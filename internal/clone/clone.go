@@ -163,6 +163,7 @@ func (j *CloneJob) Run() error {
 }
 
 // RunToFile saves remote disk as a gzip compressed file.
+// The remote does dd | gzip, so only compressed data travels over the network.
 func (j *CloneJob) RunToFile() error {
 	if err := validateDevicePath(j.params.SourcePath); err != nil {
 		return err
@@ -181,19 +182,11 @@ func (j *CloneJob) RunToFile() error {
 	}
 	defer f.Close()
 
-	gzw, err := gzip.NewWriterLevel(f, gzip.BestSpeed)
-	if err != nil {
-		return fmt.Errorf("create gzip writer: %w", err)
-	}
-
-	// For file mode, use raw stream (no remote gzip) because we do gzip locally
-	if err := j.streamRaw(gzw); err != nil {
-		gzw.Close()
+	// Remote compresses, local writes the compressed stream directly to disk.
+	// No local gzip — the file is already gzip-compressed by the remote.
+	j.logFn("  远程压缩传输 (dd|gzip → 网络 → 本地文件)")
+	if err := j.streamCompressedRaw(f); err != nil {
 		return err
-	}
-
-	if err := gzw.Close(); err != nil {
-		return fmt.Errorf("finalize gzip: %w", err)
 	}
 
 	return nil
@@ -340,6 +333,86 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 		finalErr = fmt.Errorf("%s", errMsg)
 	} else if written == 0 {
 		errMsg := "remote dd produced no data — disk may be busy, missing, or inaccessible"
+		if stderrOut != "" {
+			errMsg += "\n  stderr: " + strings.TrimSpace(stderrOut)
+		}
+		finalErr = fmt.Errorf("%s", errMsg)
+	}
+
+	j.progressFn(Progress{Done: true, Error: finalErr})
+	return finalErr
+}
+
+// streamCompressedRaw: remote dd|gzip → SSH → dst (no local decompression).
+// The remote sends already-compressed data; we write it directly to disk.
+// This is used by RunToFile where the output file is already .gz format.
+func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
+	if j.sshClient == nil {
+		return fmt.Errorf("SSH client is nil")
+	}
+
+	bs := j.params.BlockSize
+	if bs == "" {
+		bs = "4M"
+	}
+	if err := validateBS(bs); err != nil {
+		return err
+	}
+	bsBytes := bsToBytes(bs)
+
+	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | gzip -1", j.params.SourcePath, bsBytes)
+
+	session, err := j.sshClient.Execute(remoteCmd)
+	if err != nil {
+		return fmt.Errorf("start remote dd|gzip: %w", err)
+	}
+	defer session.Close()
+
+	stderrCh := make(chan string, 1)
+	go func() {
+		data, _ := io.ReadAll(session.Stderr)
+		stderrCh <- string(data)
+	}()
+
+	done := make(chan struct{})
+	defer close(done)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	cancelled := false
+	go func() {
+		select {
+		case <-sigCh:
+			cancelled = true
+			_ = session.Signal(ssh.SIGTERM)
+		case <-done:
+		}
+	}()
+
+	// Write compressed bytes directly — no local gzip/decompression
+	written, copyErr := j.copyWithProgress(dst, session.Stdout)
+
+	sessionErr := session.Wait()
+
+	stderrOut := ""
+	select {
+	case stderrOut = <-stderrCh:
+	case <-time.After(3 * time.Second):
+	}
+
+	var finalErr error
+	if cancelled {
+		finalErr = fmt.Errorf("cancelled by user")
+	} else if copyErr != nil {
+		finalErr = copyErr
+	} else if sessionErr != nil {
+		errMsg := fmt.Sprintf("remote dd|gzip: %v", sessionErr)
+		if stderrOut != "" {
+			errMsg += "\n  stderr: " + strings.TrimSpace(stderrOut)
+		}
+		finalErr = fmt.Errorf("%s", errMsg)
+	} else if written == 0 {
+		errMsg := "remote dd|gzip produced no data — disk may be busy, missing, or gzip not installed"
 		if stderrOut != "" {
 			errMsg += "\n  stderr: " + strings.TrimSpace(stderrOut)
 		}
