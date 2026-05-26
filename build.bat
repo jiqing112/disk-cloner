@@ -4,7 +4,7 @@ title Disk Cloner - Go Builder
 setlocal enabledelayedexpansion
 
 echo ============================================
-echo   Disk Cloner - Go Build (Linux targets)
+echo   Disk Cloner - Go Build
 echo ============================================
 echo.
 
@@ -44,6 +44,16 @@ if %errorlevel% neq 0 (
     echo     [OK] disk-cloner-linux-amd64
 )
 
+echo   - Building for Windows amd64...
+set GOOS=windows
+set GOARCH=amd64
+go build -ldflags="-s -w" -o disk-cloner-windows-amd64.exe .
+if %errorlevel% neq 0 (
+    echo     [FAILED]
+) else (
+    echo     [OK] disk-cloner-windows-amd64.exe
+)
+
 echo.
 echo ============================================
 echo   BUILD COMPLETE
@@ -54,6 +64,9 @@ echo   scp disk-cloner-linux-amd64 root@CLIENT:/usr/local/bin/disk-cloner
 echo   ssh root@CLIENT
 echo     chmod +x /usr/local/bin/disk-cloner
 echo     disk-cloner
+echo.
+echo Use on Windows:
+echo   disk-cloner-windows-amd64.exe
 
 pause
 exit /b 0

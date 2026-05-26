@@ -1,71 +1,134 @@
 # Disk Cloner
 
-通过 SSH 将远程服务器的硬盘克隆到本地，或在本地保存为 gzip 压缩镜像文件。
+通过 SSH 远程克隆磁盘的 Go 工具。支持三个方向：
 
-专为 **Alpine Linux RAM OS** 环境设计——客户端和远程服务器都可以是 Alpine Linux 的 RAM 启动环境，无需安装系统。克隆时自动使用 gzip 压缩传输，大幅减少网络流量。
+```
+克隆:  远程 dd | gzip → SSH → 本地 gunzip → 磁盘
+保存:  远程 dd | gzip → SSH → 本地文件 (.img.gz)
+恢复:  本地 .img.gz → gunzip → SSH → 远程 dd
+```
+
+纯 Go 实现，单个可执行文件，零依赖。同时提供 Linux 和 Windows 版本。
+
+---
 
 ## 适用场景
 
-- **云服务器迁移**：将云服务器硬盘 dd 到本地，再恢复到其他机器
-- **系统备份**：远程磁盘 → 本地 gzip 压缩文件
-- **救援模式克隆**：源服务器进入 Alpine RAM OS 后，通过网络克隆其磁盘
+- **云服务器迁移**：把 A 服务器的系统盘 dd 克隆到 B 服务器
+- **系统备份**：远程磁盘保存为本地 gzip 压缩镜像
+- **系统还原**：把本地备份镜像恢复到远程磁盘
+- **救援模式克隆**：源端和目标端都进入 Alpine Linux RAM OS，安全离线克隆
 
-## 前置条件
-
-- 客户端和远程服务器均能通过 SSH 连接（密码或密钥）
-- 远程服务器需要 `dd`（Alpine busybox 自带）
-- 客户端会自动安装所需依赖（`apk add`）
+---
 
 ## 快速开始
 
-### 构建
+### 1. 源服务器进入 Alpine RAM OS
+
+参考 [bin456789/reinstall](https://github.com/bin456789/reinstall) 脚本：
 
 ```bash
-# Windows 下构建
-build.bat
-
-# Linux/Mac 下直接构建
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o disk-cloner-linux-amd64 .
+curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
+bash reinstall.sh alpine --hold 1
 ```
 
-### 交互模式（推荐）
+服务器重启后进入 Alpine Linux RAM OS 状态，此时系统盘分区已卸载，可以安全克隆。
 
-将程序放到客户端 Alpine Linux 上，直接运行：
+### 2. 下载程序
+
+从 [Releases](https://github.com/xxx/disk-cloner-go/releases) 下载对应平台的可执行文件：
+
+- `disk-cloner-linux-amd64` — Linux (Alpine)
+- `disk-cloner-windows-amd64.exe` — Windows
 
 ```bash
+# Linux 客户端
+chmod +x disk-cloner-linux-amd64
 ./disk-cloner-linux-amd64
 ```
 
-按照提示输入：
-1. 远程服务器 IP
-2. SSH 端口（默认 22）
-3. 用户名（默认 root）
-4. 密码（回车则使用 SSH 密钥）
+```cmd
+# Windows 客户端
+disk-cloner-windows-amd64.exe
+```
 
-然后选择源盘和操作模式：
+### 3. 按提示操作
+
+输入远程 SSH 信息后，选择操作模式：
 
 ```
   操作模式:
-  [1] 克隆到本地磁盘 (dd → 磁盘)
-  [2] 保存为压缩文件 (dd → gzip 文件)
+  [1] 克隆到本地磁盘 (dd -> 磁盘)
+  [2] 保存为压缩文件 (dd -> gzip 文件)
+  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)
 ```
 
-### 命令行模式
+---
+
+## 三种模式详解
+
+### 模式 1 — 克隆磁盘
+
+把远程服务器的系统盘完整复制到本地磁盘。用于**云服务器迁移**或**对拷**。
+
+```
+远程: dd if=/dev/sda | gzip -1
+         ↓ 压缩数据通过 SSH 传输
+本地: gunzip → dd of=/dev/sda
+```
+
+- 传输前可选**零填充**：把远程磁盘的空闲空间写零，大幅提高压缩率
+  - 40GB 源盘、6GB 实际数据 → 网络只需传约 6GB
+- 克隆完成后提示 3 次 fstab 检查警告
+
+### 模式 2 — 保存镜像
+
+把远程磁盘保存为本地 gzip 压缩文件。用于**系统备份**。
+
+```
+远程: dd if=/dev/sda | gzip -1
+         ↓
+本地: 直接写 .img.gz 文件
+```
+
+- 文件名默认格式：`IP地址-磁盘名.img.gz`（如 `192.168.1.100-sda.img.gz`）
+- 远程压缩，网络只传输压缩后的数据
+
+### 模式 3 — 恢复镜像
+
+把本地备份文件恢复到远程磁盘。用于**系统还原**。
+
+```
+本地: 读 .img.gz → gunzip
+         ↓ 通过 SSH stdin 传输
+远程: dd of=/dev/sda
+```
+
+- 支持恢复之前通过模式 2 保存的 `.img.gz` 文件
+- 直接覆盖远程磁盘，操作前会确认
+
+---
+
+## 命令行模式
 
 ```bash
 # 克隆磁盘
 ./disk-cloner-linux-amd64 -H 192.168.1.100 -p password \
   -s /dev/sda -t /dev/sda -y
 
-# 保存为压缩文件（自动命名：IP-磁盘名.img.gz）
+# 保存为文件（自动命名）
 ./disk-cloner-linux-amd64 -H 192.168.1.100 -p password \
   -s /dev/sda -o auto -y
 
-# 自定义文件名
+# 保存为指定文件
 ./disk-cloner-linux-amd64 -H 192.168.1.100 -p password \
   -s /dev/sda -o backup.img.gz -y
 
-# 使用 SSH 密钥（不提供 -p 参数）
+# 恢复文件到远程磁盘
+./disk-cloner-linux-amd64 -H 192.168.1.100 -p password \
+  -s /dev/sda -r backup.img.gz -y
+
+# 使用 SSH 密钥（不提供 -p）
 ./disk-cloner-linux-amd64 -H 192.168.1.100 -s /dev/sda -t /dev/nvme0n1 -y
 ```
 
@@ -74,13 +137,15 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o disk-cloner-l
 | `-H` | 远程服务器 IP | — |
 | `-P` | SSH 端口 | 22 |
 | `-u` | SSH 用户名 | root |
-| `-p` | SSH 密码（不提供则使用密钥） | — |
+| `-p` | SSH 密码（不提供则尝试密钥） | — |
 | `-s` | 源磁盘（远程），如 `/dev/sda` | — |
 | `-t` | 目标磁盘（本地），如 `/dev/sda` | — |
 | `-o` | 保存为文件，`auto` 为自动命名 | — |
+| `-r` | 从 gzip 文件恢复到远程 | — |
 | `-bs` | dd 块大小 | 4M |
 | `-y` | 跳过确认 | — |
-| `--fix-boot-disk` | 离线修复引导（独立模式） | — |
+
+---
 
 ## 克隆后必须做的事
 
@@ -93,67 +158,66 @@ mdev -s
 # 2. 挂载根分区（用 lsblk 查看分区号）
 mount /dev/sda4 /mnt
 
-# 3. 编辑 fstab，删除云服务器独有的数据盘挂载
+# 3. 编辑 fstab，删除源服务器独有的数据盘挂载
 vi /mnt/etc/fstab
-
-# 注释掉类似这样的行（在新机器上不存在）：
-# UUID=xxx  /data       ext4  defaults  0 2
-# /dev/vdb  /mnt/logs   ext4  defaults  0 0
+# 注释掉 /data、/mnt/* 等不存在的磁盘条目
 
 # 4. 卸载并重启
-umount /mnt
-reboot
+umount /mnt && reboot
 ```
 
-> 如果不修改 fstab，systemd 会在启动时等待不存在的设备 90 秒，可能导致系统进入 emergency mode。
+> 不修改 fstab 的话，systemd 会等不存在的设备 90 秒，可能进入 emergency mode。
 
-## 修复引导（可选）
+---
 
-如果克隆后系统能启动但仍想修复 initramfs 和 GRUB：
+## Windows 版说明
+
+- **仅支持模式 2（保存）和模式 3（恢复）**
+- **不需要安装 SSH 客户端** — Go 程序内置 SSH 协议实现
+- **不需要 gzip** — Go 程序内置压缩/解压
+- 双击运行或命令行执行，操作流程与 Linux 版相同
+
+---
+
+## 自行编译
 
 ```bash
-# 确保安装了必要的包
-apk add util-linux lvm2 e2fsprogs xfsprogs btrfs-progs efibootmgr
+# 需要 Go 1.22+
+git clone https://github.com/xxx/disk-cloner-go
+cd disk-cloner-go
 
-# 对目标磁盘执行引导修复
-./disk-cloner-linux-amd64 --fix-boot-disk /dev/sda
+# Linux
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o disk-cloner-linux-amd64 .
+
+# Windows
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o disk-cloner-windows-amd64.exe .
 ```
 
-此操作会：
-- 重建 initramfs（包含所有硬件驱动，`--no-hostonly`）
-- 重装 GRUB 引导器
-- 自动修复 fstab（注释掉数据盘条目，其余加 `nofail`）
+Windows 下也可直接运行 `build.bat`。
+
+---
+
+## 前置依赖
+
+### 客户端（程序运行的地方）
+
+- **Linux**：程序启动时自动 `apk add util-linux lvm2 e2fsprogs xfsprogs efibootmgr`
+- **Windows**：无需任何依赖
+
+### 远程服务器（被克隆的机器）
+
+- 需要 `dd`（Alpine busybox 自带）
+- 需要 `gzip`（Alpine busybox 自带，程序会自动检测并安装）
+- 建议进入 Alpine Linux RAM OS 后再克隆（程序会自动检测并警告）
+
+---
 
 ## 工作原理
 
-```
-远程服务器                          本地客户端
-┌──────────────┐                   ┌──────────────┐
-│  dd          │                   │  写入目标磁盘  │
-│  ↓           │                   │  ↑           │
-│  gzip -1     │ ═══ SSH 管道 ═══ │  gunzip      │
-│  (压缩传输)   │   (压缩后数据)    │  (本地解压)   │
-└──────────────┘                   └──────────────┘
-```
-
-1. 远程执行 `dd if=/dev/sda | gzip -1`，磁盘数据压缩后通过 SSH 传输
-2. 本地接收压缩流，解压后写入目标设备
-3. 传输前自动对远程磁盘执行零填充（将空闲空间写零），提高压缩率
-4. 进度实时显示：百分比、速度、预计剩余时间
-
-## 零填充
-
-克隆和保存文件前都会自动对远程磁盘的空闲空间执行零填充：
-
-- 临时挂载每个分区 → `dd if=/dev/zero` 填满剩余空间 → 删除零文件 → 卸载
-- 空闲空间变为全零 → gzip 压缩率极高（接近 100%）
-- 40GB 源盘、6GB 实际数据 → 网络只需传输约 6GB
-
-零填充可能因远程缺少文件系统模块而跳过（不影响克隆）。
-
-## 注意事项
-
-- Alpine Linux 使用 `mdev` 而非 `udev`。挂载分区前可能需要 `mdev -s` 创建设备节点
-- 源盘和目标盘可以不同大小。目标较小会警告但允许继续（超过目标容量的数据会丢失）
-- 保存文件模式将文件写入当前工作目录，RAM OS 下注意内存充足
-- SSH 密钥认证优先于密码认证。密码通过内存传输，不写入磁盘
+| 组件 | 运行位置 | 实现 |
+|------|---------|------|
+| SSH 客户端 | 本地 | Go `crypto/ssh` |
+| gzip 压缩/解压 | 两端 | Go `compress/gzip`（本地）/ 远程 busybox gzip |
+| dd 读写磁盘 | 远程 | 通过 SSH 执行 dd 命令 |
+| lsblk 磁盘扫描 | 远程/本地 | 通过 SSH 执行 / 本地执行 |
+| mdev/partprobe | 本地 | 通过 `--fix-boot-disk` 离线修复引导 |

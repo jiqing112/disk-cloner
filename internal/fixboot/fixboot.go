@@ -38,12 +38,12 @@ func Run(cfg Config) error {
 	}
 
 	// ── 1. Re-read partition table ─────────────────────────────────
-	log("刷新分区表...")
+	log("刷新分区??..")
 	run("partprobe", cfg.TargetDisk)
 	run("blockdev", "--rereadpt", cfg.TargetDisk)
 	time.Sleep(2 * time.Second)
 
-	// Create device nodes — Alpine uses mdev instead of udev,
+	// Create device nodes ??Alpine uses mdev instead of udev,
 	// partition nodes like /dev/sda1 are NOT auto-created.
 	// mdev -s does a coldplug scan: reads /sys and creates all /dev nodes.
 	if commandExists("mdev") {
@@ -55,7 +55,7 @@ func Run(cfg Config) error {
 
 	// ── 2. Activate LVM if available ───────────────────────────────
 	if commandExists("lvm") {
-		log("检测 LVM...")
+		log("检??LVM...")
 		run("vgscan", "--mknodes")
 		run("vgchange", "-ay")
 		time.Sleep(time.Second)
@@ -64,18 +64,18 @@ func Run(cfg Config) error {
 	}
 
 	// ── 3. Find root filesystem ────────────────────────────────────
-	log("查找根文件系统...")
+	log("查找根文件系??..")
 	rootDev, rootFstype, err := findRootPartition(cfg.TargetDisk)
 	if err != nil {
-		return fmt.Errorf("找不到根文件系统: %w\n  请手动指定分区并挂载到 %s", err, mountRoot)
+		return fmt.Errorf("找不到根文件系统: %w\n  请手动指定分区并挂载??%s", err, mountRoot)
 	}
-	log("  根分区: %s (%s)", rootDev, rootFstype)
+	log("  根分?? %s (%s)", rootDev, rootFstype)
 
 	// Mount root
 	if err := mountWithType(rootDev, mountRoot, rootFstype); err != nil {
 		// Fallback to auto-detect
 		if err2 := mount(rootDev, mountRoot); err2 != nil {
-			return fmt.Errorf("挂载根分区 %s: %w", rootDev, err)
+			return fmt.Errorf("挂载根分??%s: %w", rootDev, err)
 		}
 	}
 	defer umountAll()
@@ -89,18 +89,18 @@ func Run(cfg Config) error {
 
 	if dev, ok := fstabMounts["/boot"]; ok {
 		bootDir := filepath.Join(mountRoot, "boot")
-		log("  挂载 /boot ← %s", dev)
+		log("  挂载 /boot ??%s", dev)
 		if err := mount(dev, bootDir); err != nil {
-			log("  ⚠ 挂载 /boot 失败: %v (跳过)", err)
+			log("  ??挂载 /boot 失败: %v (跳过)", err)
 		}
 	}
 
 	if dev, ok := fstabMounts["/boot/efi"]; ok {
 		efiDir := filepath.Join(mountRoot, "boot/efi")
 		os.MkdirAll(efiDir, 0755)
-		log("  挂载 /boot/efi ← %s", dev)
+		log("  挂载 /boot/efi ??%s", dev)
 		if err := mount(dev, efiDir); err != nil {
-			log("  ⚠ 挂载 /boot/efi 失败: %v (跳过)", err)
+			log("  ??挂载 /boot/efi 失败: %v (跳过)", err)
 		}
 	}
 
@@ -125,7 +125,7 @@ func Run(cfg Config) error {
 	mountTmpfs(runDir)
 
 	// ── 7. Rebuild initramfs ───────────────────────────────────────
-	log("重建 initramfs (包含所有硬件驱动)...")
+	log("重建 initramfs (包含所有硬件驱??...")
 	switch distro {
 	case "fedora", "rhel", "centos", "rocky", "alma":
 		err = chrootExec(mountRoot, "dracut", "--no-hostonly", "--regenerate-all", "--force")
@@ -145,13 +145,13 @@ func Run(cfg Config) error {
 		} else if fileExists(filepath.Join(mountRoot, "usr/bin/mkinitcpio")) {
 			err = chrootExec(mountRoot, "mkinitcpio", "-P")
 		} else {
-			return fmt.Errorf("未找到 initramfs 重建工具 (dracut/update-initramfs/mkinitcpio)")
+			return fmt.Errorf("未找??initramfs 重建工具 (dracut/update-initramfs/mkinitcpio)")
 		}
 	}
 	if err != nil {
 		return fmt.Errorf("重建 initramfs 失败: %w", err)
 	}
-	log("  ✓ initramfs 重建完成")
+	log("  ??initramfs 重建完成")
 
 	// ── 8. Reinstall GRUB ──────────────────────────────────────────
 	log("修复 GRUB 引导...")
@@ -168,7 +168,7 @@ func Run(cfg Config) error {
 				"--bootloader-id=fedora",
 				"--recheck")
 			if err != nil {
-				log("  ⚠ grub2-install 失败: %v (可能需要手动处理)", err)
+				log("  ??grub2-install 失败: %v (可能需要手动处??", err)
 			}
 			chrootExec(mountRoot, "grub2-mkconfig", "-o", "/boot/grub2/grub.cfg")
 		} else if fileExists(filepath.Join(mountRoot, "usr/sbin/grub-install")) {
@@ -177,7 +177,7 @@ func Run(cfg Config) error {
 				"--efi-directory=/boot/efi",
 				"--recheck")
 			if err != nil {
-				log("  ⚠ grub-install 失败: %v", err)
+				log("  ??grub-install 失败: %v", err)
 			}
 			chrootExec(mountRoot, "grub-mkconfig", "-o", "/boot/grub/grub.cfg")
 		}
@@ -193,35 +193,35 @@ func Run(cfg Config) error {
 						"-p", efiPart,
 						"-L", "Linux",
 						"-l", shimPath)
-					log("  ✓ UEFI 引导项已添加")
+					log("  ??UEFI 引导项已添加")
 				}
 			}
 		} else {
-			log("  ⚠ 未找到 efibootmgr，可能需要手动设置 UEFI 引导项")
-			log("    Alpine 安装: apk add efibootmgr")
+			log("efibootmgr not found, UEFI boot entry may need manual setup")
+			log("    Install on Alpine: apk add efibootmgr")
 		}
 	} else {
 		log("  检测到 BIOS/Legacy 模式")
 		if fileExists(filepath.Join(mountRoot, "usr/sbin/grub2-install")) {
 			err = chrootExec(mountRoot, "grub2-install", "--recheck", cfg.TargetDisk)
 			if err != nil {
-				log("  ⚠ grub2-install 失败: %v", err)
+				log("  ??grub2-install 失败: %v", err)
 			}
 			chrootExec(mountRoot, "grub2-mkconfig", "-o", "/boot/grub2/grub.cfg")
 		} else if fileExists(filepath.Join(mountRoot, "usr/sbin/grub-install")) {
 			err = chrootExec(mountRoot, "grub-install", "--recheck", cfg.TargetDisk)
 			if err != nil {
-				log("  ⚠ grub-install 失败: %v", err)
+				log("  ??grub-install 失败: %v", err)
 			}
 			chrootExec(mountRoot, "grub-mkconfig", "-o", "/boot/grub/grub.cfg")
 		}
 	}
-	log("  ✓ GRUB 修复完成")
+	log("  ??GRUB 修复完成")
 
 	// ── 9. Fix fstab: remove extra disk mounts ─────────────────────
 	log("修复 fstab (移除不存在的额外磁盘挂载)...")
 	if err := fixFstab(mountRoot); err != nil {
-		log("  ⚠ fstab 修复失败: %v (不影响启动, 可手动处理)", err)
+		log("  ??fstab 修复失败: %v (不影响启?? 可手动处??", err)
 		_ = copyFile(
 			filepath.Join(mountRoot, "etc/fstab"),
 			filepath.Join(mountRoot, "etc/fstab.bak"),
@@ -229,9 +229,9 @@ func Run(cfg Config) error {
 	}
 
 	// ── 10. Cleanup ─────────────────────────────────────────────────
-	log("清理挂载点...")
+	log("清理挂载??..")
 	umountAll()
-	log("✓ 引导修复完成!")
+	log("??引导修复完成!")
 
 	return nil
 }
@@ -407,7 +407,7 @@ func detectDistro(mountpoint string) string {
 	return "unknown"
 }
 
-// parseFstab reads /etc/fstab and returns a map of mountpoint → device.
+// parseFstab reads /etc/fstab and returns a map of mountpoint ??device.
 // Resolves UUID= and LABEL= references.
 func parseFstab(path string) map[string]string {
 	result := map[string]string{}
@@ -489,7 +489,7 @@ func findEFIPartNum(disk string, fstabMounts map[string]string) string {
 		return ""
 	}
 	// Extract partition number from device path
-	// e.g. /dev/sda1 → 1, /dev/nvme0n1p1 → 1
+	// e.g. /dev/sda1 ??1, /dev/nvme0n1p1 ??1
 	efiDev = strings.TrimPrefix(efiDev, disk)
 	efiDev = strings.TrimPrefix(efiDev, "p") // for NVMe
 	if efiDev != "" {
@@ -676,14 +676,14 @@ func dirExists(path string) bool {
 //
 // Strategy (B+C):
 //
-//	/        → keep as-is (root)
-//	/boot*   → keep as-is (needed for kernel updates)
-//	swap     → keep as-is
-//	/mnt/*   → comment out (external data disks)
-//	/data*   → comment out
-//	/media/* → comment out
-//	/backup  → comment out
-//	other    → add "nofail,x-systemd.device-timeout=10s"
+//	/        ??keep as-is (root)
+//	/boot*   ??keep as-is (needed for kernel updates)
+//	swap     ??keep as-is
+//	/mnt/*   ??comment out (external data disks)
+//	/data*   ??comment out
+//	/media/* ??comment out
+//	/backup  ??comment out
+//	other    ??add "nofail,x-systemd.device-timeout=10s"
 func fixFstab(rootMount string) error {
 	fstabPath := filepath.Join(rootMount, "etc/fstab")
 	bakPath := filepath.Join(rootMount, "etc/fstab.bak")
