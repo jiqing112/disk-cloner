@@ -377,10 +377,8 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			saveFile = makeFileName(ip, source)
 		}
 		fmt.Printf("文件: %s (gzip)\n", saveFile)
-		totalStart := time.Now()
 		cliDisk := cli.DiskItem{Path: srcDisk.Path, SizeBytes: srcDisk.SizeBytes, SizeHuman: srcDisk.SizeHuman, Name: srcDisk.Name}
 		doSaveToFile(ip, cliDisk, sshClient, saveFile)
-		fmt.Printf("保存完成! 总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
 		return
 	}
 
@@ -503,7 +501,7 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 	})
 	if err := job.RunToFile(); err != nil {
 		fmt.Printf("\n  保存失败: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	if info, err := os.Stat(fileName); err == nil {
 		ratio := 0.0
@@ -554,7 +552,7 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	})
 	if err := job.RestoreFromFile(fileName); err != nil {
 		fmt.Printf("\n  恢复失败: %v\n", err)
-		os.Exit(1)
+		return
 	}
 
 	fmt.Println()

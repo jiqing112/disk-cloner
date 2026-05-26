@@ -14,9 +14,9 @@
 
 ## 适用场景
 
-- **云服务器迁移**：把 A 服务器的系统盘 dd 克隆到 B 服务器 (两个服务器都要进入Alpine RAM OS状态)  
-- **系统备份**：远程磁盘保存为本地 gzip 压缩镜像 (只需要被克隆服务器进入Alpine RAM OS状态)  
-- **系统还原**：把本地备份镜像恢复到远程磁盘 (只需要被克隆服务器进入Alpine RAM OS状态)  
+- **云服务器迁移**：把 A 服务器的系统盘 dd 克隆到 B 服务器
+- **系统备份**：远程磁盘保存为本地 gzip 压缩镜像
+- **系统还原**：把本地备份镜像恢复到远程磁盘
 - **救援模式克隆**：源端和目标端都进入 Alpine Linux RAM OS，安全离线克隆
 
 ---
@@ -36,7 +36,7 @@ bash reinstall.sh alpine --hold 1
 
 ### 2. 下载程序
 
-从 [Releases](https://github.com/jiqing112/disk-cloner/releases) 下载对应平台的可执行文件：
+从 [Releases](https://github.com/xxx/disk-cloner-go/releases) 下载对应平台的可执行文件：
 
 - `disk-cloner-linux-amd64` — Linux (Alpine)
 - `disk-cloner-windows-amd64.exe` — Windows
@@ -69,7 +69,7 @@ disk-cloner-windows-amd64.exe
 
 ### 模式 1 — 克隆磁盘
 
-把远程服务器的系统盘完整复制到本地磁盘。用于**云服务器迁移**或**两个云服务器之间对拷**。
+把远程服务器的系统盘完整复制到本地磁盘。用于**云服务器迁移**或**对拷**。
 
 ```
 远程: dd if=/dev/sda | gzip -1
