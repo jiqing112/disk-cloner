@@ -36,7 +36,7 @@ bash reinstall.sh alpine --hold 1
 
 ### 2. 下载程序
 
-从 [Releases](https://github.com/jiqing112/disk-cloner/releases)) 下载对应平台的可执行文件：
+从 [Releases](https://github.com/jiqing112/disk-cloner/releases) 下载对应平台的可执行文件：
 
 - `disk-cloner-linux-amd64` — Linux (Alpine)
 - `disk-cloner-windows-amd64.exe` — Windows
