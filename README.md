@@ -1,118 +1,123 @@
 # Disk Cloner
 
-通过 SSH 远程克隆磁盘的 Go 工具。支持三个方向：
+通过 SSH 远程克隆磁盘的 Go 工具。纯 Go 实现，单文件零依赖。
 
-```
-克隆:  远程 dd | gzip → SSH → 本地 gunzip → 磁盘
-保存:  远程 dd | gzip → SSH → 本地文件 (.img.gz)
-恢复:  本地 .img.gz → gunzip → SSH → 远程 dd
-```
+## 功能一览
 
-纯 Go 实现，单个可执行文件，零依赖。同时提供 Linux 和 Windows 版本。
+| 模式 | 方向 | 用途 |
+|------|------|------|
+| 克隆 | 远程 → 本地磁盘 | 服务器迁移、对拷 |
+| 保存 | 远程 → 本地文件 | 系统备份、镜像存档 |
+| 恢复 | 本地文件 → 远程磁盘 | 系统还原、批量部署 |
 
----
-
-## 适用场景
-
-- **云服务器迁移**：把 A 服务器的系统盘 dd 克隆到 B 服务器
-- **系统备份**：远程磁盘保存为本地 gzip 压缩镜像
-- **系统还原**：把本地备份镜像恢复到远程磁盘
-- **救援模式克隆**：源端和目标端都进入 Alpine Linux RAM OS，安全离线克隆
-
----
-
-## 快速开始
-
-### 1. 源服务器进入 Alpine RAM OS
-
-参考 [bin456789/reinstall](https://github.com/bin456789/reinstall) 脚本：
-
-```bash
-curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
-bash reinstall.sh alpine --hold 1
-```
-
-服务器重启后进入 Alpine Linux RAM OS 状态，此时系统盘分区已卸载，可以安全克隆。
-
-### 2. 下载程序
-
-从 [Releases](https://github.com/xxx/disk-cloner-go/releases) 下载对应平台的可执行文件：
-
-- `disk-cloner-linux-amd64` — Linux (Alpine)
-- `disk-cloner-windows-amd64.exe` — Windows
-
-```bash
-# Linux 客户端
-chmod +x disk-cloner-linux-amd64
-./disk-cloner-linux-amd64
-```
-
-```cmd
-# Windows 客户端
-disk-cloner-windows-amd64.exe
-```
-
-### 3. 按提示操作
-
-输入远程 SSH 信息后，选择操作模式：
-
-```
-  操作模式:
-  [1] 克隆到本地磁盘 (dd -> 磁盘)
-  [2] 保存为压缩文件 (dd -> gzip 文件)
-  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)
-```
+支持 Linux 和 Windows。
 
 ---
 
 ## 三种模式详解
 
-### 模式 1 — 克隆磁盘
+### 模式 1 — 克隆到本地磁盘
 
-把远程服务器的系统盘完整复制到本地磁盘。用于**云服务器迁移**或**对拷**。
-
-```
-远程: dd if=/dev/sda | gzip -1
-         ↓ 压缩数据通过 SSH 传输
-本地: gunzip → dd of=/dev/sda
-```
-
-- 传输前可选**零填充**：把远程磁盘的空闲空间写零，大幅提高压缩率
-  - 40GB 源盘、6GB 实际数据 → 网络只需传约 6GB
-- 克隆完成后提示 3 次 fstab 检查警告
-
-### 模式 2 — 保存镜像
-
-把远程磁盘保存为本地 gzip 压缩文件。用于**系统备份**。
+把远程服务器的硬盘完整复制到本地硬盘。
 
 ```
-远程: dd if=/dev/sda | gzip -1
-         ↓
-本地: 直接写 .img.gz 文件
+远程服务器                         本地客户端
+┌──────────────┐                  ┌──────────────┐
+│  dd if=/dev/sda │ ──SSH──▶     │  gunzip       │
+│  ↓              │               │  ↓            │
+│  gzip -1       │  压缩流传输    │  dd of=/dev/sda│
+└──────────────┘                  └──────────────┘
 ```
 
-- 文件名默认格式：`IP地址-磁盘名.img.gz`（如 `192.168.1.100-sda.img.gz`）
-- 远程压缩，网络只传输压缩后的数据
+- 传输前可选**零填充**：把远程空闲空间写零，gzip 可极高压缩率
+  - 40GB 盘、6GB 数据 → 网络只传 ~6GB
+- 支持压缩/非压缩自动选择（远程有 gzip 则压缩传输）
+- 完成前检测远程是否为 Alpine RAM OS，非 RAM OS 给出警告
 
-### 模式 3 — 恢复镜像
+### 模式 2 — 保存为 gzip 文件
 
-把本地备份文件恢复到远程磁盘。用于**系统还原**。
+把远程磁盘保存为本地 `.img.gz` 压缩文件。
 
 ```
-本地: 读 .img.gz → gunzip
-         ↓ 通过 SSH stdin 传输
-远程: dd of=/dev/sda
+远程服务器                         本地客户端
+┌──────────────┐                  ┌──────────────┐
+│  dd if=/dev/sda │ ──SSH──▶     │  直接写文件    │
+│  ↓              │               │  xxx.img.gz  │
+│  gzip -1       │               │              │
+└──────────────┘                  └──────────────┘
 ```
 
-- 支持恢复之前通过模式 2 保存的 `.img.gz` 文件
-- 直接覆盖远程磁盘，操作前会确认
+- 远程压缩后传输，带宽占用最小
+- 零填充同样可用
+- 文件名默认为 `IP-磁盘名.img.gz`
+
+### 模式 3 — 恢复文件到远程磁盘
+
+把本地 `.img.gz` 备份恢复到远程硬盘。模式 2 的逆操作。
+
+```
+本地客户端                         远程服务器
+┌──────────────┐                  ┌──────────────┐
+│  xxx.img.gz  │                  │  dd of=/dev/sda│
+│  ↓ (gunzip)  │ ──SSH stdin──▶ │              │
+└──────────────┘                  └──────────────┘
+```
+
+- 本地解压后通过 SSH 管道传入远程 dd
+- Windows 支持文件对话框 + 拖拽 + 目录浏览三种选文件方式
+- 进度显示解压后字节数（从 gzip 尾部 ISIZE 读取，≤4GB 精确）
 
 ---
 
-## 命令行模式
+## 使用方式
+
+### 1. 远程服务器进入 Alpine RAM OS
+
+参考 [bin456789/reinstall](https://github.com/bin456789/reinstall)：
 
 ```bash
-# 克隆磁盘
+bash reinstall.sh alpine --hold 1
+```
+
+重启后进入 Alpine RAM OS。此时物理磁盘分区已卸载，可安全克隆。
+
+### 2. 下载程序
+
+从 [Releases](https://github.com/jiqing112/disk-cloner/releases) 下载：
+
+```bash
+# Linux
+chmod +x disk-cloner-linux-amd64
+./disk-cloner-linux-amd64
+
+# Windows
+disk-cloner-windows-amd64.exe
+```
+
+### 3. 交互式操作
+
+按提示输入远程 SSH 信息、选择源盘、选择操作模式即可。
+
+```
+  远程服务器配置
+  ─────────────────────────────────────────────
+  服务器IP: 192.168.1.100
+  SSH 端口 [22]:
+  用户名 [root]:
+  密码 (回车使用密钥):
+
+  正在检测 SSH 服务...
+  SSH 服务已确认 (SSH-2.0-OpenSSH_9.6)
+  正在进行 SSH 认证...
+  SSH 连接成功 (root@192.168.1.100:22)
+```
+
+每个大步骤之间有 `───` 分隔，一目了然。
+
+### 4. 命令行模式
+
+```bash
+# 克隆远程磁盘到本地
 ./disk-cloner-linux-amd64 -H 192.168.1.100 -p password \
   -s /dev/sda -t /dev/sda -y
 
@@ -120,17 +125,12 @@ disk-cloner-windows-amd64.exe
 ./disk-cloner-linux-amd64 -H 192.168.1.100 -p password \
   -s /dev/sda -o auto -y
 
-# 保存为指定文件
-./disk-cloner-linux-amd64 -H 192.168.1.100 -p password \
-  -s /dev/sda -o backup.img.gz -y
-
 # 恢复文件到远程磁盘
 ./disk-cloner-linux-amd64 -H 192.168.1.100 -p password \
   -s /dev/sda -r backup.img.gz -y
-
-# 使用 SSH 密钥（不提供 -p）
-./disk-cloner-linux-amd64 -H 192.168.1.100 -s /dev/sda -t /dev/nvme0n1 -y
 ```
+
+#### 参数表
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
@@ -138,53 +138,93 @@ disk-cloner-windows-amd64.exe
 | `-P` | SSH 端口 | 22 |
 | `-u` | SSH 用户名 | root |
 | `-p` | SSH 密码（不提供则尝试密钥） | — |
-| `-s` | 源磁盘（远程），如 `/dev/sda` | — |
-| `-t` | 目标磁盘（本地），如 `/dev/sda` | — |
-| `-o` | 保存为文件，`auto` 为自动命名 | — |
-| `-r` | 从 gzip 文件恢复到远程 | — |
+| `-s` | 源磁盘路径（远程） | — |
+| `-t` | 目标磁盘路径（本地） | — |
+| `-o` | 保存为 gzip 文件，`auto` 自动命名 | — |
+| `-r` | 从 gzip 文件恢复到远程磁盘 | — |
 | `-bs` | dd 块大小 | 4M |
-| `-y` | 跳过确认 | — |
+| `-y` | 跳过确认提示 | false |
+| `--fix-boot-disk` | 离线修复引导（实验性） | — |
 
 ---
 
 ## 克隆后必须做的事
 
-克隆完成后程序会连续提示 3 次——**务必在重启前执行**：
+克隆到磁盘完成后，程序会连续弹出 3 次警告。**重启前请务必执行**：
 
 ```bash
 # 1. 创建设备节点（Alpine 精简环境需要）
 mdev -s
 
 # 2. 挂载根分区（用 lsblk 查看分区号）
+lsblk
 mount /dev/sda4 /mnt
 
-# 3. 编辑 fstab，删除源服务器独有的数据盘挂载
+# 3. 编辑 fstab，注释掉源服务器独有的数据盘挂载
 vi /mnt/etc/fstab
 # 注释掉 /data、/mnt/* 等不存在的磁盘条目
 
 # 4. 卸载并重启
-umount /mnt && reboot
+umount /mnt
+reboot
 ```
 
-> 不修改 fstab 的话，systemd 会等不存在的设备 90 秒，可能进入 emergency mode。
+> 不处理 fstab → systemd 等不存在的设备 90 秒 → 进入 emergency mode。
 
 ---
 
-## Windows 版说明
+## 平台说明
 
-- **仅支持模式 2（保存）和模式 3（恢复）**
-- **不需要安装 SSH 客户端** — Go 程序内置 SSH 协议实现
-- **不需要 gzip** — Go 程序内置压缩/解压
-- 双击运行或命令行执行，操作流程与 Linux 版相同
+### Linux
+
+- 程序启动时自动 `apk add util-linux lvm2 e2fsprogs xfsprogs efibootmgr`
+- 克隆到磁盘、保存本地文件、恢复文件三模式全支持
+- 输入使用 terminal raw 模式，退格/Ctrl+U/Ctrl+W 完整支持
+
+### Windows
+
+- **仅支持保存文件 [2] 和恢复文件 [3]**（不克隆硬盘）
+- 不需要安装 SSH 客户端或 gzip — Go 程序已内置
+- 恢复时文件选择三种方式：
+  - **回车** → 弹出 Windows 原生文件选择对话框
+  - **拖拽** → 把文件拖到 cmd 窗口自动填入路径
+  - **手动输入**路径
+- 程序启动时自动 `chcp 65001` 切换到 UTF-8 模式，中文路径正常
+- 进度条每 1 秒 `os.Stdout.Sync()` 强制刷新，Windows cmd 下可见
+
+---
+
+## 进度显示
+
+| 模式 | 进度条 | 百分比 | 速度 | 已传量 | ETA |
+|------|--------|--------|------|--------|-----|
+| 克隆（已知总量） | `[====>-----]` | 52.3% | 118.5 MB/s | 20.1GB/40.0GB | 2分48秒 |
+| 保存（已知总量） | `[====>-----]` | 52.3% | 118.5 MB/s | 20.1GB/40.0GB | 2分48秒 |
+| 恢复 ≤4GB（ISIZE） | `[====>-----]` | 52.3% | 118.5 MB/s | 10.5GB/20.0GB | 2分48秒 |
+| 恢复 >4GB（ISIZE溢出） | 旋转动画 `\|/-\` | — | 118.5 MB/s | 10.5GB | — |
+
+---
+
+## 技术架构
+
+| 组件 | 实现 | 运行位置 |
+|------|------|---------|
+| SSH 协议 | Go `crypto/ssh`（纯 Go） | 客户端 |
+| gzip 压缩/解压 | Go `compress/gzip` + 远程 busybox gzip | 两端 |
+| dd 读写磁盘 | 远程 busybox dd | 远程服务器 |
+| 磁盘扫描 | 远程 `lsblk`（util-linux） | 远程服务器 |
+| 控制台输入 | Linux: term raw mode 逐字符 / Windows: bufio.Reader | 客户端 |
+| 文件对话框 | PowerShell 调用 WinForms OpenFileDialog | Windows 客户端 |
+| 控制台编码 | `chcp 65001`（UTF-8 模式） | Windows 客户端 |
+| 进度刷线 | `os.Stdout.Sync()` 每秒强制刷新 | 客户端 |
 
 ---
 
 ## 自行编译
 
 ```bash
-# 需要 Go 1.22+
-git clone https://github.com/xxx/disk-cloner-go
-cd disk-cloner-go
+git clone https://github.com/jiqing112/disk-cloner
+cd disk-cloner
 
 # Linux
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o disk-cloner-linux-amd64 .
@@ -193,31 +233,23 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o disk-cloner-l
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o disk-cloner-windows-amd64.exe .
 ```
 
-Windows 下也可直接运行 `build.bat`。
+Windows 下也可双击 `build.bat`。
+
+## 自动发布
+
+推送版本标签即可触发 GitHub Actions 自动编译并上传 Release：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+## 快速提交
+
+修改代码后双击 `push.bat`，输入 commit message 即可推送。
 
 ---
 
-## 前置依赖
+## License
 
-### 客户端（程序运行的地方）
-
-- **Linux**：程序启动时自动 `apk add util-linux lvm2 e2fsprogs xfsprogs efibootmgr`
-- **Windows**：无需任何依赖
-
-### 远程服务器（被克隆的机器）
-
-- 需要 `dd`（Alpine busybox 自带）
-- 需要 `gzip`（Alpine busybox 自带，程序会自动检测并安装）
-- 建议进入 Alpine Linux RAM OS 后再克隆（程序会自动检测并警告）
-
----
-
-## 工作原理
-
-| 组件 | 运行位置 | 实现 |
-|------|---------|------|
-| SSH 客户端 | 本地 | Go `crypto/ssh` |
-| gzip 压缩/解压 | 两端 | Go `compress/gzip`（本地）/ 远程 busybox gzip |
-| dd 读写磁盘 | 远程 | 通过 SSH 执行 dd 命令 |
-| lsblk 磁盘扫描 | 远程/本地 | 通过 SSH 执行 / 本地执行 |
-| mdev/partprobe | 本地 | 通过 `--fix-boot-disk` 离线修复引导 |
+MIT
