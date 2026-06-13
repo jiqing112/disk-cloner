@@ -1,0 +1,10 @@
+# Go binaries
+*.exe
+*.exe~
+*.out
+disk-cloner-linux-*
+
+# IDE
+.idea/
+.vscode/
+*.swp
