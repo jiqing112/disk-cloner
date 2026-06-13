@@ -8,3 +8,6 @@ disk-cloner-linux-*
 .idea/
 .vscode/
 *.swp
+
+# Local scripts
+push.bat
