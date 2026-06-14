@@ -32,7 +32,8 @@
 - 传输前可选**零填充**：把远程空闲空间写零，gzip 可极高压缩率
   - 40GB 盘、6GB 数据 → 网络只传 ~6GB
 - 支持压缩/非压缩自动选择（远程有 gzip 则压缩传输）
-- 完成前检测远程是否为 Alpine RAM OS，非 RAM OS 给出警告
+- **克隆前双方都需要进入 Alpine RAM OS**，确保磁盘分区已卸载、无写入干扰
+- 程序自动检测远程是否为 Alpine RAM OS，非 RAM OS 给出警告
 
 ### 模式 2 — 保存为 gzip 文件
 
@@ -65,13 +66,16 @@
 
 - 本地解压后通过 SSH 管道传入远程 dd
 - Windows 支持文件对话框 + 拖拽 + 目录浏览三种选文件方式
+- 恢复前**目标远程服务器需进入 Alpine RAM OS**，确保磁盘分区已卸载
 - 进度显示解压后字节数（从 gzip 尾部 ISIZE 读取，≤4GB 精确）
 
 ---
 
 ## 使用方式
 
-### 1. 远程服务器进入 Alpine RAM OS
+### 1. 服务器进入 Alpine RAM OS
+
+被克隆的源服务器**必须**进入 Alpine RAM OS。克隆到本地磁盘（模式 1）时，目标服务器也需进入 Alpine RAM OS。保存文件（模式 2）和恢复文件（模式 3）只需源端或目标端进入。
 
 参考 [bin456789/reinstall](https://github.com/bin456789/reinstall)：
 
