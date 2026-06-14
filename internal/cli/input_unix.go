@@ -13,12 +13,10 @@ import (
 
 // ReadInput reads a line from the terminal with full backspace/delete support.
 // Uses raw terminal mode to handle control characters properly.
+// If def is not empty, it is pre-filled into the input buffer so the user
+// can edit it with backspace/arrows rather than retyping entirely.
 func ReadInput(prompt, def string) string {
-	if def != "" {
-		fmt.Printf("  %s [%s]: ", prompt, def)
-	} else {
-		fmt.Printf("  %s: ", prompt)
-	}
+	fmt.Printf("  %s: ", prompt)
 
 	fd := int(os.Stdin.Fd())
 
@@ -35,6 +33,11 @@ func ReadInput(prompt, def string) string {
 	defer term.Restore(fd, oldState)
 
 	var buf []byte
+	// Pre-fill buffer with default so the user can edit it
+	if def != "" {
+		buf = []byte(def)
+		fmt.Print(def)
+	}
 	oneByte := make([]byte, 4)
 
 	for {

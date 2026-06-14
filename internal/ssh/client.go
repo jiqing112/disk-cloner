@@ -210,6 +210,16 @@ func (c *Client) Close() {
 	}
 }
 
+// IsConnected checks whether the SSH connection is still alive by sending
+// a keepalive request. Returns false if the connection has been dropped.
+func (c *Client) IsConnected() bool {
+	if c.conn == nil {
+		return false
+	}
+	_, _, err := c.conn.SendRequest("keepalive@openssh.com", true, nil)
+	return err == nil
+}
+
 type Session struct {
 	session *ssh.Session
 	Stdout  io.Reader

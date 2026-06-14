@@ -214,7 +214,8 @@ func (j *CloneJob) Run() error {
 }
 
 // RunToFile saves remote disk as a gzip compressed file.
-// The remote does dd | gzip, so only compressed data travels over the network.
+// Remote does dd | gzip, only compressed data travels over the network.
+// The file is a standard RFC 1952 gzip — compatible with gunzip/dd everywhere.
 func (j *CloneJob) RunToFile() error {
 	if err := validateDevicePath(j.params.SourcePath); err != nil {
 		return err
@@ -233,9 +234,7 @@ func (j *CloneJob) RunToFile() error {
 	}
 	defer f.Close()
 
-	// Remote compresses, local writes the compressed stream directly to disk.
-	// No local gzip ??the file is already gzip-compressed by the remote.
-	j.logFn("  Remote compressing (dd|gzip -> net -> local file)")
+	j.logFn("  Remote compressing (dd|gzip -> net -> file)")
 	if err := j.streamCompressedRaw(f); err != nil {
 		return err
 	}
@@ -358,9 +357,35 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 // zeroFillFreeSpace mounts each partition on the source disk,
 // writes zeros to fill free space, then unmounts.
 func (j *CloneJob) zeroFillFreeSpace() error {
-	j.logFn("  Zero-filling remote disk free space (improves compression)...")
-
 	diskName := j.params.SourcePath
+
+	// Show partition info before starting
+	infoOut, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+		`disk="%s"; diskbase=$(basename "$disk"); echo "DISK=$diskbase"; for p in /sys/block/"$diskbase"/"$diskbase"*/partition; do [ -f "$p" ] || continue; pname=$(basename $(dirname "$p")); size=$(cat /sys/block/"$diskbase"/"$pname"/size 2>/dev/null); echo "PART $pname $size"; done`,
+		diskName,
+	))
+
+	diskNameOnly := ""
+	var parts []string
+	for _, line := range strings.Split(infoOut, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "DISK=") {
+			diskNameOnly = strings.TrimPrefix(line, "DISK=")
+		} else if strings.HasPrefix(line, "PART ") {
+			f := strings.Fields(line)
+			if len(f) >= 3 {
+				sz, _ := strconv.ParseInt(f[2], 10, 64)
+				szBytes := sz * 512
+				parts = append(parts, f[1])
+				j.logFn("    Partition %s: %s", f[1], formatBytesCompat(szBytes))
+			}
+		}
+	}
+	if diskNameOnly != "" {
+		j.logFn("  Disk %s: %d partition(s) found", diskNameOnly, len(parts))
+	}
+
+	j.logFn("  Zero-filling free space on each (mountable) partition...")
 
 	script := fmt.Sprintf(`disk="%s"
 diskbase=$(basename "$disk")
@@ -403,17 +428,25 @@ echo "DONE"
 		}
 	}
 
+	filled := 0
+	skipped := 0
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "FILL ") {
 			j.logFn("    Filled: %s", strings.TrimPrefix(line, "FILL "))
+			filled++
 		} else if strings.HasPrefix(line, "SKIP ") {
-			j.logFn("    -- skip: %s", strings.TrimPrefix(line, "SKIP "))
+			j.logFn("    Skipped (unmountable): %s", strings.TrimPrefix(line, "SKIP "))
+			skipped++
 		} else if line == "NO_PARTS" {
-			j.logFn("    no partitions found")
+			j.logFn("    No partitions found (raw disk without partition table)")
 		}
 	}
-	j.logFn("  zero-fill done")
+	if filled > 0 || skipped > 0 {
+		j.logFn("  Zero-fill done: %d filled, %d skipped", filled, skipped)
+	} else {
+		j.logFn("  Zero-fill done")
+	}
 	return nil
 }
 
@@ -703,14 +736,19 @@ func (j *CloneJob) copyWithProgress(dst io.Writer, src io.Reader) (int64, error)
 					}
 				}
 
-				j.progressFn(Progress{
-					BytesWritten:   written,
-					TotalBytes:     j.params.SourceSize,
-					Percent:        percent,
-					SpeedMBps:      speedMBps,
-					ElapsedSeconds: int64(elapsed),
-					EtaSeconds:     eta,
-				})
+			j.progressFn(Progress{
+				BytesWritten:   written,
+				TotalBytes:     j.params.SourceSize,
+				Percent:        percent,
+				SpeedMBps:      speedMBps,
+				ElapsedSeconds: int64(elapsed),
+				EtaSeconds:     eta,
+			})
+
+			// Check if SSH connection is still alive
+			if !j.sshClient.IsConnected() {
+				return written, fmt.Errorf("SSH connection lost — remote host may have rebooted or shut down")
+			}
 
 				lastUpdate = now
 				lastWritten = written

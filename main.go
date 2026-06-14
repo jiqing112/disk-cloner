@@ -498,16 +498,30 @@ func runSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client)
 }
 
 func askSaveDirectory() string {
+	cwd, _ := os.Getwd()
+	fmt.Println()
+	fmt.Printf("  当前目录: %s\n", cwd)
+
 	if runtime.GOOS == "windows" {
-		fmt.Println()
-		if !cli.Confirm("  保存到当前目录? 输入 no 浏览其他文件夹") {
+		fmt.Println("  ─────────────────────────────────────────────")
+		fmt.Println("  回车 → 使用当前目录")
+		fmt.Println("  输入 b → 浏览文件夹")
+		fmt.Println("  输入路径 → 保存到该路径")
+		input := cli.ReadInput("  保存目录", ".")
+		lower := strings.ToLower(input)
+		if lower == "." || lower == "" {
+			return "."
+		}
+		if lower == "b" || lower == "browse" {
 			if dir := windowsFolderDialog(); dir != "" {
 				return dir
 			}
+			return "."
 		}
-		return "."
+		return input
 	}
-	dir := cli.ReadInput("保存目录 (留空使用当前目录)", ".")
+
+	dir := cli.ReadInput("  保存目录 (回车使用当前目录，或输入路径)", ".")
 	if dir == "" || dir == "." {
 		return "."
 	}
