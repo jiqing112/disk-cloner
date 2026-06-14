@@ -4,6 +4,9 @@
 *.out
 disk-cloner-linux-*
 
+# Disk images
+*.img.gz
+
 # IDE
 .idea/
 .vscode/
