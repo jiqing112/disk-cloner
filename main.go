@@ -490,9 +490,28 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 }
 
 func runSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client) {
+	saveDir := askSaveDirectory()
 	defaultName := makeFileName(ip, srcDisk.Name)
-	fileName := cli.ReadInput("文件名", defaultName)
+	fileName := filepath.Join(saveDir, defaultName)
+	fileName = cli.ReadInput("文件名", fileName)
 	doSaveToFile(ip, srcDisk, sshClient, fileName)
+}
+
+func askSaveDirectory() string {
+	if runtime.GOOS == "windows" {
+		fmt.Println()
+		if !cli.Confirm("  保存到当前目录? 输入 no 浏览其他文件夹") {
+			if dir := windowsFolderDialog(); dir != "" {
+				return dir
+			}
+		}
+		return "."
+	}
+	dir := cli.ReadInput("保存目录 (留空使用当前目录)", ".")
+	if dir == "" || dir == "." {
+		return "."
+	}
+	return dir
 }
 
 func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, fileName string) {
@@ -616,6 +635,26 @@ func windowsFileDialog() string {
 		return ""
 	}
 	// Strip UTF-8 BOM if present (PowerShell [IO.File]::WriteAllText emits it)
+	path := strings.TrimSpace(string(data))
+	path = strings.TrimPrefix(path, "\ufeff")
+	return path
+}
+
+// windowsFolderDialog opens the native Windows folder picker and returns
+// the selected directory path. Returns empty string if cancelled.
+func windowsFolderDialog() string {
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("diskcloner_%d.txt", time.Now().UnixNano()))
+	psCmd := fmt.Sprintf(
+		`Add-Type -AssemblyName System.Windows.Forms; $f=New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description='Select save directory'; if($f.ShowDialog() -eq 'OK'){[IO.File]::WriteAllText('%s',$f.SelectedPath,[Text.Encoding]::UTF8)}`,
+		tmpFile,
+	)
+	exec.Command("powershell", "-NoProfile", "-Command", psCmd).Run()
+
+	data, err := os.ReadFile(tmpFile)
+	os.Remove(tmpFile)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
 	path := strings.TrimSpace(string(data))
 	path = strings.TrimPrefix(path, "\ufeff")
 	return path
