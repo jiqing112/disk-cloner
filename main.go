@@ -18,9 +18,11 @@ import (
 	sshclient "disk-cloner/internal/ssh"
 )
 
-const remoteLsblkCmd = "lsblk -Jb -o NAME,SIZE,TYPE,MOUNTPOINT,MODEL,SERIAL,TRAN,ROTA,RM,FSTYPE,LABEL"
-
-const clearLine = "\r                                                                                \r"
+const (
+	remoteLsblkCmd = "lsblk -Jb -o NAME,SIZE,TYPE,MOUNTPOINT,MODEL,SERIAL,TRAN,ROTA,RM,FSTYPE,LABEL"
+	clearLine      = "\r                                                                                \r"
+	version        = "3.0.0"
+)
 
 func main() {
 	var (
@@ -30,14 +32,43 @@ func main() {
 		remotePass = flag.String("p", "", "SSH 密码")
 		source     = flag.String("s", "", "源磁盘 (远程)")
 		target     = flag.String("t", "", "目标磁盘 (本地)")
-		bs         = flag.String("bs", "4M", "块大小")
+		bs         = flag.String("bs", "4M", "dd 块大小")
 		autoYes    = flag.Bool("y", false, "跳过确认")
 		saveFile   = flag.String("o", "", "保存为 gzip 文件")
 		noFixBoot  = flag.Bool("no-fix-boot", false, "跳过引导修复")
 		fixBootDev = flag.String("fix-boot-disk", "", "独立修复引导")
 		restoreFile = flag.String("r", "", "恢复 gzip 文件到远程磁盘")
+		showVer   = flag.Bool("V", false, "显示版本号")
 	)
+	flag.Usage = func() {
+		fmt.Println("Disk Cloner v" + version)
+		fmt.Println("通过 SSH 远程克隆磁盘的 Go 工具")
+		fmt.Println()
+		fmt.Println("用法:")
+		fmt.Println("  disk-cloner [参数]")
+		fmt.Println()
+		fmt.Println("交互模式 (直接运行):")
+		fmt.Println("  disk-cloner")
+		fmt.Println()
+		fmt.Println("命令行模式:")
+		fmt.Println("  disk-cloner -H 服务器IP -p 密码 -s /dev/sda -t /dev/sda -y")
+		fmt.Println("  disk-cloner -H 服务器IP -p 密码 -s /dev/sda -o auto -y")
+		fmt.Println("  disk-cloner -H 服务器IP -p 密码 -s /dev/sda -r backup.img.gz -y")
+		fmt.Println()
+		fmt.Println("参数:")
+		flag.PrintDefaults()
+		fmt.Println()
+		fmt.Println("示例:")
+		fmt.Println("  克隆:  disk-cloner -H 192.168.1.100 -p mypass -s /dev/sda -t /dev/sda -y")
+		fmt.Println("  保存:  disk-cloner -H 192.168.1.100 -p mypass -s /dev/sda -o auto -y")
+		fmt.Println("  恢复:  disk-cloner -H 192.168.1.100 -p mypass -s /dev/sda -r backup.img.gz -y")
+	}
 	flag.Parse()
+
+	if *showVer {
+		fmt.Println("Disk Cloner v" + version)
+		return
+	}
 
 	setupConsole()
 	ensureDeps()

@@ -1,6 +1,7 @@
 package clone
 
 import (
+	"bufio"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -356,17 +357,19 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 
 // zeroFillFreeSpace mounts each partition on the source disk,
 // writes zeros to fill free space, then unmounts.
+// Outputs progress in real-time as each partition is processed.
 func (j *CloneJob) zeroFillFreeSpace() error {
 	diskName := j.params.SourcePath
 
 	// Show partition info before starting
+	j.logFn("  Scanning remote disk partitions...")
 	infoOut, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
 		`disk="%s"; diskbase=$(basename "$disk"); echo "DISK=$diskbase"; for p in /sys/block/"$diskbase"/"$diskbase"*/partition; do [ -f "$p" ] || continue; pname=$(basename $(dirname "$p")); size=$(cat /sys/block/"$diskbase"/"$pname"/size 2>/dev/null); echo "PART $pname $size"; done`,
 		diskName,
 	))
 
 	diskNameOnly := ""
-	var parts []string
+	var totalSize int64
 	for _, line := range strings.Split(infoOut, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "DISK=") {
@@ -376,17 +379,18 @@ func (j *CloneJob) zeroFillFreeSpace() error {
 			if len(f) >= 3 {
 				sz, _ := strconv.ParseInt(f[2], 10, 64)
 				szBytes := sz * 512
-				parts = append(parts, f[1])
+				totalSize += szBytes
 				j.logFn("    Partition %s: %s", f[1], formatBytesCompat(szBytes))
 			}
 		}
 	}
 	if diskNameOnly != "" {
-		j.logFn("  Disk %s: %d partition(s) found", diskNameOnly, len(parts))
+		j.logFn("  Disk %s: total %s across %d partition(s)", diskNameOnly, formatBytesCompat(totalSize), len(strings.Split(infoOut, "\n"))-2) // rough count
 	}
 
-	j.logFn("  Zero-filling free space on each (mountable) partition...")
+	j.logFn("  Zero-filling free space (run 'df -h /dev/sda*' on remote to see progress)...")
 
+	// Build script that outputs progress immediately (no 2>/dev/null on dd)
 	script := fmt.Sprintf(`disk="%s"
 diskbase=$(basename "$disk")
 modprobe ext4 2>/dev/null
@@ -407,10 +411,11 @@ for part in $parts; do
   mp=$(mktemp -d /tmp/zf.XXXXXX)
   if mount "$part" "$mp" 2>/dev/null; then
     echo "FILL $part"
-    dd if=/dev/zero of="$mp/.zero_fill" bs=4194304 2>/dev/null || true
+    dd if=/dev/zero of="$mp/.zero_fill" bs=4194304 2>/dev/null
     rm -f "$mp/.zero_fill"
     sync
     umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null
+    echo "DONEPART $part"
   else
     echo "SKIP $part"
   fi
@@ -419,29 +424,36 @@ done
 echo "DONE"
 `, diskName)
 
-	out, err := j.sshClient.CombinedOutput("sh -c " + shellQuote(script))
+	// Stream execution — shows each FILL line in real-time
+	session, err := j.sshClient.Execute("sh -c " + shellQuote(script))
 	if err != nil {
-		if strings.Contains(out, "DONE") || strings.Contains(out, "FILL") {
-			// Partial success is OK
-		} else {
-			return fmt.Errorf("zero-fill: %w\n%s", err, out)
+		return fmt.Errorf("start zero-fill: %w", err)
+	}
+	defer session.Close()
+
+	scanner := bufio.NewScanner(session.Stdout)
+	filled := 0
+	skipped := 0
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "FILL ") {
+			j.logFn("    Filling: %s", strings.TrimPrefix(line, "FILL "))
+			filled++
+		} else if strings.HasPrefix(line, "DONEPART ") {
+			j.logFn("    Done: %s", strings.TrimPrefix(line, "DONEPART "))
+		} else if strings.HasPrefix(line, "SKIP ") {
+			j.logFn("    Skipped: %s", strings.TrimPrefix(line, "SKIP "))
+		} else if line == "NO_PARTS" {
+			j.logFn("    No partitions found (raw disk)")
+		} else if line == "DONE" {
+			break
 		}
 	}
 
-	filled := 0
-	skipped := 0
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "FILL ") {
-			j.logFn("    Filled: %s", strings.TrimPrefix(line, "FILL "))
-			filled++
-		} else if strings.HasPrefix(line, "SKIP ") {
-			j.logFn("    Skipped (unmountable): %s", strings.TrimPrefix(line, "SKIP "))
-			skipped++
-		} else if line == "NO_PARTS" {
-			j.logFn("    No partitions found (raw disk without partition table)")
-		}
+	if err := scanner.Err(); err != nil {
+		j.logFn("  Warning: output stream ended early: %v", err)
 	}
+
 	if filled > 0 || skipped > 0 {
 		j.logFn("  Zero-fill done: %d filled, %d skipped", filled, skipped)
 	} else {
