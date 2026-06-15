@@ -132,13 +132,15 @@ func readGzipISize(path string) int64 {
 	size := int64(uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24)
 
 	// If the uncompressed size is larger than 4 GB, ISIZE wraps around.
-	// As a heuristic: if the compressed file is large (>2 GB) and ISIZE
-	// is relatively small, the data probably exceeded 4 GB and ISIZE wrapped.
-	// We return 0 in that case to avoid showing an incorrect small size.
+	// Heuristic to detect ISIZE wrap (uncompressed size > 4 GB):
+	// If the claimed ISIZE is less than 2x the compressed file size,
+	// the actual uncompressed data probably exceeded 4 GB and ISIZE wrapped.
+	// gzip cannot normally achieve >50% compression on disk images, so
+	// ISIZE < compressedSize * 2 is a reliable indicator of wrapping.
 	info, _ := f.Stat()
 	compressedSize := info.Size()
-	if compressedSize > 2*1024*1024*1024 && size < compressedSize/5 {
-		return 0 // likely wrapped, give up rather than show wrong number
+	if compressedSize > 512*1024*1024 && size < compressedSize*2 {
+		return 0 // likely wrapped
 	}
 
 	return size

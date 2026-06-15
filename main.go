@@ -268,7 +268,25 @@ func runInteractive() {
 
 			cli.PrintSection("请选择源磁盘 — 输入序号选定远程磁盘")
 			cli.PrintDiskList(remoteList, "remote")
-			idx := cli.SelectDisk("请输入序号", 1, len(remoteList))
+			if mode == 2 {
+				fmt.Println("  [0] 备份全部磁盘")
+			}
+			minIdx := 1
+			if mode == 2 {
+				minIdx = 0
+			}
+			idx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
+
+			if mode == 2 && idx == 0 {
+				for i, d := range remoteList {
+					fmt.Println()
+					fmt.Printf("  --- 备份 %d/%d: %s ---\n", i+1, len(remoteList), d.Path)
+					runSaveToFile(ip, d, sshClient)
+				}
+				waitExit()
+				return
+			}
+
 			disk := remoteList[idx-1]
 
 			if mode == 2 {
@@ -299,17 +317,36 @@ func runInteractive() {
 		}
 
 		fmt.Println()
-		cli.PrintSection("选择源磁盘 — 输入序号选定远程磁盘")
-		cli.PrintDiskList(remoteList, "remote")
-		srcIdx := cli.SelectDisk("请输入序号", 1, len(remoteList))
-		srcDisk := remoteList[srcIdx-1]
-
-		fmt.Println()
 		fmt.Println("  操作模式 — 输入序号选择:")
 		fmt.Println("  [1] 克隆到本地磁盘 (dd -> 磁盘)")
 		fmt.Println("  [2] 保存为压缩文件 (dd -> gzip 文件)")
 		fmt.Println("  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)")
 		mode := cli.SelectOption("请输入序号", 1, 3)
+
+		fmt.Println()
+		cli.PrintSection("选择源磁盘 — 输入序号选定远程磁盘")
+		cli.PrintDiskList(remoteList, "remote")
+		if mode == 2 {
+			fmt.Println("  [0] 备份全部磁盘")
+		}
+
+		minIdx := 1
+		if mode == 2 {
+			minIdx = 0
+		}
+		srcIdx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
+
+		if mode == 2 && srcIdx == 0 {
+			for i, d := range remoteList {
+				fmt.Println()
+				fmt.Printf("  --- 备份 %d/%d: %s ---\n", i+1, len(remoteList), d.Path)
+				runSaveToFile(ip, d, sshClient)
+			}
+			waitExit()
+			return
+		}
+
+		srcDisk := remoteList[srcIdx-1]
 
 		if mode == 1 {
 			if len(localList) == 0 {
@@ -598,7 +635,7 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 }
 
 func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client) {
-	fileName := cli.ReadInput("本地文件 (.img.gz, 回车浏览)", "")
+	fileName := cli.ReadInputPath("本地文件 (.img.gz, 回车浏览)", "")
 
 	if fileName == "" {
 		fileName = browseLocalFiles()
@@ -611,6 +648,10 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 		fmt.Printf("\n  文件不存在: %s\n", fileName)
 		return
 	}
+
+	fmt.Println()
+	fmt.Printf("  已选中文件: %s\n", fileName)
+	fmt.Println()
 
 	remoteDisk := cli.ReadInput("远程目标磁盘", srcDisk.Path)
 
