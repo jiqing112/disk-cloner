@@ -200,23 +200,8 @@ func runInteractive() {
 		}
 
 		fmt.Println()
-		fmt.Print("  正在检测 SSH 服务...")
 
-		probe, probeErr := sshclient.ProbeSSH(sshclient.Config{Host: ip, Port: port, Timeout: 5})
-		if probeErr != nil {
-			fmt.Printf(clearLine+"  SSH 探测失败: %v\n", probeErr)
-			fmt.Println()
-			fmt.Println("  端口可达但未收到 SSH 响应，请确认:")
-			fmt.Println("    - 目标端口确实运行着 SSH 服务")
-			fmt.Println("    - 防火墙/代理没有拦截 SSH 协议")
-			fmt.Println()
-			fmt.Println("  请重新输入连接信息...")
-			fmt.Println()
-			continue
-		}
-		fmt.Printf(clearLine+"  SSH 服务已确认 (%s)\n", probe.Banner)
-
-		fmt.Print("  正在进行 SSH 认证...")
+		fmt.Print("  正在连接...")
 		sshClient, err := sshclient.Connect(sshclient.Config{
 			Host: ip, Port: port, User: user, Password: pass, Timeout: 15,
 		})
@@ -437,7 +422,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 	if saveFile != "" {
 		if saveFile == "auto" {
-			saveFile = makeFileName(ip, source)
+			saveFile = makeFileName(ip, source, srcDisk.SizeHuman)
 		}
 		fmt.Printf("文件: %s (gzip)\n", saveFile)
 		cliDisk := cli.DiskItem{Path: srcDisk.Path, SizeBytes: srcDisk.SizeBytes, SizeHuman: srcDisk.SizeHuman, Name: srcDisk.Name}
@@ -522,7 +507,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 func runSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client) {
 	saveDir := askSaveDirectory()
-	defaultName := makeFileName(ip, srcDisk.Name)
+	defaultName := makeFileName(ip, srcDisk.Name, srcDisk.SizeHuman)
 	fileName := filepath.Join(saveDir, defaultName)
 	fileName = cli.ReadInput("文件名", fileName)
 	doSaveToFile(ip, srcDisk, sshClient, fileName)
@@ -835,9 +820,19 @@ func waitExit() {
 	}
 }
 
-func makeFileName(ip, diskName string) string {
+func makeFileName(ip, diskName, sizeHuman string) string {
 	if i := strings.LastIndex(diskName, "/"); i >= 0 {
 		diskName = diskName[i+1:]
+	}
+	// Extract numeric size like "30 GB" -> "30G"
+	size := ""
+	for _, part := range strings.Fields(sizeHuman) {
+		if part != "B" {
+			size += part
+		}
+	}
+	if size != "" {
+		return fmt.Sprintf("%s-%s-%s.img.gz", ip, diskName, size)
 	}
 	return fmt.Sprintf("%s-%s.img.gz", ip, diskName)
 }

@@ -36,6 +36,9 @@ func ProbeSSH(cfg Config) (*ProbeResult, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 22
 	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 15
+	}
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
@@ -44,7 +47,8 @@ func ProbeSSH(cfg Config) (*ProbeResult, error) {
 	}
 	defer conn.Close()
 
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// Use the config timeout for reading the banner (some servers are slow)
+	conn.SetReadDeadline(time.Now().Add(time.Duration(cfg.Timeout) * time.Second))
 	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
 	if err != nil {
@@ -68,24 +72,26 @@ func Connect(cfg Config) (*Client, error) {
 
 	authMethods := []ssh.AuthMethod{}
 
-	// Password auth (tried first if provided)
+	// Password provided → use password auth only.
+	// Loading SSH keys alongside password can exceed MaxAuthTries on
+	// servers with strict limits (each failed key attempt counts).
 	if cfg.Password != "" {
 		authMethods = append(authMethods, ssh.Password(cfg.Password))
-	}
-
-	// Try all available SSH keys
-	keyPaths := []string{"~/.ssh/id_rsa", "~/.ssh/id_ed25519", "~/.ssh/id_ecdsa"}
-	for _, kp := range keyPaths {
-		expanded := expandPath(kp)
-		key, err := os.ReadFile(expanded)
-		if err != nil {
-			continue
+	} else {
+		// Try SSH keys as fallback
+		keyPaths := []string{"~/.ssh/id_rsa", "~/.ssh/id_ed25519", "~/.ssh/id_ecdsa"}
+		for _, kp := range keyPaths {
+			expanded := expandPath(kp)
+			key, err := os.ReadFile(expanded)
+			if err != nil {
+				continue
+			}
+			signer, err := ssh.ParsePrivateKey(key)
+			if err != nil {
+				continue
+			}
+			authMethods = append(authMethods, ssh.PublicKeys(signer))
 		}
-		signer, err := ssh.ParsePrivateKey(key)
-		if err != nil {
-			continue
-		}
-		authMethods = append(authMethods, ssh.PublicKeys(signer))
 	}
 
 	if len(authMethods) == 0 {

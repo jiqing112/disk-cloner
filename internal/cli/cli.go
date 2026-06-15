@@ -84,7 +84,7 @@ func ConfirmZero() bool {
 	fmt.Println("  传输前先零填充空闲空间?")
 	fmt.Println("    将空闲空间写零可大幅提高压缩率，减少网络传输量。")
 	fmt.Println("    可能需要较长时间，但能显著减少网络流量。")
-	input := ReadInput("  零填充 [Y/n]", "y")
+	input := ReadInput("  零填充 (回车=执行填充, 输入n=跳过填充) [Y/n]", "")
 	lower := strings.ToLower(input)
 	return lower != "n" && lower != "no"
 }
@@ -100,6 +100,7 @@ type CloneProgress struct {
 
 func PrintProgress(p CloneProgress) {
 	transferred := formatSize(p.BytesWritten)
+	elapsedStr := formatDuration(p.ElapsedSeconds)
 	etaStr := "--"
 	if p.EtaSeconds > 0 {
 		etaStr = formatDuration(p.EtaSeconds)
@@ -109,8 +110,8 @@ func PrintProgress(p CloneProgress) {
 		// Unknown total size (restore mode) — show animated spinner + bytes transferred
 		spinner := []string{"|", "/", "-", "\\"}
 		sp := spinner[int(time.Now().UnixMilli()/200)%4]
-		fmt.Printf("\r  [%s] %s  %6.1f MB/s  %s          ",
-			sp, transferred, p.SpeedMBps, etaStr)
+		fmt.Printf("\r  [%s] %s  %6.1f MB/s  %s           ",
+			sp, transferred, p.SpeedMBps, elapsedStr)
 		os.Stdout.Sync()
 		return
 	}
@@ -137,8 +138,8 @@ func PrintProgress(p CloneProgress) {
 
 	total := formatSize(p.TotalBytes)
 
-	fmt.Printf("\r  [%s] %5.1f%%  %6.1f MB/s  %s/%s  ETA: %s          ",
-		string(bar), p.Percent, p.SpeedMBps, transferred, total, etaStr)
+	fmt.Printf("\r  [%s] %5.1f%%  %6.1f MB/s  %s/%s  %s  ETA: %s          ",
+		string(bar), p.Percent, p.SpeedMBps, transferred, total, elapsedStr, etaStr)
 	os.Stdout.Sync()
 }
 
