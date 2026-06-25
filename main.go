@@ -563,8 +563,6 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 func runSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client) {
 	saveDir := askSaveDirectory()
-
-	// Create date-based subfolder: 2026-06-15
 	dateStr := time.Now().Format("2006-01-02")
 	dateDir := filepath.Join(saveDir, dateStr)
 	os.MkdirAll(dateDir, 0755)
@@ -574,6 +572,31 @@ func runSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client)
 	fileName := filepath.Join(dateDir, defaultName)
 	fileName = cli.ReadInput("文件名", fileName)
 	doSaveToFile(ip, srcDisk, sshClient, fileName)
+}
+
+// batchSaveToFile saves all remote disks with a single set of prompts.
+func batchSaveToFile(ip string, disks []cli.DiskItem, sshClient *sshclient.Client) {
+	saveDir := askSaveDirectory()
+	dateStr := time.Now().Format("2006-01-02")
+	dateDir := filepath.Join(saveDir, dateStr)
+	os.MkdirAll(dateDir, 0755)
+	fmt.Printf("  保存目录: %s\n", dateDir)
+
+	blockSize := cli.ReadInput("块大小", "4M")
+	compressLevel = cli.AskCompressionLevel()
+	doZero := cli.ConfirmZero()
+	fmt.Println()
+	if !cli.Confirm("  确认开始批量备份? 输入 yes 继续") {
+		fmt.Println("  已取消")
+		return
+	}
+
+	for i, d := range disks {
+		fmt.Println()
+		fmt.Printf("  --- 备份 %d/%d: %s ---\n", i+1, len(disks), d.Path)
+		fileName := filepath.Join(dateDir, makeFileName(ip, d.Name, d.SizeHuman, dateStr))
+		execSaveToFile(ip, d, sshClient, fileName, blockSize, doZero)
+	}
 }
 
 func askSaveDirectory() string {
@@ -630,6 +653,11 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 		fmt.Println("  已取消")
 		return
 	}
+	execSaveToFile(ip, srcDisk, sshClient, fileName, blockSize, doZero)
+}
+
+// execSaveToFile runs the actual save without prompts.
+func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, fileName string, blockSize string, doZero bool) {
 	fmt.Println()
 	fmt.Println("  开始保存...")
 	fmt.Println()
