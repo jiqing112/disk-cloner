@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -187,6 +188,7 @@ func runInteractive() {
 		fmt.Println("  远程服务器配置")
 		fmt.Println("  ─────────────────────────────────────────────")
 		ip := cli.ReadInput("服务器IP", "")
+		ip = extractIP(ip)
 		if ip == "" {
 			fmt.Println("  取消")
 			waitExit()
@@ -653,7 +655,7 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	fmt.Printf("  已选中文件: %s\n", fileName)
 	fmt.Println()
 
-	remoteDisk := cli.ReadInput("远程目标磁盘", srcDisk.Path)
+	remoteDisk := cli.ReadInput("远程目标磁盘，确认请回车", srcDisk.Path)
 
 	fmt.Println()
 	fmt.Println("  +--------------------------------------------+")
@@ -689,6 +691,8 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	fmt.Printf("  恢复完成! 总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
 	fmt.Println("  ===============================================")
 }
+
+// windowsFileDialog opens the native Windows file picker and returns the
 
 // windowsFileDialog opens the native Windows file picker and returns the
 // selected file path. Returns empty string if cancelled or unavailable.
@@ -876,6 +880,23 @@ func makeFileName(ip, diskName, sizeHuman string) string {
 		return fmt.Sprintf("%s-%s-%s.img.gz", ip, diskName, size)
 	}
 	return fmt.Sprintf("%s-%s.img.gz", ip, diskName)
+}
+
+// extractIP attempts to extract an IPv4 address from user input.
+// Handles copied text like "IP: 192.168.1.100" or "192.168.1.100:22".
+var ipRe = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
+
+func extractIP(input string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return ""
+	}
+	// Try to extract IP from any surrounding text
+	match := ipRe.FindString(input)
+	if match != "" {
+		return match
+	}
+	return input
 }
 
 func makeProgressFn() func(clone.Progress) {

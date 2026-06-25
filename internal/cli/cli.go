@@ -124,12 +124,11 @@ func PrintProgress(p CloneProgress) {
 	}
 
 	if p.TotalBytes <= 0 {
-		// Unknown total size (restore mode) — show animated spinner + bytes transferred
 		spinner := []string{"|", "/", "-", "\\"}
 		sp := spinner[int(time.Now().UnixMilli()/200)%4]
 		fmt.Printf("\r  [%s] %s  %6.1f MB/s  %s           ",
 			sp, transferred, p.SpeedMBps, elapsedStr)
-		os.Stdout.Sync()
+		flushConsole()
 		return
 	}
 
@@ -157,16 +156,20 @@ func PrintProgress(p CloneProgress) {
 
 	fmt.Printf("\r  [%s] %5.1f%%  %6.1f MB/s  %s/%s  %s  ETA: %s          ",
 		string(bar), p.Percent, p.SpeedMBps, transferred, total, elapsedStr, etaStr)
-	os.Stdout.Sync()
+	flushConsole()
 }
 
 func PrintProgressComplete(p CloneProgress) {
 	fmt.Print("\r                                                                                                    \r")
-	os.Stdout.Sync()
 	duration := formatDuration(p.ElapsedSeconds)
 	fmt.Printf("  完成!  %s 已传输  平均速度: %.1f MB/s  用时: %s\n",
 		formatSize(p.BytesWritten), p.SpeedMBps, duration)
 	fmt.Println()
+}
+
+// flushConsole flushes stdout to show progress in real-time.
+func flushConsole() {
+	os.Stdout.Sync()
 }
 
 func formatDuration(seconds int64) string {
