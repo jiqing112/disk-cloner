@@ -106,6 +106,21 @@ func ConfirmZero() bool {
 	return lower != "n" && lower != "no"
 }
 
+// AskCompressionLevel prompts the user to choose gzip compression level.
+func AskCompressionLevel() int {
+	fmt.Println("  压缩级别:")
+	fmt.Println("    0 = 不压缩 (局域网快速, 节省远程 CPU)")
+	fmt.Println("    1 = 最快 (默认, 适合日常备份)")
+	fmt.Println("    6 = 均衡 (中等压缩率)")
+	fmt.Println("    9 = 最小 (最高压缩, 费 CPU)")
+	input := ReadInput("  压缩级别", "1")
+	val, err := strconv.Atoi(input)
+	if err != nil || val < 0 || val > 9 {
+		return 1
+	}
+	return val
+}
+
 type CloneProgress struct {
 	BytesWritten   int64
 	TotalBytes     int64

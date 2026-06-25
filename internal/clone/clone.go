@@ -18,11 +18,12 @@ import (
 )
 
 type Params struct {
-	SourcePath string
-	TargetPath string // block device for clone, file path for save
-	SourceSize int64
-	BlockSize  string
-	ZeroFill   bool // zero-fill free space before dd (improves compression)
+	SourcePath       string
+	TargetPath       string // block device for clone, file path for save
+	SourceSize       int64
+	BlockSize        string
+	ZeroFill         bool // zero-fill free space before dd (improves compression)
+	CompressionLevel int  // 0=no compression, 1-9=gzip level (default 1)
 }
 
 // LogFunc is called to print status messages during zero-fill etc.
@@ -194,16 +195,23 @@ func (j *CloneJob) Run() error {
 	}
 	defer target.Close()
 
-	// Check if remote has gzip (Alpine busybox includes it, but check anyway)
-	hasGzip := j.remoteHasCommand("gzip")
+	// Compression level 0 = no compression, 1-9 = gzip level
+	useCompression := j.params.CompressionLevel > 0
 
-	if hasGzip {
-		j.logFn("  Using compressed transfer (dd|gzip -> net -> gunzip -> disk)")
-		if err := j.streamCompressed(target); err != nil {
-			return err
+	if useCompression {
+		if j.remoteHasCommand("gzip") {
+			j.logFn("  Using compressed transfer (dd|gzip -> net -> gunzip -> disk)")
+			if err := j.streamCompressed(target); err != nil {
+				return err
+			}
+		} else {
+			j.logFn("  Remote gzip not found, falling back to raw transfer")
+			if err := j.streamRaw(target); err != nil {
+				return err
+			}
 		}
 	} else {
-		j.logFn("  [!] Remote gzip not found, using raw transfer (slower)")
+		j.logFn("  No compression (dd -> net -> disk)")
 		if err := j.streamRaw(target); err != nil {
 			return err
 		}
@@ -480,9 +488,12 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	}
 	bsBytes := bsToBytes(bs)
 
-	// Remote: dd | gzip -1 (fast compression)
-	// gzip -1 is best for dd streaming: minimal CPU overhead, good compression on zero-filled regions
-	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | gzip -1", j.params.SourcePath, bsBytes)
+	// Remote: dd | gzip -N (user-chosen compression level)
+	level := j.params.CompressionLevel
+	if level <= 0 || level > 9 {
+		level = 1
+	}
+	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | gzip -%d", j.params.SourcePath, bsBytes, level)
 
 	session, err := j.sshClient.Execute(remoteCmd)
 	if err != nil {
@@ -570,7 +581,11 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 	}
 	bsBytes := bsToBytes(bs)
 
-	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | gzip -1", j.params.SourcePath, bsBytes)
+	level := j.params.CompressionLevel
+	if level <= 0 || level > 9 {
+		level = 1
+	}
+	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | gzip -%d", j.params.SourcePath, bsBytes, level)
 
 	session, err := j.sshClient.Execute(remoteCmd)
 	if err != nil {

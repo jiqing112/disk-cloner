@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -25,6 +27,8 @@ const (
 	version        = "3.0.0"
 )
 
+var compressLevel = 1 // default gzip compression level 1-9, 0 = no compression
+
 func main() {
 	var (
 		remoteIP   = flag.String("H", "", "远程服务器 IP")
@@ -34,6 +38,7 @@ func main() {
 		source     = flag.String("s", "", "源磁盘 (远程)")
 		target     = flag.String("t", "", "目标磁盘 (本地)")
 		bs         = flag.String("bs", "4M", "dd 块大小")
+		compressLv = flag.Int("z", 1, "压缩级别 0-9 (0=不压缩, 1=最快, 9=最小)")
 		autoYes    = flag.Bool("y", false, "跳过确认")
 		saveFile   = flag.String("o", "", "保存为 gzip 文件")
 		noFixBoot  = flag.Bool("no-fix-boot", false, "跳过引导修复")
@@ -65,6 +70,11 @@ func main() {
 		fmt.Println("  恢复:  disk-cloner -H 192.168.1.100 -p mypass -s /dev/sda -r backup.img.gz -y")
 	}
 	flag.Parse()
+
+	compressLevel = *compressLv
+	if compressLevel < 0 || compressLevel > 9 {
+		compressLevel = 1
+	}
 
 	if *showVer {
 		fmt.Println("Disk Cloner v" + version)
@@ -375,6 +385,7 @@ func runInteractive() {
 			}
 
 			blockSize := cli.ReadInput("块大小", "4M")
+			compressLevel = cli.AskCompressionLevel()
 
 			fmt.Println()
 			doZero := cli.ConfirmZero()
@@ -398,6 +409,7 @@ func runInteractive() {
 				SourceSize: srcDisk.SizeBytes,
 				BlockSize:  blockSize,
 				ZeroFill:   doZero,
+				CompressionLevel: compressLevel,
 			}, makeProgressFn())
 			job.SetLogFunc(func(format string, args ...interface{}) {
 				fmt.Printf(format+"\n", args...)
@@ -461,7 +473,10 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 	if saveFile != "" {
 		if saveFile == "auto" {
-			saveFile = makeFileName(ip, source, srcDisk.SizeHuman)
+			dateStr := time.Now().Format("2006-01-02")
+			dateDir := filepath.Join(".", dateStr)
+			os.MkdirAll(dateDir, 0755)
+			saveFile = filepath.Join(dateDir, makeFileName(ip, source, srcDisk.SizeHuman, dateStr))
 		}
 		fmt.Printf("文件: %s (gzip)\n", saveFile)
 		cliDisk := cli.DiskItem{Path: srcDisk.Path, SizeBytes: srcDisk.SizeBytes, SizeHuman: srcDisk.SizeHuman, Name: srcDisk.Name}
@@ -478,6 +493,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		job := clone.New(sshClient, clone.Params{
 			TargetPath: source,
 			BlockSize:  bs,
+			CompressionLevel: compressLevel,
 		}, makeProgressFn())
 		job.SetLogFunc(func(format string, args ...interface{}) {
 			fmt.Printf(format+"\n", args...)
@@ -529,6 +545,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		SourceSize: srcDisk.SizeBytes,
 		BlockSize:  bs,
 		ZeroFill:   true,
+		CompressionLevel: compressLevel,
 	}, makeProgressFn())
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
@@ -546,8 +563,15 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 func runSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client) {
 	saveDir := askSaveDirectory()
-	defaultName := makeFileName(ip, srcDisk.Name, srcDisk.SizeHuman)
-	fileName := filepath.Join(saveDir, defaultName)
+
+	// Create date-based subfolder: 2026-06-15
+	dateStr := time.Now().Format("2006-01-02")
+	dateDir := filepath.Join(saveDir, dateStr)
+	os.MkdirAll(dateDir, 0755)
+	fmt.Printf("  保存目录: %s\n", dateDir)
+
+	defaultName := makeFileName(ip, srcDisk.Name, srcDisk.SizeHuman, dateStr)
+	fileName := filepath.Join(dateDir, defaultName)
 	fileName = cli.ReadInput("文件名", fileName)
 	doSaveToFile(ip, srcDisk, sshClient, fileName)
 }
@@ -598,6 +622,8 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 	}
 	blockSize := cli.ReadInput("块大小", "4M")
 
+	compressLevel = cli.AskCompressionLevel()
+
 	doZero := cli.ConfirmZero()
 	fmt.Println()
 	if !cli.Confirm("  确认开始保存? 输入 yes 继续") {
@@ -615,6 +641,7 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 		SourceSize: srcDisk.SizeBytes,
 		BlockSize:  blockSize,
 		ZeroFill:   doZero,
+		CompressionLevel: compressLevel,
 	}, makeProgressFn())
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
@@ -623,6 +650,9 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 		fmt.Printf("\n  保存失败: %v\n", err)
 		return
 	}
+
+	saveChecksum(fileName)
+
 	if info, err := os.Stat(fileName); err == nil {
 		ratio := 0.0
 		if srcDisk.SizeBytes > 0 {
@@ -677,10 +707,18 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	job := clone.New(sshClient, clone.Params{
 		TargetPath: remoteDisk,
 		BlockSize:  "4M",
+		CompressionLevel: compressLevel,
 	}, makeProgressFn())
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
 	})
+
+	if !verifyChecksum(fileName) {
+		if !cli.Confirm("  校验失败，是否继续恢复? 输入 yes 强制恢复") {
+			return
+		}
+	}
+
 	if err := job.RestoreFromFile(fileName); err != nil {
 		fmt.Printf("\n  恢复失败: %v\n", err)
 		return
@@ -865,7 +903,7 @@ func waitExit() {
 	}
 }
 
-func makeFileName(ip, diskName, sizeHuman string) string {
+func makeFileName(ip, diskName, sizeHuman, dateStr string) string {
 	if i := strings.LastIndex(diskName, "/"); i >= 0 {
 		diskName = diskName[i+1:]
 	}
@@ -877,9 +915,9 @@ func makeFileName(ip, diskName, sizeHuman string) string {
 		}
 	}
 	if size != "" {
-		return fmt.Sprintf("%s-%s-%s.img.gz", ip, diskName, size)
+		return fmt.Sprintf("%s-%s-%s-%s.img.gz", ip, diskName, size, dateStr)
 	}
-	return fmt.Sprintf("%s-%s.img.gz", ip, diskName)
+	return fmt.Sprintf("%s-%s-%s.img.gz", ip, diskName, dateStr)
 }
 
 // extractIP attempts to extract an IPv4 address from user input.
@@ -946,4 +984,56 @@ func countType(disks []disk.DiskInfo, t string) int {
 		}
 	}
 	return n
+}
+
+// saveChecksum computes SHA256 of a file and writes it to filePath+".sha256".
+func saveChecksum(filePath string) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return
+	}
+
+	hash := fmt.Sprintf("%x  %s\n", h.Sum(nil), filepath.Base(filePath))
+	os.WriteFile(filePath+".sha256", []byte(hash), 0644)
+	fmt.Printf("  校验文件: %s.sha256\n", filePath)
+}
+
+// verifyChecksum checks .sha256 file against the actual file. Returns true if valid.
+func verifyChecksum(filePath string) bool {
+	data, err := os.ReadFile(filePath + ".sha256")
+	if err != nil {
+		return true // no checksum file to verify against
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return true
+	}
+
+	actual := fmt.Sprintf("%x", h.Sum(nil))
+	expected := strings.Fields(string(data))
+	if len(expected) == 0 {
+		return true
+	}
+
+	if actual != expected[0] {
+		fmt.Printf("  [!] SHA256 不匹配! 文件可能已损坏\n")
+		fmt.Printf("  期望: %s\n", expected[0])
+		fmt.Printf("  实际: %s\n", actual)
+		return false
+	}
+	fmt.Println("  ✓ 文件完整性校验通过")
+	return true
 }
