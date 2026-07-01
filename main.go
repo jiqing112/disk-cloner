@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -290,11 +291,7 @@ func runInteractive() {
 			idx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
 
 			if mode == 2 && idx == 0 {
-				for i, d := range remoteList {
-					fmt.Println()
-					fmt.Printf("  --- 备份 %d/%d: %s ---\n", i+1, len(remoteList), d.Path)
-					runSaveToFile(ip, d, sshClient)
-				}
+				batchSaveToFile(ip, remoteList, sshClient)
 				waitExit()
 				return
 			}
@@ -349,11 +346,7 @@ func runInteractive() {
 		srcIdx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
 
 		if mode == 2 && srcIdx == 0 {
-			for i, d := range remoteList {
-				fmt.Println()
-				fmt.Printf("  --- 备份 %d/%d: %s ---\n", i+1, len(remoteList), d.Path)
-				runSaveToFile(ip, d, sshClient)
-			}
+			batchSaveToFile(ip, remoteList, sshClient)
 			waitExit()
 			return
 		}
@@ -731,6 +724,20 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	fmt.Println("  开始恢复...")
 	fmt.Println()
 
+	// Check target disk size vs uncompressed image size
+	uncompSize := clone.GzipUncompressedSize(fileName)
+	if uncompSize > 0 {
+		targetSize, _ := getRemoteDiskSize(sshClient, remoteDisk)
+		if targetSize > 0 && uncompSize > targetSize {
+			pct := float64(targetSize) / float64(uncompSize) * 100
+			fmt.Printf("  [!] 目标盘 (%s) 小于解压后镜像 (%s)，只能写入约 %.1f%%\n",
+				disk.FormatBytes(targetSize), disk.FormatBytes(uncompSize), pct)
+			if !cli.Confirm("  继续恢复? 输入 yes") {
+				return
+			}
+		}
+	}
+
 	totalStart := time.Now()
 	job := clone.New(sshClient, clone.Params{
 		TargetPath: remoteDisk,
@@ -758,7 +765,19 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	fmt.Println("  ===============================================")
 }
 
-// windowsFileDialog opens the native Windows file picker and returns the
+// getRemoteDiskSize returns the size of a disk on the remote server via lsblk.
+func getRemoteDiskSize(sshClient *sshclient.Client, disk string) (int64, error) {
+	out, err := sshClient.CombinedOutput(fmt.Sprintf("lsblk -b -n -o SIZE %s 2>/dev/null | head -1", disk))
+	if err != nil {
+		return 0, err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return 0, fmt.Errorf("no size returned")
+	}
+	size, err := strconv.ParseInt(out, 10, 64)
+	return size, err
+}
 
 // windowsFileDialog opens the native Windows file picker and returns the
 // selected file path. Returns empty string if cancelled or unavailable.

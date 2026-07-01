@@ -109,6 +109,12 @@ func bsToBytes(bs string) string {
 	}
 }
 
+// GzipUncompressedSize reads the uncompressed size from a .gz file.
+// Returns 0 if unknown (file > 4 GB or not a valid gzip).
+func GzipUncompressedSize(path string) int64 {
+	return readGzipISize(path)
+}
+
 // readGzipISize reads the last 4 bytes of a gzip file to get the
 // uncompressed data size (ISIZE, stored as uint32 LE modulo 2^32).
 // For files <= 4 GB this is exact; for larger files it wraps around.
@@ -731,6 +737,12 @@ func (j *CloneJob) copyWithProgress(dst io.Writer, src io.Reader) (int64, error)
 	lastUpdate := time.Now()
 	var lastWritten int64
 
+	// Sliding window of speed samples (1 per second, last 30 seconds)
+	var speedRing [30]float64
+	var speedRingPos int
+	var speedRingCount int
+	warnedSlow := false
+
 	for {
 		n, readErr := src.Read(buf)
 		if n > 0 {
@@ -745,9 +757,39 @@ func (j *CloneJob) copyWithProgress(dst io.Writer, src io.Reader) (int64, error)
 				elapsed := now.Sub(start).Seconds()
 				interval := now.Sub(lastUpdate).Seconds()
 
-				speedMBps := 0.0
+				// Instantaneous speed
+				instSpeed := 0.0
 				if interval > 0 {
-					speedMBps = float64(written-lastWritten) / interval / (1024 * 1024)
+					instSpeed = float64(written-lastWritten) / interval / (1024 * 1024)
+				}
+
+				// Add to ring buffer for sliding average
+				speedRing[speedRingPos] = instSpeed
+				speedRingPos = (speedRingPos + 1) % 30
+				if speedRingCount < 30 {
+					speedRingCount++
+				}
+
+				// Average speed from ring
+				avgSpeed := 0.0
+				if speedRingCount > 0 {
+					var sum float64
+					for i := 0; i < speedRingCount; i++ {
+						sum += speedRing[i]
+					}
+					avgSpeed = sum / float64(speedRingCount)
+				}
+
+				// Use average speed for stable ETA
+				avgForETA := avgSpeed
+				if avgForETA <= 0 {
+					avgForETA = instSpeed // fallback to instant if no avg yet
+				}
+
+				// Slow speed warning (detected once)
+				if speedRingCount >= 30 && avgSpeed < 1.0 && !warnedSlow {
+					j.logFn("  [!] Transfer speed is very slow (%.1f MB/s average) — check network or remote CPU load", avgSpeed)
+					warnedSlow = true
 				}
 
 				percent := 0.0
@@ -757,27 +799,27 @@ func (j *CloneJob) copyWithProgress(dst io.Writer, src io.Reader) (int64, error)
 					if percent > 100 {
 						percent = 100
 					}
-					if speedMBps > 0 {
+					if avgForETA > 0 {
 						remaining := j.params.SourceSize - written
 						if remaining > 0 {
-							eta = int64(float64(remaining) / (speedMBps * 1024 * 1024))
+							eta = int64(float64(remaining) / (avgForETA * 1024 * 1024))
 						}
 					}
 				}
 
-			j.progressFn(Progress{
-				BytesWritten:   written,
-				TotalBytes:     j.params.SourceSize,
-				Percent:        percent,
-				SpeedMBps:      speedMBps,
-				ElapsedSeconds: int64(elapsed),
-				EtaSeconds:     eta,
-			})
+				j.progressFn(Progress{
+					BytesWritten:   written,
+					TotalBytes:     j.params.SourceSize,
+					Percent:        percent,
+					SpeedMBps:      avgSpeed,
+					ElapsedSeconds: int64(elapsed),
+					EtaSeconds:     eta,
+				})
 
-			// Check if SSH connection is still alive
-			if !j.sshClient.IsConnected() {
-				return written, fmt.Errorf("SSH connection lost — remote host may have rebooted or shut down")
-			}
+				// Check if SSH connection is still alive
+				if !j.sshClient.IsConnected() {
+					return written, fmt.Errorf("SSH connection lost — remote host may have rebooted or shut down")
+				}
 
 				lastUpdate = now
 				lastWritten = written
