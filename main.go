@@ -28,7 +28,9 @@ const (
 	version        = "3.0.0"
 )
 
-var compressLevel = 1 // default gzip compression level 1-9, 0 = no compression
+var compressLevel = 1  // default gzip compression level 1-9, 0 = no compression
+var compressType = 0   // 0=gzip, 1=pigz (multi-threaded)
+var fixInitramfs = false
 
 func main() {
 	var (
@@ -159,6 +161,7 @@ func ensureRemoteDeps(sshClient *sshclient.Client) {
 	checks := []struct{ cmd, pkg string }{
 		{"lsblk", "util-linux"},
 		{"gzip", "gzip"},
+		{"pigz", "pigz"},
 	}
 	var missing []string
 	for _, c := range checks {
@@ -192,10 +195,25 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
+// isBack returns true when the user wants to go back to the previous menu.
+func isBack(v int) bool { return v == -2 }
+
 func runInteractive() {
 	cli.PrintHeader()
 
+	var sshClient *sshclient.Client
+	defer func() {
+		if sshClient != nil {
+			sshClient.Close()
+		}
+	}()
+
 	for {
+		// Close previous SSH connection if going back
+		if sshClient != nil {
+			sshClient.Close()
+		}
+
 		fmt.Println("  远程服务器配置")
 		fmt.Println("  ─────────────────────────────────────────────")
 		ip := cli.ReadInput("服务器IP", "")
@@ -215,7 +233,8 @@ func runInteractive() {
 		fmt.Println()
 
 		fmt.Print("  正在连接...")
-		sshClient, err := sshclient.Connect(sshclient.Config{
+		var err error
+		sshClient, err = sshclient.Connect(sshclient.Config{
 			Host: ip, Port: port, User: user, Password: pass, Timeout: 15,
 		})
 		if err != nil {
@@ -230,7 +249,6 @@ func runInteractive() {
 			fmt.Println()
 			continue
 		}
-		defer sshClient.Close()
 		fmt.Printf(clearLine+"  SSH 连接成功 (%s@%s:%d)\n", user, ip, port)
 
 		fmt.Println()
@@ -278,6 +296,7 @@ func runInteractive() {
 			fmt.Println("  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)")
 			fmt.Println("  请输入序号 2 或 3 选择操作模式")
 			mode := cli.SelectOption("选择操作模式", 2, 3)
+			if isBack(mode) { continue }
 
 			cli.PrintSection("请选择源磁盘 — 输入序号选定远程磁盘")
 			cli.PrintDiskList(remoteList, "remote")
@@ -289,6 +308,7 @@ func runInteractive() {
 				minIdx = 0
 			}
 			idx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
+			if isBack(idx) { continue }
 
 			if mode == 2 && idx == 0 {
 				batchSaveToFile(ip, remoteList, sshClient)
@@ -379,10 +399,12 @@ func runInteractive() {
 
 			blockSize := cli.ReadInput("块大小", "4M")
 			compressLevel = cli.AskCompressionLevel()
+			compressType = cli.AskCompressionType()
 
 			fmt.Println()
-			doZero := cli.ConfirmZero()
-			fmt.Println()
+		doZero := cli.ConfirmZero()
+		fixInitramfs = cli.AskFixInitramfs()
+		fmt.Println()
 
 			fmt.Printf("  此操作将覆盖 %s 上的所有数据!\n", tgtDisk.Path)
 			if !cli.Confirm("  确认开始克隆? 输入 yes 继续") {
@@ -403,6 +425,8 @@ func runInteractive() {
 				BlockSize:  blockSize,
 				ZeroFill:   doZero,
 				CompressionLevel: compressLevel,
+		CompressType: compressType,
+		FixInitramfs: fixInitramfs,
 			}, makeProgressFn())
 			job.SetLogFunc(func(format string, args ...interface{}) {
 				fmt.Printf(format+"\n", args...)
@@ -487,6 +511,8 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			TargetPath: source,
 			BlockSize:  bs,
 			CompressionLevel: compressLevel,
+		CompressType: compressType,
+		FixInitramfs: fixInitramfs,
 		}, makeProgressFn())
 		job.SetLogFunc(func(format string, args ...interface{}) {
 			fmt.Printf(format+"\n", args...)
@@ -539,6 +565,8 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		BlockSize:  bs,
 		ZeroFill:   true,
 		CompressionLevel: compressLevel,
+		CompressType: compressType,
+		FixInitramfs: fixInitramfs,
 	}, makeProgressFn())
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
@@ -577,6 +605,7 @@ func batchSaveToFile(ip string, disks []cli.DiskItem, sshClient *sshclient.Clien
 
 	blockSize := cli.ReadInput("块大小", "4M")
 	compressLevel = cli.AskCompressionLevel()
+	compressType = cli.AskCompressionType()
 	doZero := cli.ConfirmZero()
 	fmt.Println()
 	if !cli.Confirm("  确认开始批量备份? 输入 yes 继续") {
@@ -639,6 +668,7 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 	blockSize := cli.ReadInput("块大小", "4M")
 
 	compressLevel = cli.AskCompressionLevel()
+	compressType = cli.AskCompressionType()
 
 	doZero := cli.ConfirmZero()
 	fmt.Println()
@@ -663,6 +693,8 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client
 		BlockSize:  blockSize,
 		ZeroFill:   doZero,
 		CompressionLevel: compressLevel,
+		CompressType: compressType,
+		FixInitramfs: fixInitramfs,
 	}, makeProgressFn())
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
@@ -743,6 +775,8 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 		TargetPath: remoteDisk,
 		BlockSize:  "4M",
 		CompressionLevel: compressLevel,
+		CompressType: compressType,
+		FixInitramfs: fixInitramfs,
 	}, makeProgressFn())
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
@@ -943,11 +977,9 @@ func printFstabWarning(targetDisk string) {
 }
 
 func waitExit() {
-	if runtime.GOOS == "windows" {
-		fmt.Println()
-		fmt.Print("  按回车键退出...")
-		fmt.Scanln()
-	}
+	fmt.Println()
+	fmt.Print("  按回车键退出...")
+	fmt.Scanln()
 }
 
 func makeFileName(ip, diskName, sizeHuman, dateStr string) string {
@@ -985,28 +1017,39 @@ func extractIP(input string) string {
 }
 
 func makeProgressFn() func(clone.Progress) {
+	var last cli.CloneProgress
 	return func(p clone.Progress) {
 		if p.Done {
 			if p.Error == nil {
-				cli.PrintProgressComplete(cli.CloneProgress{
+				// Use the last non-Done values if Done has zeros
+				cp := cli.CloneProgress{
 					BytesWritten:   p.BytesWritten,
 					TotalBytes:     p.TotalBytes,
 					Percent:        p.Percent,
 					SpeedMBps:      p.SpeedMBps,
 					ElapsedSeconds: p.ElapsedSeconds,
 					EtaSeconds:     p.EtaSeconds,
-				})
+				}
+				if cp.BytesWritten == 0 {
+					cp.BytesWritten = last.BytesWritten
+					cp.TotalBytes = last.TotalBytes
+					cp.Percent = last.Percent
+					cp.SpeedMBps = last.SpeedMBps
+					cp.ElapsedSeconds = last.ElapsedSeconds
+				}
+				cli.PrintProgressComplete(cp)
 			}
 			return
 		}
-		cli.PrintProgress(cli.CloneProgress{
+		last = cli.CloneProgress{
 			BytesWritten:   p.BytesWritten,
 			TotalBytes:     p.TotalBytes,
 			Percent:        p.Percent,
 			SpeedMBps:      p.SpeedMBps,
 			ElapsedSeconds: p.ElapsedSeconds,
 			EtaSeconds:     p.EtaSeconds,
-		})
+		}
+		cli.PrintProgress(last)
 	}
 }
 

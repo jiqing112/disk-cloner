@@ -24,6 +24,8 @@ type Params struct {
 	BlockSize        string
 	ZeroFill         bool // zero-fill free space before dd (improves compression)
 	CompressionLevel int  // 0=no compression, 1-9=gzip level (default 1)
+	CompressType     int  // 0=gzip, 1=pigz
+	FixInitramfs     bool // rebuild initramfs with --no-hostonly before dd
 }
 
 // LogFunc is called to print status messages during zero-fill etc.
@@ -176,6 +178,43 @@ func (j *CloneJob) remoteHasCommand(cmd string) bool {
 	return err == nil
 }
 
+// buildCompressCmd returns the compress command segment for the remote pipeline.
+// It detects available tools (gzip, pigz) and builds the appropriate command.
+// Also ensures the chosen tool is installed.
+func (j *CloneJob) buildCompressCmd() string {
+	level := j.params.CompressionLevel
+	if level <= 0 || level > 9 {
+		level = 1
+	}
+
+	// If pigz requested, try to install and use it
+	if j.params.CompressType == 1 {
+		j.sshClient.CombinedOutput("command -v pigz || apk add --quiet pigz 2>/dev/null")
+		if j.remoteHasCommand("pigz") {
+			ncpus, _ := j.sshClient.CombinedOutput("nproc 2>/dev/null")
+			ncpus = strings.TrimSpace(ncpus)
+			threads := "2"
+			if n, err := strconv.Atoi(ncpus); err == nil && n > 1 {
+				threads = strconv.Itoa(n)
+			}
+			return fmt.Sprintf("pigz -%d -p %s", level, threads)
+		}
+		// If pigz install failed, fall through to gzip
+	}
+
+	// Install or check gzip
+	j.sshClient.CombinedOutput("command -v gzip || apk add --quiet gzip 2>/dev/null")
+	return fmt.Sprintf("gzip -%d", level)
+}
+
+// compressToolName returns the human-readable name of the compression tool.
+func (j *CloneJob) compressToolName() string {
+	if j.params.CompressType == 1 {
+		return "pigz"
+	}
+	return "gzip"
+}
+
 // Run clones remote disk to a local block device.
 // Uses gzip compression over SSH to reduce network transfer:
 //   remote: dd | gzip ??SSH ??local: gunzip ??write to disk
@@ -195,26 +234,24 @@ func (j *CloneJob) Run() error {
 		}
 	}
 
+	// Rebuild initramfs for cross-hardware compatibility
+	if j.params.FixInitramfs {
+		if err := j.FixInitramfs(); err != nil {
+			j.logFn("  [!] %v", err)
+		}
+	}
+
 	target, err := os.OpenFile(j.params.TargetPath, os.O_WRONLY, 0)
 	if err != nil {
 		return fmt.Errorf("open target device: %w", err)
 	}
 	defer target.Close()
 
-	// Compression level 0 = no compression, 1-9 = gzip level
-	useCompression := j.params.CompressionLevel > 0
-
-	if useCompression {
-		if j.remoteHasCommand("gzip") {
-			j.logFn("  Using compressed transfer (dd|gzip -> net -> gunzip -> disk)")
-			if err := j.streamCompressed(target); err != nil {
-				return err
-			}
-		} else {
-			j.logFn("  Remote gzip not found, falling back to raw transfer")
-			if err := j.streamRaw(target); err != nil {
-				return err
-			}
+	// Compression level 0 = no compression, 1-9 = gzip/pigz level
+	if j.params.CompressionLevel > 0 {
+		j.logFn("  Compressed transfer (dd|%s -> net -> gunzip -> disk)", j.compressToolName())
+		if err := j.streamCompressed(target); err != nil {
+			return err
 		}
 	} else {
 		j.logFn("  No compression (dd -> net -> disk)")
@@ -245,13 +282,20 @@ func (j *CloneJob) RunToFile() error {
 		}
 	}
 
+	// Rebuild initramfs for cross-hardware compatibility
+	if j.params.FixInitramfs {
+		if err := j.FixInitramfs(); err != nil {
+			j.logFn("  [!] %v", err)
+		}
+	}
+
 	f, err := os.Create(j.params.TargetPath)
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}
 	defer f.Close()
 
-	j.logFn("  Remote compressing (dd|gzip -> net -> file)")
+	j.logFn("  Remote compressing (dd|%s -> net -> file)", j.compressToolName())
 	if err := j.streamCompressedRaw(f); err != nil {
 		return err
 	}
@@ -378,9 +422,9 @@ func (j *CloneJob) zeroFillFreeSpace() error {
 	diskName := j.params.SourcePath
 
 	// Show partition info before starting
-	j.logFn("  Scanning remote disk partitions...")
+	j.logFn("  Scanning remote disk partitions (including LVM)...")
 	infoOut, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
-		`disk="%s"; diskbase=$(basename "$disk"); echo "DISK=$diskbase"; for p in /sys/block/"$diskbase"/"$diskbase"*/partition; do [ -f "$p" ] || continue; pname=$(basename $(dirname "$p")); size=$(cat /sys/block/"$diskbase"/"$pname"/size 2>/dev/null); echo "PART $pname $size"; done`,
+		`disk="%s"; diskbase=$(basename "$disk"); apk add --quiet lvm2 2>/dev/null; lvm vgscan --mknodes 2>/dev/null; lvm vgchange -ay 2>/dev/null; echo "DISK=$diskbase"; for p in /sys/block/"$diskbase"/"$diskbase"*/partition; do [ -f "$p" ] || continue; pname=$(basename $(dirname "$p")); size=$(cat /sys/block/"$diskbase"/"$pname"/size 2>/dev/null); echo "PART $pname $size"; done; lvm lvs --noheadings -o lv_path,lv_size --units b 2>/dev/null | while read lvpath size; do [ -n "$lvpath" ] && echo "LVM $lvpath $size"; done`,
 		diskName,
 	))
 
@@ -398,42 +442,79 @@ func (j *CloneJob) zeroFillFreeSpace() error {
 				totalSize += szBytes
 				j.logFn("    Partition %s: %s", f[1], formatBytesCompat(szBytes))
 			}
+		} else if strings.HasPrefix(line, "LVM ") {
+			f := strings.Fields(line)
+			if len(f) >= 3 {
+				szStr := strings.TrimSuffix(f[2], "B")
+				sz, _ := strconv.ParseInt(szStr, 10, 64)
+				totalSize += sz
+				j.logFn("    LVM %s: %s", f[1], formatBytesCompat(sz))
+			}
 		}
 	}
 	if diskNameOnly != "" {
-		j.logFn("  Disk %s: total %s across %d partition(s)", diskNameOnly, formatBytesCompat(totalSize), len(strings.Split(infoOut, "\n"))-2) // rough count
+		j.logFn("  Disk %s: total %s", diskNameOnly, formatBytesCompat(totalSize))
 	}
 
 	j.logFn("  Zero-filling free space (run 'df -h /dev/sda*' on remote to see progress)...")
 
-	// Build script that outputs progress immediately (no 2>/dev/null on dd)
-	script := fmt.Sprintf(`disk="%s"
+	// Build script that:
+	// 1. Install lvm2 if needed
+	// 2. Activate LVM
+	// 3. Fills direct partitions
+	// 4. Fills LVM logical volumes backed by this disk
+	script := fmt.Sprintf(`apk add --quiet lvm2 2>/dev/null || true
+disk="%s"
 diskbase=$(basename "$disk")
 modprobe ext4 2>/dev/null
 modprobe xfs 2>/dev/null
 modprobe btrfs 2>/dev/null
 modprobe vfat 2>/dev/null
+
+# Activate all LVM volumes
+lvm vgscan --mknodes 2>/dev/null || true
+lvm vgchange -ay 2>/dev/null || true
+
+# Direct partitions
 parts=""
 for p in /sys/block/"$diskbase"/"$diskbase"*/partition; do
   [ -f "$p" ] || continue
   pname=$(basename $(dirname "$p"))
   parts="$parts /dev/$pname"
 done
-if [ -z "$parts" ]; then
+
+# LVM logical volumes (any LV on this machine)
+lvm_lvs=""
+for lv in /dev/mapper/*; do
+  [ "$lv" = "/dev/mapper/control" ] && continue
+  [ -b "$lv" ] && lvm_lvs="$lvm_lvs $lv"
+done
+
+all_devices="$parts $lvm_lvs"
+
+if [ -z "$(echo $all_devices)" ]; then
   echo "NO_PARTS"
   exit 0
 fi
-for part in $parts; do
+
+for dev in $all_devices; do
   mp=$(mktemp -d /tmp/zf.XXXXXX)
-  if mount "$part" "$mp" 2>/dev/null; then
-    echo "FILL $part"
-    dd if=/dev/zero of="$mp/.zero_fill" bs=4194304 2>/dev/null
+  if mount "$dev" "$mp" 2>/dev/null; then
+    echo "FILL $dev"
+    dd if=/dev/zero of="$mp/.zero_fill" bs=4194304 2>/dev/null &
+    PID=$!
+    while kill -0 $PID 2>/dev/null; do
+      size=$(stat -c %%s "$mp/.zero_fill" 2>/dev/null)
+      [ -n "$size" ] && echo "PROGRESS $dev $size"
+      sleep 5
+    done
+    wait $PID
     rm -f "$mp/.zero_fill"
     sync
     umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null
-    echo "DONEPART $part"
+    echo "DONEPART $dev"
   else
-    echo "SKIP $part"
+    echo "SKIP $dev"
   fi
   rmdir "$mp" 2>/dev/null || true
 done
@@ -455,6 +536,12 @@ echo "DONE"
 		if strings.HasPrefix(line, "FILL ") {
 			j.logFn("    Filling: %s", strings.TrimPrefix(line, "FILL "))
 			filled++
+		} else if strings.HasPrefix(line, "PROGRESS ") {
+			f := strings.Fields(line)
+			if len(f) >= 3 {
+				sz, _ := strconv.ParseInt(f[2], 10, 64)
+				j.logFn("      %s: %s written so far", f[1], formatBytesCompat(sz))
+			}
 		} else if strings.HasPrefix(line, "DONEPART ") {
 			j.logFn("    Done: %s", strings.TrimPrefix(line, "DONEPART "))
 		} else if strings.HasPrefix(line, "SKIP ") {
@@ -478,6 +565,101 @@ echo "DONE"
 	return nil
 }
 
+// FixInitramfs rebuilds the remote system's initramfs with --no-hostonly
+// so the backup can boot on different hardware. Runs via chroot.
+func (j *CloneJob) FixInitramfs() error {
+	if j.sshClient == nil {
+		return fmt.Errorf("SSH client is nil")
+	}
+
+	j.logFn("  Rebuilding initramfs (--no-hostonly for cross-hardware boot)...")
+
+	// Step 1: install LVM tools and activate volumes
+	j.sshClient.CombinedOutput("apk add --quiet lvm2 2>/dev/null")
+	j.sshClient.CombinedOutput("lvm vgscan --mknodes 2>/dev/null; lvm vgchange -ay 2>/dev/null")
+
+	out, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+		`lsblk -ln -o NAME,TYPE,FSTYPE 2>/dev/null | awk '$2=="part"&&$3!=""&&$3!="swap"{print "/dev/"$1}'; lsblk -ln -o NAME,TYPE,FSTYPE 2>/dev/null | awk '$2=="lvm"&&$3!=""&&$3!="swap"{print "/dev/mapper/"$1}'`,
+	))
+
+	rootDev := ""
+	for _, dev := range strings.Split(out, "\n") {
+		dev = strings.TrimSpace(dev)
+		if dev == "" {
+			continue
+		}
+
+		// Check device exists before attempting mount
+		check, _ := j.sshClient.CombinedOutput(fmt.Sprintf("test -b %s && echo OK", dev))
+		if !strings.Contains(check, "OK") {
+			continue
+		}
+
+		// Try mounting to see if it's root
+		rc, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+			`mp=$(mktemp -d) && mount %s "$mp" 2>/dev/null && { [ -f "$mp/etc/os-release" ] || [ -f "$mp/etc/fstab" ]; rc=$?; umount "$mp" 2>/dev/null; rmdir "$mp" 2>/dev/null; exit $rc; } && rmdir "$mp" 2>/dev/null; exit 1`,
+			dev,
+		))
+		if rc == "" {
+			rootDev = dev
+			break
+		}
+	}
+	if rootDev == "" {
+		return fmt.Errorf("no root partition found, cannot rebuild initramfs")
+	}
+
+	j.logFn("    Root: %s", rootDev)
+
+	// Step 2: mount root + bind
+	script := fmt.Sprintf(`set -e
+ROOT=%s
+
+mount "$ROOT" /mnt 2>/dev/null
+[ ! -d /mnt/usr/bin ] && [ ! -d /mnt/usr/sbin ] && echo "FAIL" && exit 1
+
+mount --bind /dev /mnt/dev 2>/dev/null
+mount --bind /proc /mnt/proc 2>/dev/null
+mount --bind /sys /mnt/sys 2>/dev/null
+mount -t tmpfs tmpfs /mnt/run 2>/dev/null || mkdir -p /mnt/run
+
+	RC=0
+DONE=0
+if [ -x /mnt/usr/bin/dracut ] || [ -x /mnt/usr/sbin/dracut ]; then
+  echo "  -> dracut --no-hostonly"
+  chroot /mnt dracut --no-hostonly --force --regenerate-all 2>&1 && DONE=1 || RC=1
+fi
+if [ "$DONE" = "0" ] && [ -x /mnt/usr/sbin/update-initramfs ]; then
+  echo "  -> update-initramfs"
+  chroot /mnt update-initramfs -u -k all 2>&1 && DONE=1 || RC=1
+fi
+if [ "$DONE" = "0" ] && [ -x /mnt/usr/bin/mkinitcpio ]; then
+  echo "  -> mkinitcpio -P"
+  chroot /mnt mkinitcpio -P 2>&1 && DONE=1 || RC=1
+fi
+[ "$DONE" = "0" ] && echo "NO_TOOL" && RC=1
+
+umount -l /mnt/run 2>/dev/null
+umount -l /mnt/sys 2>/dev/null
+umount -l /mnt/proc 2>/dev/null
+umount -l /mnt/dev 2>/dev/null
+umount -l /mnt 2>/dev/null
+exit $RC
+`, rootDev)
+
+	out2, err2 := j.sshClient.CombinedOutput("sh -c " + shellQuote(script))
+	if err2 != nil || strings.Contains(out2, "FAIL") || strings.Contains(out2, "NO_TOOL") {
+		if strings.Contains(out2, "NO_TOOL") {
+			j.logFn("  [!] No initramfs tool found (dracut/update-initramfs/mkinitcpio), skipping")
+		} else {
+			j.logFn("  [!] Initramfs rebuild failed — you may need to fix boot manually")
+		}
+		return nil // non-fatal
+	}
+	j.logFn("  ✓ Initramfs rebuilt")
+	return nil
+}
+
 // streamCompressed: remote dd|gzip ??SSH ??local gzip.Reader ??dst
 // This transfers compressed data over the network, then decompresses locally.
 func (j *CloneJob) streamCompressed(dst io.Writer) error {
@@ -494,12 +676,9 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	}
 	bsBytes := bsToBytes(bs)
 
-	// Remote: dd | gzip -N (user-chosen compression level)
-	level := j.params.CompressionLevel
-	if level <= 0 || level > 9 {
-		level = 1
-	}
-	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | gzip -%d", j.params.SourcePath, bsBytes, level)
+	// Remote: dd | compress (gzip or pigz)
+	compress := j.buildCompressCmd()
+	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | %s", j.params.SourcePath, bsBytes, compress)
 
 	session, err := j.sshClient.Execute(remoteCmd)
 	if err != nil {
@@ -587,11 +766,8 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 	}
 	bsBytes := bsToBytes(bs)
 
-	level := j.params.CompressionLevel
-	if level <= 0 || level > 9 {
-		level = 1
-	}
-	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | gzip -%d", j.params.SourcePath, bsBytes, level)
+	compress := j.buildCompressCmd()
+	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | %s", j.params.SourcePath, bsBytes, compress)
 
 	session, err := j.sshClient.Execute(remoteCmd)
 	if err != nil {

@@ -72,13 +72,17 @@ func PrintDiskList(disks []DiskItem, location string) {
 func SelectDisk(prompt string, minIdx, maxIdx int) int {
 	for {
 		input := ReadInput(prompt, "")
+		lower := strings.ToLower(input)
+		if lower == "q" || lower == "quit" {
+			return -2
+		}
 		if input == "" {
-			fmt.Printf("  请输入 %d-%d 之间的数字\n", minIdx, maxIdx)
+			fmt.Printf("  请输入 %d-%d，输入 q 返回上一步\n", minIdx, maxIdx)
 			continue
 		}
 		idx, err := strconv.Atoi(input)
 		if err != nil || idx < minIdx || idx > maxIdx {
-			fmt.Printf("  请输入 %d-%d 之间的数字\n", minIdx, maxIdx)
+			fmt.Printf("  请输入 %d-%d，输入 q 返回上一步\n", minIdx, maxIdx)
 			continue
 		}
 		return idx
@@ -86,7 +90,23 @@ func SelectDisk(prompt string, minIdx, maxIdx int) int {
 }
 
 func SelectOption(prompt string, minIdx, maxIdx int) int {
-	return SelectDisk(prompt, minIdx, maxIdx)
+	for {
+		input := ReadInput(prompt, "")
+		lower := strings.ToLower(input)
+		if lower == "q" || lower == "quit" {
+			return -2
+		}
+		if input == "" {
+			fmt.Printf("  请输入 %d-%d，输入 q 返回\n", minIdx, maxIdx)
+			continue
+		}
+		idx, err := strconv.Atoi(input)
+		if err != nil || idx < minIdx || idx > maxIdx {
+			fmt.Printf("  请输入 %d-%d，输入 q 返回\n", minIdx, maxIdx)
+			continue
+		}
+		return idx
+	}
 }
 
 func Confirm(prompt string) bool {
@@ -113,12 +133,37 @@ func AskCompressionLevel() int {
 	fmt.Println("    1 = 最快 (默认, 适合日常备份)")
 	fmt.Println("    6 = 均衡 (中等压缩率)")
 	fmt.Println("    9 = 最小 (最高压缩, 费 CPU)")
+	fmt.Println("    回车使用默认值 1")
 	input := ReadInput("  压缩级别", "1")
 	val, err := strconv.Atoi(input)
 	if err != nil || val < 0 || val > 9 {
 		return 1
 	}
 	return val
+}
+
+// AskCompressionType prompts the user to choose compression algorithm.
+// Returns 0 = gzip, 1 = pigz (multi-threaded).
+func AskCompressionType() int {
+	fmt.Println("  压缩方式:")
+	fmt.Println("    1 = gzip (单核压缩, 兼容性最广)")
+	fmt.Println("    2 = pigz (多核压缩, 速度更快, 需远程安装)")
+	input := ReadInput("  压缩方式", "1")
+	if input == "2" {
+		return 1
+	}
+	return 0
+}
+
+// AskFixInitramfs asks whether to rebuild initramfs for cross-hardware boot.
+func AskFixInitramfs() bool {
+	fmt.Println("  重建 initramfs (兼容不同硬件启动)?")
+	fmt.Println("    将远程系统的 initramfs 重建为包含所有硬件驱动")
+	fmt.Println("    这样备份镜像恢复到其他机器(不同CPU/硬盘控制器)时也能正常启动")
+	fmt.Println("    需要挂载远程分区并 chroot, 耗时约 1-2 分钟")
+	input := ReadInput("  重建 initramfs [Y/n]", "y")
+	lower := strings.ToLower(input)
+	return lower != "n" && lower != "no"
 }
 
 type CloneProgress struct {
