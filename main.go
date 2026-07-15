@@ -671,6 +671,7 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 	compressType = cli.AskCompressionType()
 
 	doZero := cli.ConfirmZero()
+	fixInitramfs = cli.AskFixInitramfs()
 	fmt.Println()
 	if !cli.Confirm("  确认开始保存? 输入 yes 继续") {
 		fmt.Println("  已取消")

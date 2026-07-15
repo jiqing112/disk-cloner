@@ -596,11 +596,11 @@ func (j *CloneJob) FixInitramfs() error {
 		}
 
 		// Try mounting to see if it's root
-		rc, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+		_, rcErr := j.sshClient.CombinedOutput(fmt.Sprintf(
 			`mp=$(mktemp -d) && mount %s "$mp" 2>/dev/null && { [ -f "$mp/etc/os-release" ] || [ -f "$mp/etc/fstab" ]; rc=$?; umount "$mp" 2>/dev/null; rmdir "$mp" 2>/dev/null; exit $rc; } && rmdir "$mp" 2>/dev/null; exit 1`,
 			dev,
 		))
-		if rc == "" {
+		if rcErr == nil {
 			rootDev = dev
 			break
 		}
@@ -612,18 +612,21 @@ func (j *CloneJob) FixInitramfs() error {
 	j.logFn("    Root: %s", rootDev)
 
 	// Step 2: mount root + bind
-	script := fmt.Sprintf(`set -e
-ROOT=%s
+	// Note: no set -e here because mount commands may fail and we handle errors manually
+	script := fmt.Sprintf(`ROOT=%s
 
-mount "$ROOT" /mnt 2>/dev/null
-[ ! -d /mnt/usr/bin ] && [ ! -d /mnt/usr/sbin ] && echo "FAIL" && exit 1
+# Unmount /mnt if something is already mounted there
+umount /mnt 2>/dev/null
+
+mount "$ROOT" /mnt 2>/dev/null || { echo "FAIL mount"; exit 1; }
+[ ! -d /mnt/usr/bin ] && [ ! -d /mnt/usr/sbin ] && { echo "FAIL noroot"; exit 1; }
 
 mount --bind /dev /mnt/dev 2>/dev/null
 mount --bind /proc /mnt/proc 2>/dev/null
 mount --bind /sys /mnt/sys 2>/dev/null
 mount -t tmpfs tmpfs /mnt/run 2>/dev/null || mkdir -p /mnt/run
 
-	RC=0
+RC=0
 DONE=0
 if [ -x /mnt/usr/bin/dracut ] || [ -x /mnt/usr/sbin/dracut ]; then
   echo "  -> dracut --no-hostonly"
