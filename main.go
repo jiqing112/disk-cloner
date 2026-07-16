@@ -312,19 +312,30 @@ func runInteractive() {
 
 			if mode == 2 && idx == 0 {
 				batchSaveToFile(ip, remoteList, sshClient)
-				waitExit()
-				return
+				if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
+					waitExit()
+					return
+				}
+				continue
 			}
 
 			disk := remoteList[idx-1]
 
 			if mode == 2 {
 				runSaveToFile(ip, disk, sshClient)
+				if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
+					waitExit()
+					return
+				}
+				continue
 			} else {
 				runRestoreToRemote(ip, disk, sshClient)
+				if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
+					waitExit()
+					return
+				}
+				continue
 			}
-			waitExit()
-			return
 		}
 
 		fmt.Println()
@@ -447,16 +458,25 @@ func runInteractive() {
 			fmt.Println("  ===============================================")
 
 			printFstabWarning(tgtDisk.Path)
-			waitExit()
-			return
+			if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
+				waitExit()
+				return
+			}
+			continue
 		} else if mode == 2 {
 			runSaveToFile(ip, srcDisk, sshClient)
-			waitExit()
-			return
+			if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
+				waitExit()
+				return
+			}
+			continue
 		} else {
 			runRestoreToRemote(ip, srcDisk, sshClient)
-			waitExit()
-			return
+			if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
+				waitExit()
+				return
+			}
+			continue
 		}
 	}
 }

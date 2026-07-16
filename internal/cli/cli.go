@@ -229,7 +229,25 @@ func PrintProgressComplete(p CloneProgress) {
 
 // flushConsole flushes stdout to show progress in real-time.
 func flushConsole() {
-	os.Stdout.Sync()
+	// Use a single reusable channel to limit goroutines
+	// On Windows, Sync() can block when window is minimized.
+	// We run it in a goroutine so the main loop isn't blocked,
+	// but cap it to avoid goroutine accumulation.
+	select {
+	case flushCh <- struct{}{}:
+	default:
+		// Previous flush still running, skip this one
+	}
+}
+
+var flushCh = make(chan struct{}, 1)
+
+func init() {
+	go func() {
+		for range flushCh {
+			os.Stdout.Sync()
+		}
+	}()
 }
 
 func formatDuration(seconds int64) string {
