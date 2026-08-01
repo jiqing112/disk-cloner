@@ -362,7 +362,6 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 		stderrCh <- string(data)
 	}()
 
-	// Handle Ctrl+C
 	done := make(chan struct{})
 	defer close(done)
 	sigCh := make(chan os.Signal, 1)
@@ -370,11 +369,19 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	defer signal.Stop(sigCh)
 	cancelled := false
 	go func() {
-		select {
-		case <-sigCh:
-			cancelled = true
-			_ = session.Signal(ssh.SIGTERM)
-		case <-done:
+		for {
+			select {
+			case <-sigCh:
+				if !cancelled {
+					cancelled = true
+					_ = session.Signal(ssh.SIGTERM)
+					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
+				} else {
+					os.Exit(130)
+				}
+			case <-done:
+				return
+			}
 		}
 	}()
 
@@ -696,7 +703,7 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 		stderrCh <- string(data)
 	}()
 
-	// Handle Ctrl+C
+	// Handle Ctrl+C: first press sends SIGTERM to remote, second force-exits
 	done := make(chan struct{})
 	defer close(done)
 	sigCh := make(chan os.Signal, 1)
@@ -704,11 +711,19 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	defer signal.Stop(sigCh)
 	cancelled := false
 	go func() {
-		select {
-		case <-sigCh:
-			cancelled = true
-			_ = session.Signal(ssh.SIGTERM)
-		case <-done:
+		for {
+			select {
+			case <-sigCh:
+				if !cancelled {
+					cancelled = true
+					_ = session.Signal(ssh.SIGTERM)
+					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
+				} else {
+					os.Exit(130)
+				}
+			case <-done:
+				return
+			}
 		}
 	}()
 
@@ -791,11 +806,19 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 	defer signal.Stop(sigCh)
 	cancelled := false
 	go func() {
-		select {
-		case <-sigCh:
-			cancelled = true
-			_ = session.Signal(ssh.SIGTERM)
-		case <-done:
+		for {
+			select {
+			case <-sigCh:
+				if !cancelled {
+					cancelled = true
+					_ = session.Signal(ssh.SIGTERM)
+					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
+				} else {
+					os.Exit(130)
+				}
+			case <-done:
+				return
+			}
 		}
 	}()
 
@@ -869,11 +892,19 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 	defer signal.Stop(sigCh)
 	cancelled := false
 	go func() {
-		select {
-		case <-sigCh:
-			cancelled = true
-			_ = session.Signal(ssh.SIGTERM)
-		case <-done:
+		for {
+			select {
+			case <-sigCh:
+				if !cancelled {
+					cancelled = true
+					_ = session.Signal(ssh.SIGTERM)
+					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
+				} else {
+					os.Exit(130)
+				}
+			case <-done:
+				return
+			}
 		}
 	}()
 

@@ -253,7 +253,12 @@ func runInteractive() {
 
 		fmt.Println()
 		fmt.Println("  ─────────────────────────────────────────────")
-		checkRemoteReadiness(sshClient)
+		readiness := checkRemoteReadiness(sshClient)
+		if !confirmUnsafeRemote(readiness, false) {
+			fmt.Println("  已取消,请先将远程重启进入 Alpine RAM OS 后再试")
+			fmt.Println()
+			continue
+		}
 		ensureRemoteDeps(sshClient)
 
 		fmt.Println()
@@ -496,6 +501,13 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 	defer sshClient.Close()
 
 	ensureRemoteDeps(sshClient)
+
+	// Detect Alpine RAM OS — refuse or warn if remote is running a normal system
+	readiness := checkRemoteReadiness(sshClient)
+	if !confirmUnsafeRemote(readiness, autoYes) {
+		fmt.Println("已取消")
+		return
+	}
 
 	remoteRaw, err := sshClient.CombinedOutput(remoteLsblkCmd)
 	if err != nil || remoteRaw == "" {
@@ -925,41 +937,87 @@ func browseLocalFiles() string {
 	return files[idx-1]
 }
 
-func checkRemoteReadiness(sshClient *sshclient.Client) {
+// RemoteReadiness holds the result of probing the remote system environment.
+// IsAlpineRAM == true means it's safe to clone the system disk directly.
+type RemoteReadiness struct {
+	OSLine   string
+	RootFS   string
+	IsAlpine bool
+	IsRAM    bool
+	// Detected == false means the probe failed (could not read os-release / df),
+	// in which case IsAlpine/IsRAM are not reliable and we should be cautious.
+	Detected bool
+}
+
+// IsSafe returns true only when the remote is detected as Alpine Linux
+// running from RAM (tmpfs/overlay/rootfs), which is the only state where
+// dd-ing the system disk is guaranteed to produce a consistent image.
+func (r RemoteReadiness) IsSafe() bool {
+	return r.Detected && r.IsAlpine && r.IsRAM
+}
+
+func checkRemoteReadiness(sshClient *sshclient.Client) RemoteReadiness {
 	script := `echo "OS=$(cat /etc/os-release 2>/dev/null | head -1)"
 echo "ROOTFS=$(df -T / 2>/dev/null | tail -1 | awk '{print $2}')"`
+
+	// Even on error, CombinedOutput usually returns partial output -
+	// parse what we can rather than silently giving up.
 	out, err := sshClient.CombinedOutput(script)
-	if err != nil {
-		return
-	}
-	osLine, rootFS := "", ""
+
+	r := RemoteReadiness{}
 	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
 		switch {
 		case strings.HasPrefix(line, "OS="):
-			osLine = strings.TrimPrefix(line, "OS=")
+			r.OSLine = strings.TrimPrefix(line, "OS=")
 		case strings.HasPrefix(line, "ROOTFS="):
-			rootFS = strings.TrimPrefix(line, "ROOTFS=")
+			r.RootFS = strings.TrimPrefix(line, "ROOTFS=")
 		}
 	}
-	isAlpine := strings.Contains(strings.ToLower(osLine), "alpine")
-	isRAM := rootFS == "tmpfs" || rootFS == "overlay" || rootFS == "rootfs"
+	r.IsAlpine = strings.Contains(strings.ToLower(r.OSLine), "alpine")
+	r.IsRAM = r.RootFS == "tmpfs" || r.RootFS == "overlay" || r.RootFS == "rootfs"
+	r.Detected = r.OSLine != "" || r.RootFS != ""
+
 	fmt.Println()
-	if isAlpine && isRAM {
-		fmt.Printf("  远程状态: Alpine Linux RAM OS (%s 根文件系统)\n", rootFS)
-		fmt.Println("  磁盘分区未挂载，可以安全克隆。")
-	} else if isAlpine && !isRAM {
-		fmt.Println("  远程是 Alpine Linux 但根文件系统不是 tmpfs/overlay")
-		fmt.Printf("  (当前根文件系统: %s)\n", rootFS)
-		fmt.Println("  可能是安装到磁盘的 Alpine，继续克隆可能损坏数据！")
+	if !r.Detected {
+		fmt.Println("  [!] 无法检测远程环境 (os-release 或 df 读取失败)")
+		if err != nil {
+			fmt.Printf("      错误: %v\n", err)
+		}
+		fmt.Println("      无法确认远程是否处于 Alpine RAM OS,继续可能导致数据不一致")
+	} else if r.IsAlpine && r.IsRAM {
+		fmt.Printf("  远程状态: Alpine Linux RAM OS (%s 根文件系统)\n", r.RootFS)
+		fmt.Println("  磁盘分区未挂载,可以安全克隆。")
+	} else if r.IsAlpine && !r.IsRAM {
+		fmt.Println("  [!] 远程是 Alpine Linux 但根文件系统不是 tmpfs/overlay")
+		fmt.Printf("      当前根文件系统: %s\n", r.RootFS)
+		fmt.Println("      可能是安装到磁盘的 Alpine,继续克隆可能损坏数据!")
 	} else {
-		fmt.Printf("  远程操作系统: %s\n", osLine)
-		fmt.Printf("  根文件系统: %s\n", rootFS)
-		fmt.Println("  远程不是 Alpine RAM OS！如果远程系统在正常运行,")
-		fmt.Println("  克隆其系统盘可能导致数据不一致。")
+		fmt.Printf("  [!] 远程操作系统: %s\n", r.OSLine)
+		fmt.Printf("  [!] 根文件系统: %s\n", r.RootFS)
+		fmt.Println("  [!] 远程不是 Alpine RAM OS! 如果远程系统在正常运行,")
+		fmt.Println("      克隆其系统盘可能导致数据不一致。")
 		fmt.Println()
 		fmt.Println("  建议先将远程服务器重启进入 Alpine RAM OS 后再克隆。")
 		fmt.Println("  参考 https://github.com/bin456789/reinstall 项目执行 bash reinstall.sh alpine --hold 1")
 	}
+	return r
+}
+
+// confirmUnsafeRemote asks the user to confirm proceeding when the remote
+// is not detected as Alpine RAM OS. Returns true if the user explicitly
+// accepts the risk (or if the remote is safe and no confirmation is needed).
+func confirmUnsafeRemote(r RemoteReadiness, autoYes bool) bool {
+	if r.IsSafe() {
+		return true
+	}
+	if autoYes {
+		fmt.Println("  [!] 已使用 -y 跳过确认,继续执行(风险自负)")
+		return true
+	}
+	fmt.Println()
+	fmt.Println("  ─────────────────────────────────────────────")
+	return cli.Confirm("  远程不是 Alpine RAM OS,继续可能损坏远程数据。输入 yes 继续")
 }
 
 func printFstabWarning(targetDisk string) {
