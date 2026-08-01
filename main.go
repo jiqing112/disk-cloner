@@ -378,8 +378,11 @@ func runInteractive() {
 
 		if mode == 2 && srcIdx == 0 {
 			batchSaveToFile(ip, remoteList, sshClient)
-			waitExit()
-			return
+			if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
+				waitExit()
+				return
+			}
+			continue
 		}
 
 		srcDisk := remoteList[srcIdx-1]
@@ -627,6 +630,7 @@ func batchSaveToFile(ip string, disks []cli.DiskItem, sshClient *sshclient.Clien
 	compressLevel = cli.AskCompressionLevel()
 	compressType = cli.AskCompressionType()
 	doZero := cli.ConfirmZero()
+	fixInitramfs = cli.AskFixInitramfs()
 	fmt.Println()
 	if !cli.Confirm("  确认开始批量备份? 输入 yes 继续") {
 		fmt.Println("  已取消")
