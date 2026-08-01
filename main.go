@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"disk-cloner/internal/cli"
@@ -191,6 +192,23 @@ func formatTotalTime(d time.Duration) string {
 	return fmt.Sprintf("%d时%d分%d秒", int(d.Hours()), int(d.Minutes())%60, int(d.Seconds())%60)
 }
 
+// authMethod returns a human-readable description of the SSH auth method
+// for logging purposes. Never logs the password itself.
+func authMethod(pass string) string {
+	if pass == "" {
+		return "密钥"
+	}
+	return "密码"
+}
+
+// compressTypeName maps the compressType code to a human-readable name.
+func compressTypeName(t int) string {
+	if t == 1 {
+		return "pigz"
+	}
+	return "gzip"
+}
+
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
@@ -251,15 +269,29 @@ func runInteractive() {
 		}
 		fmt.Printf(clearLine+"  SSH 连接成功 (%s@%s:%d)\n", user, ip, port)
 
+		// Start capturing the session for the optional Mode 2 log file.
+		// Entries are buffered until a save path is known; if the user picks
+		// another mode or cancels, the buffer is discarded silently.
+		logger := newSessionLogger()
+		logger.logf("=== Disk Cloner v%s 会话开始 ===", version)
+		logger.logf("SSH 连接: %s@%s:%d (认证: %s)", user, ip, port, authMethod(pass))
+
 		fmt.Println()
 		fmt.Println("  ─────────────────────────────────────────────")
 		readiness := checkRemoteReadiness(sshClient)
+		logger.logf("远程环境: OS=%q RootFS=%q Alpine=%v RAM=%v Detected=%v",
+			readiness.OSLine, readiness.RootFS, readiness.IsAlpine, readiness.IsRAM, readiness.Detected)
+		if readiness.Detected && !readiness.IsSafe() {
+			logger.logf("警告: 远程不是 Alpine RAM OS,继续可能导致数据不一致")
+		}
 		if !confirmUnsafeRemote(readiness, false) {
+			logger.logf("用户取消: 远程不是 Alpine RAM OS")
 			fmt.Println("  已取消,请先将远程重启进入 Alpine RAM OS 后再试")
 			fmt.Println()
 			continue
 		}
 		ensureRemoteDeps(sshClient)
+		logger.logf("远程依赖检查完成")
 
 		fmt.Println()
 		fmt.Println("  ─────────────────────────────────────────────")
@@ -273,6 +305,7 @@ func runInteractive() {
 			if remoteRaw != "" {
 				msg = remoteRaw
 			}
+			logger.logf("远程磁盘扫描失败: %s", msg)
 			fmt.Printf(clearLine+"  远程扫描失败: %s\n", msg)
 			fmt.Println("    请确认远程已安装 lsblk (apk add util-linux)")
 			fmt.Println()
@@ -284,7 +317,15 @@ func runInteractive() {
 			continue
 		}
 		fmt.Printf(clearLine+"  发现 %d 块远程磁盘\n", countType(remoteDisks, "disk"))
+		logger.logf("扫描到 %d 块远程磁盘", countType(remoteDisks, "disk"))
 		remoteList := filterDisks(remoteDisks)
+		for _, d := range remoteList {
+			model := d.Model
+			if model == "" {
+				model = "(无型号)"
+			}
+			logger.logf("  远程磁盘: %s  大小 %s  %s", d.Path, d.SizeHuman, model)
+		}
 		if len(remoteList) == 0 {
 			fmt.Println("\n  远程未发现磁盘设备")
 			continue
@@ -302,6 +343,7 @@ func runInteractive() {
 			fmt.Println("  请输入序号 2 或 3 选择操作模式")
 			mode := cli.SelectOption("选择操作模式", 2, 3)
 			if isBack(mode) { continue }
+			logger.logf("用户选择操作模式: %d", mode)
 
 			cli.PrintSection("请选择源磁盘 — 输入序号选定远程磁盘")
 			cli.PrintDiskList(remoteList, "remote")
@@ -314,9 +356,14 @@ func runInteractive() {
 			}
 			idx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
 			if isBack(idx) { continue }
+			if mode == 2 && idx == 0 {
+				logger.logf("用户选择备份全部磁盘")
+			} else {
+				logger.logf("用户选择源磁盘: %s (%s)", remoteList[idx-1].Path, remoteList[idx-1].SizeHuman)
+			}
 
 			if mode == 2 && idx == 0 {
-				batchSaveToFile(ip, remoteList, sshClient)
+				batchSaveToFile(ip, remoteList, sshClient, logger)
 				if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
 					waitExit()
 					return
@@ -327,7 +374,7 @@ func runInteractive() {
 			disk := remoteList[idx-1]
 
 			if mode == 2 {
-				runSaveToFile(ip, disk, sshClient)
+				runSaveToFile(ip, disk, sshClient, logger)
 				if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
 					waitExit()
 					return
@@ -367,6 +414,7 @@ func runInteractive() {
 		fmt.Println("  [2] 保存为压缩文件 (dd -> gzip 文件)")
 		fmt.Println("  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)")
 		mode := cli.SelectOption("请输入序号", 1, 3)
+		logger.logf("用户选择操作模式: %d", mode)
 
 		fmt.Println()
 		cli.PrintSection("选择源磁盘 — 输入序号选定远程磁盘")
@@ -380,9 +428,14 @@ func runInteractive() {
 			minIdx = 0
 		}
 		srcIdx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
+		if mode == 2 && srcIdx == 0 {
+			logger.logf("用户选择备份全部磁盘")
+		} else {
+			logger.logf("用户选择源磁盘: %s (%s)", remoteList[srcIdx-1].Path, remoteList[srcIdx-1].SizeHuman)
+		}
 
 		if mode == 2 && srcIdx == 0 {
-			batchSaveToFile(ip, remoteList, sshClient)
+			batchSaveToFile(ip, remoteList, sshClient, logger)
 			if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
 				waitExit()
 				return
@@ -472,7 +525,7 @@ func runInteractive() {
 			}
 			continue
 		} else if mode == 2 {
-			runSaveToFile(ip, srcDisk, sshClient)
+			runSaveToFile(ip, srcDisk, sshClient, logger)
 			if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
 				waitExit()
 				return
@@ -532,7 +585,17 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		}
 		fmt.Printf("文件: %s (gzip)\n", saveFile)
 		cliDisk := cli.DiskItem{Path: srcDisk.Path, SizeBytes: srcDisk.SizeBytes, SizeHuman: srcDisk.SizeHuman, Name: srcDisk.Name}
-		doSaveToFile(ip, cliDisk, sshClient, saveFile)
+
+		logger := newSessionLogger()
+		logger.logf("=== Disk Cloner v%s 命令行模式 ===", version)
+		logger.logf("SSH 连接: %s@%s:%d (认证: %s)", user, ip, port, authMethod(pass))
+		logger.logf("远程环境: OS=%q RootFS=%q Alpine=%v RAM=%v Detected=%v",
+			readiness.OSLine, readiness.RootFS, readiness.IsAlpine, readiness.IsRAM, readiness.Detected)
+		logger.logf("源磁盘: %s (%s)", srcDisk.Path, srcDisk.SizeHuman)
+		logger.logf("保存文件: %s", saveFile)
+		logger.logf("压缩级别: %d  压缩方式: %s  块大小: %s",
+			compressLevel, compressTypeName(compressType), bs)
+		doSaveToFile(ip, cliDisk, sshClient, saveFile, logger)
 		return
 	}
 
@@ -617,44 +680,69 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 	printFstabWarning(target)
 }
 
-func runSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client) {
+func runSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, logger *sessionLogger) {
 	saveDir := askSaveDirectory()
 	dateStr := time.Now().Format("2006-01-02")
 	dateDir := filepath.Join(saveDir, dateStr)
 	os.MkdirAll(dateDir, 0755)
 	fmt.Printf("  保存目录: %s\n", dateDir)
+	logger.logf("保存目录: %s", dateDir)
 
 	defaultName := makeFileName(ip, srcDisk.Name, srcDisk.SizeHuman, dateStr)
 	fileName := filepath.Join(dateDir, defaultName)
 	fileName = cli.ReadInput("文件名", fileName)
-	doSaveToFile(ip, srcDisk, sshClient, fileName)
+	logger.logf("用户输入文件名: %s", fileName)
+	doSaveToFile(ip, srcDisk, sshClient, fileName, logger)
 }
 
 // batchSaveToFile saves all remote disks with a single set of prompts.
-func batchSaveToFile(ip string, disks []cli.DiskItem, sshClient *sshclient.Client) {
+func batchSaveToFile(ip string, disks []cli.DiskItem, sshClient *sshclient.Client, logger *sessionLogger) {
 	saveDir := askSaveDirectory()
 	dateStr := time.Now().Format("2006-01-02")
 	dateDir := filepath.Join(saveDir, dateStr)
 	os.MkdirAll(dateDir, 0755)
 	fmt.Printf("  保存目录: %s\n", dateDir)
+	logger.logf("批量备份保存目录: %s", dateDir)
+	logger.logf("待备份磁盘数: %d", len(disks))
 
 	blockSize := cli.ReadInput("块大小", "4M")
 	compressLevel = cli.AskCompressionLevel()
 	compressType = cli.AskCompressionType()
 	doZero := cli.ConfirmZero()
 	fixInitramfs = cli.AskFixInitramfs()
+	logger.logf("块大小: %s", blockSize)
+	logger.logf("压缩级别: %d  压缩方式: %s", compressLevel, compressTypeName(compressType))
+	logger.logf("零填充空闲空间: %v", doZero)
+	logger.logf("重建 initramfs: %v", fixInitramfs)
 	fmt.Println()
 	if !cli.Confirm("  确认开始批量备份? 输入 yes 继续") {
+		logger.logf("用户取消批量备份")
 		fmt.Println("  已取消")
 		return
 	}
+	logger.logf("用户确认开始批量备份")
 
 	for i, d := range disks {
 		fmt.Println()
 		fmt.Printf("  --- 备份 %d/%d: %s ---\n", i+1, len(disks), d.Path)
 		fileName := filepath.Join(dateDir, makeFileName(ip, d.Name, d.SizeHuman, dateStr))
-		execSaveToFile(ip, d, sshClient, fileName, blockSize, doZero)
+
+		// Each disk gets its own log file containing the common preamble
+		// (connection / readiness / scan) inherited via fork() plus the
+		// per-disk entries below.
+		diskLogger := logger.fork()
+		diskLogger.logf("=== 备份 %d/%d: %s (%s) ===", i+1, len(disks), d.Path, d.SizeHuman)
+		diskLogger.logf("保存文件: %s", fileName)
+		logPath := fileName + ".log"
+		if err := diskLogger.open(logPath); err != nil {
+			fmt.Printf("  [!] 无法创建日志文件 %s: %v (继续无日志)\n", logPath, err)
+		} else {
+			fmt.Printf("  日志文件: %s\n", logPath)
+		}
+		execSaveToFile(ip, d, sshClient, fileName, blockSize, doZero, diskLogger)
+		diskLogger.close()
 	}
+	logger.logf("批量备份全部完成")
 }
 
 func askSaveDirectory() string {
@@ -688,13 +776,15 @@ func askSaveDirectory() string {
 	return dir
 }
 
-func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, fileName string) {
+func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, fileName string, logger *sessionLogger) {
 	fmt.Println()
 	fmt.Println("  +--------------------------------------------+")
 	fmt.Printf("  |  源:   %s:%s (%s)\n", ip, srcDisk.Path, srcDisk.SizeHuman)
 	fmt.Printf("  |  文件: %s\n", fileName)
 	fmt.Println("  |  格式: gzip 压缩")
 	fmt.Println("  +--------------------------------------------+")
+	logger.logf("源: %s:%s (%s)", ip, srcDisk.Path, srcDisk.SizeHuman)
+	logger.logf("保存文件: %s (gzip 压缩)", fileName)
 	if runtime.GOOS != "windows" {
 		fmt.Println()
 		fmt.Println("  注意: 如果在 RAM OS 中运行,")
@@ -702,27 +792,48 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 		fmt.Println("    或将文件保存到已挂载的物理磁盘路径")
 	}
 	blockSize := cli.ReadInput("块大小", "4M")
+	logger.logf("块大小: %s", blockSize)
 
 	compressLevel = cli.AskCompressionLevel()
 	compressType = cli.AskCompressionType()
+	logger.logf("压缩级别: %d  压缩方式: %s", compressLevel, compressTypeName(compressType))
 
 	doZero := cli.ConfirmZero()
 	fixInitramfs = cli.AskFixInitramfs()
+	logger.logf("零填充空闲空间: %v", doZero)
+	logger.logf("重建 initramfs: %v", fixInitramfs)
 	fmt.Println()
 	if !cli.Confirm("  确认开始保存? 输入 yes 继续") {
+		logger.logf("用户取消保存")
 		fmt.Println("  已取消")
 		return
 	}
-	execSaveToFile(ip, srcDisk, sshClient, fileName, blockSize, doZero)
+	logger.logf("用户确认开始保存")
+
+	// Now that the user has committed, create the log file. Everything
+	// buffered so far (connection, readiness, scan, prompts, choices) is
+	// flushed in one shot; subsequent entries are written live.
+	logPath := fileName + ".log"
+	if err := logger.open(logPath); err != nil {
+		fmt.Printf("  [!] 无法创建日志文件 %s: %v (继续无日志)\n", logPath, err)
+	} else {
+		fmt.Printf("  日志文件: %s\n", logPath)
+	}
+	defer logger.close()
+
+	execSaveToFile(ip, srcDisk, sshClient, fileName, blockSize, doZero, logger)
 }
 
 // execSaveToFile runs the actual save without prompts.
-func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, fileName string, blockSize string, doZero bool) {
+func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, fileName string, blockSize string, doZero bool, logger *sessionLogger) {
 	fmt.Println()
 	fmt.Println("  开始保存...")
 	fmt.Println()
 
 	totalStart := time.Now()
+	logger.logf("开始保存操作 (dd|%s -> 网络 -> 文件)", compressTypeName(compressType))
+	logger.logf("开始时间: %s", totalStart.Format("2006-01-02 15:04:05"))
+
 	job := clone.New(sshClient, clone.Params{
 		SourcePath: srcDisk.Path,
 		TargetPath: fileName,
@@ -732,27 +843,36 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client
 		CompressionLevel: compressLevel,
 		CompressType: compressType,
 		FixInitramfs: fixInitramfs,
-	}, makeProgressFn())
+	}, makeProgressFnWithLogger(logger))
 	job.SetLogFunc(func(format string, args ...interface{}) {
+		msg := fmt.Sprintf(format, args...)
 		fmt.Printf(format+"\n", args...)
+		logger.logf("  %s", msg)
 	})
 	if err := job.RunToFile(); err != nil {
+		logger.logf("保存失败: %v", err)
 		fmt.Printf("\n  保存失败: %v\n", err)
 		return
 	}
+	logger.logf("dd|gzip 传输完成")
 
 	saveChecksum(fileName)
+	logger.logf("校验文件已生成: %s.sha256", fileName)
 
 	if info, err := os.Stat(fileName); err == nil {
 		ratio := 0.0
 		if srcDisk.SizeBytes > 0 {
 			ratio = float64(info.Size()) / float64(srcDisk.SizeBytes) * 100
 		}
+		logger.logf("文件大小: %s (压缩率 %.1f%%)", disk.FormatBytes(info.Size()), ratio)
 		fmt.Printf("  文件大小: %s (压缩率 %.1f%%)\n", disk.FormatBytes(info.Size()), ratio)
 	}
+	totalTime := time.Since(totalStart)
+	logger.logf("总耗时: %s", formatTotalTime(totalTime))
+	logger.logf("=== 保存完成 ===")
 	fmt.Println()
 	fmt.Println("  ===============================================")
-	fmt.Printf("  保存完成! 总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
+	fmt.Printf("  保存完成! 总耗时: %s\n", formatTotalTime(totalTime))
 	fmt.Println("  ===============================================")
 }
 
@@ -1099,12 +1219,112 @@ func extractIP(input string) string {
 	return input
 }
 
+// sessionLogger buffers timestamped log entries until a target file is opened.
+// Used by Mode 2 (save-to-file) to record the full interactive session — from
+// SSH connection through readiness check, disk scan, prompts and progress —
+// into a .log file written alongside the compressed image.
+//
+// Entries logged before open() is called are kept in memory; they are flushed
+// to the file when open() is invoked (typically after the user confirms the
+// save and the final file path is known). If the user cancels, open() is never
+// called and the buffered entries are simply discarded when the logger goes
+// out of scope — no log file is left behind.
+//
+// fork() copies the current buffer into a new logger, used by batch mode where
+// each disk gets its own log file but should include the common preamble
+// (connection / readiness / disk list) captured before the per-disk loop.
+type sessionLogger struct {
+	mu     sync.Mutex
+	file   *os.File
+	buffer []string
+}
+
+func newSessionLogger() *sessionLogger { return &sessionLogger{} }
+
+// logf appends a timestamped entry. If a file is open it is written immediately,
+// otherwise it is buffered in memory until open() flushes the buffer.
+func (l *sessionLogger) logf(format string, args ...interface{}) {
+	if l == nil {
+		return
+	}
+	line := time.Now().Format("2006-01-02 15:04:05") + "  " + fmt.Sprintf(format, args...)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file != nil {
+		fmt.Fprintln(l.file, line)
+	} else {
+		l.buffer = append(l.buffer, line)
+	}
+}
+
+// fork returns a new logger containing a copy of this logger's buffered
+// entries. The returned logger is independent (its own buffer/file). Used by
+// batch backup where each disk gets its own log file but should include the
+// common session preamble captured before the per-disk loop.
+func (l *sessionLogger) fork() *sessionLogger {
+	if l == nil {
+		return newSessionLogger()
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	child := &sessionLogger{}
+	if len(l.buffer) > 0 {
+		child.buffer = make([]string, len(l.buffer))
+		copy(child.buffer, l.buffer)
+	}
+	return child
+}
+
+// open creates the log file and flushes any buffered entries to it.
+// After open returns successfully, subsequent logf calls write directly
+// to the file. Returns an error if the file could not be created.
+func (l *sessionLogger) open(path string) error {
+	if l == nil {
+		return nil
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.file = f
+	for _, line := range l.buffer {
+		fmt.Fprintln(f, line)
+	}
+	l.buffer = nil
+	return nil
+}
+
+// close flushes and closes the underlying file. Safe to call on a logger
+// that was never opened (no-op).
+func (l *sessionLogger) close() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file != nil {
+		err := l.file.Close()
+		l.file = nil
+		return err
+	}
+	return nil
+}
+
 func makeProgressFn() func(clone.Progress) {
+	return makeProgressFnWithLogger(nil)
+}
+
+// makeProgressFnWithLogger returns a progress callback that prints to stdout
+// and, if logger is non-nil, also writes periodic snapshots to the log file
+// (roughly every 10 seconds) plus a final summary on completion.
+func makeProgressFnWithLogger(logger *sessionLogger) func(clone.Progress) {
 	var last cli.CloneProgress
+	var lastLogTime time.Time
 	return func(p clone.Progress) {
 		if p.Done {
 			if p.Error == nil {
-				// Use the last non-Done values if Done has zeros
 				cp := cli.CloneProgress{
 					BytesWritten:   p.BytesWritten,
 					TotalBytes:     p.TotalBytes,
@@ -1121,6 +1341,15 @@ func makeProgressFn() func(clone.Progress) {
 					cp.ElapsedSeconds = last.ElapsedSeconds
 				}
 				cli.PrintProgressComplete(cp)
+				if logger != nil {
+					logger.logf("传输完成: %s / %s  平均速度 %.1f MB/s  用时 %s",
+						disk.FormatBytes(cp.BytesWritten), disk.FormatBytes(cp.TotalBytes),
+						cp.SpeedMBps, formatTotalTime(time.Duration(cp.ElapsedSeconds)*time.Second))
+				}
+			} else {
+				if logger != nil {
+					logger.logf("传输出错: %v", p.Error)
+				}
 			}
 			return
 		}
@@ -1133,6 +1362,20 @@ func makeProgressFn() func(clone.Progress) {
 			EtaSeconds:     p.EtaSeconds,
 		}
 		cli.PrintProgress(last)
+
+		// Log progress snapshots every ~10 seconds (also log the first one
+		// immediately so the user sees that transfer has started).
+		if logger != nil && (lastLogTime.IsZero() || time.Since(lastLogTime) >= 10*time.Second) {
+			etaStr := "--"
+			if p.EtaSeconds > 0 {
+				etaStr = formatTotalTime(time.Duration(p.EtaSeconds) * time.Second)
+			}
+			logger.logf("进度: %s / %s (%.1f%%)  速度 %.1f MB/s  已用 %s  ETA %s",
+				disk.FormatBytes(p.BytesWritten), disk.FormatBytes(p.TotalBytes),
+				p.Percent, p.SpeedMBps,
+				formatTotalTime(time.Duration(p.ElapsedSeconds)*time.Second), etaStr)
+			lastLogTime = time.Now()
+		}
 	}
 }
 
