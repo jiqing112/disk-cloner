@@ -163,6 +163,7 @@ func ensureRemoteDeps(sshClient *sshclient.Client) {
 		{"lsblk", "util-linux"},
 		{"gzip", "gzip"},
 		{"pigz", "pigz"},
+		{"fsck.ext4", "e2fsprogs"},
 	}
 	var missing []string
 	for _, c := range checks {

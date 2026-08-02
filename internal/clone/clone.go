@@ -375,7 +375,13 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 		return err
 	}
 	bsBytes := bsToBytes(bs)
-	remoteCmd := fmt.Sprintf("dd of=%s bs=%s", j.params.TargetPath, bsBytes)
+	// Start remote dd with stdin pipe.
+	// conv=fdatasync forces dd to flush data to disk before exiting, so the
+	// ext4 journal and superblock are consistent when the machine reboots.
+	// Without this, data lingering in the kernel page cache when the SSH
+	// session closes / VM reboots causes "bad block bitmap checksum" and
+	// "Journal has aborted" on the next boot.
+	remoteCmd := fmt.Sprintf("dd of=%s bs=%s conv=fdatasync", j.params.TargetPath, bsBytes)
 
 	session, err := j.sshClient.ExecuteStdin(remoteCmd)
 	if err != nil {
@@ -420,6 +426,14 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	session.Stdin.Close()
 
 	sessionErr := session.Wait()
+
+	// Force an additional global sync on the remote so all filesystem
+	// metadata is flushed to the underlying block device before we return.
+	// conv=fdatasync in dd only syncs the dd output stream; a separate sync
+	// guarantees the kernel has written all dirty pages from the block device.
+	if !cancelled && copyErr == nil {
+		j.sshClient.CombinedOutput("sync")
+	}
 
 	stderrOut := ""
 	select {
