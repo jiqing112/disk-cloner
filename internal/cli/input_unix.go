@@ -60,7 +60,7 @@ func ReadInput(prompt, def string) string {
 		case b == 3:
 			fmt.Print("\r\n")
 			term.Restore(fd, oldState)
-			os.Exit(0)
+			os.Exit(130)
 
 		case b == 127 || b == 8:
 			if len(buf) > 0 {

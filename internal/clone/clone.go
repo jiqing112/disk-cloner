@@ -47,6 +47,13 @@ type CloneJob struct {
 	params     Params
 	progressFn func(Progress)
 	logFn      LogFunc
+
+	// compressCmd is the built remote compression command (cached so the
+	// tool detection runs only once per job). compressTool is the actual
+	// tool in use ("gzip" or "pigz"), which may differ from the requested
+	// CompressType when pigz is unavailable and we fall back to gzip.
+	compressCmd  string
+	compressTool string
 }
 
 func New(sshClient *sshclient.Client, params Params, progressFn func(Progress)) *CloneJob {
@@ -180,8 +187,13 @@ func (j *CloneJob) remoteHasCommand(cmd string) bool {
 
 // buildCompressCmd returns the compress command segment for the remote pipeline.
 // It detects available tools (gzip, pigz) and builds the appropriate command.
-// Also ensures the chosen tool is installed.
+// Also ensures the chosen tool is installed. The result is cached so tool
+// detection runs only once per job; subsequent calls return the same command.
 func (j *CloneJob) buildCompressCmd() string {
+	if j.compressCmd != "" {
+		return j.compressCmd
+	}
+
 	level := j.params.CompressionLevel
 	if level <= 0 || level > 9 {
 		level = 1
@@ -197,18 +209,26 @@ func (j *CloneJob) buildCompressCmd() string {
 			if n, err := strconv.Atoi(ncpus); err == nil && n > 1 {
 				threads = strconv.Itoa(n)
 			}
-			return fmt.Sprintf("pigz -%d -p %s", level, threads)
+			j.compressCmd = fmt.Sprintf("pigz -%d -p %s", level, threads)
+			j.compressTool = "pigz"
+			return j.compressCmd
 		}
 		// If pigz install failed, fall through to gzip
 	}
 
 	// Install or check gzip
 	j.sshClient.CombinedOutput("command -v gzip || apk add --quiet gzip 2>/dev/null")
-	return fmt.Sprintf("gzip -%d", level)
+	j.compressCmd = fmt.Sprintf("gzip -%d", level)
+	j.compressTool = "gzip"
+	return j.compressCmd
 }
 
-// compressToolName returns the human-readable name of the compression tool.
+// compressToolName returns the human-readable name of the compression tool
+// actually in use. Accurate even when pigz was requested but unavailable.
 func (j *CloneJob) compressToolName() string {
+	if j.compressTool != "" {
+		return j.compressTool
+	}
 	if j.params.CompressType == 1 {
 		return "pigz"
 	}
@@ -249,6 +269,9 @@ func (j *CloneJob) Run() error {
 
 	// Compression level 0 = no compression, 1-9 = gzip/pigz level
 	if j.params.CompressionLevel > 0 {
+		// Build the compress command first so compressToolName reflects the
+		// actual tool (pigz may fall back to gzip).
+		_ = j.buildCompressCmd()
 		j.logFn("  Compressed transfer (dd|%s -> net -> gunzip -> disk)", j.compressToolName())
 		if err := j.streamCompressed(target); err != nil {
 			return err
@@ -295,6 +318,9 @@ func (j *CloneJob) RunToFile() error {
 	}
 	defer f.Close()
 
+	// Build the compress command first so compressToolName reflects the
+	// actual tool (pigz may fall back to gzip).
+	_ = j.buildCompressCmd()
 	j.logFn("  Remote compressing (dd|%s -> net -> file)", j.compressToolName())
 	if err := j.streamCompressedRaw(f); err != nil {
 		return err
