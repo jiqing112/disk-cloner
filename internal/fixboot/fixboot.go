@@ -699,11 +699,11 @@ func fixFstab(rootMount string) error {
 	}
 
 	extraMounts := map[string]bool{
-		"/mnt":     true,
-		"/data":    true,
-		"/backup":  true,
-		"/media":   true,
-		"/srv":     true,
+		"/mnt":            true,
+		"/data":           true,
+		"/backup":         true,
+		"/media":          true,
+		"/srv":            true,
 		"/var/lib/docker": true,
 	}
 

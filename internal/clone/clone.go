@@ -237,7 +237,9 @@ func (j *CloneJob) compressToolName() string {
 
 // Run clones remote disk to a local block device.
 // Uses gzip compression over SSH to reduce network transfer:
-//   remote: dd | gzip ??SSH ??local: gunzip ??write to disk
+//
+//	remote: dd | gzip ??SSH ??local: gunzip ??write to disk
+//
 // Also does zero-fill beforehand to maximize compression.
 func (j *CloneJob) Run() error {
 	if err := validateDevicePath(j.params.SourcePath); err != nil {

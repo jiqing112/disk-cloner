@@ -29,26 +29,26 @@ const (
 	version        = "3.0.0"
 )
 
-var compressLevel = 1  // default gzip compression level 1-9, 0 = no compression
-var compressType = 0   // 0=gzip, 1=pigz (multi-threaded)
+var compressLevel = 1 // default gzip compression level 1-9, 0 = no compression
+var compressType = 0  // 0=gzip, 1=pigz (multi-threaded)
 var fixInitramfs = false
 
 func main() {
 	var (
-		remoteIP   = flag.String("H", "", "远程服务器 IP")
-		remotePort = flag.Int("P", 22, "SSH 端口")
-		remoteUser = flag.String("u", "root", "SSH 用户名")
-		remotePass = flag.String("p", "", "SSH 密码")
-		source     = flag.String("s", "", "源磁盘 (远程)")
-		target     = flag.String("t", "", "目标磁盘 (本地)")
-		bs         = flag.String("bs", "4M", "dd 块大小")
-		compressLv = flag.Int("z", 1, "压缩级别 0-9 (0=不压缩, 1=最快, 9=最小)")
-		autoYes    = flag.Bool("y", false, "跳过确认")
-		saveFile   = flag.String("o", "", "保存为 gzip 文件")
-		noFixBoot  = flag.Bool("no-fix-boot", false, "跳过引导修复")
-		fixBootDev = flag.String("fix-boot-disk", "", "独立修复引导")
+		remoteIP    = flag.String("H", "", "远程服务器 IP")
+		remotePort  = flag.Int("P", 22, "SSH 端口")
+		remoteUser  = flag.String("u", "root", "SSH 用户名")
+		remotePass  = flag.String("p", "", "SSH 密码")
+		source      = flag.String("s", "", "源磁盘 (远程)")
+		target      = flag.String("t", "", "目标磁盘 (本地)")
+		bs          = flag.String("bs", "4M", "dd 块大小")
+		compressLv  = flag.Int("z", 1, "压缩级别 0-9 (0=不压缩, 1=最快, 9=最小)")
+		autoYes     = flag.Bool("y", false, "跳过确认")
+		saveFile    = flag.String("o", "", "保存为 gzip 文件")
+		noFixBoot   = flag.Bool("no-fix-boot", false, "跳过引导修复")
+		fixBootDev  = flag.String("fix-boot-disk", "", "独立修复引导")
 		restoreFile = flag.String("r", "", "恢复 gzip 文件到远程磁盘")
-		showVer   = flag.Bool("V", false, "显示版本号")
+		showVer     = flag.Bool("V", false, "显示版本号")
 	)
 	flag.Usage = func() {
 		fmt.Println("Disk Cloner v" + version)
@@ -342,7 +342,9 @@ func runInteractive() {
 			fmt.Println("  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)")
 			fmt.Println("  请输入序号 2 或 3 选择操作模式")
 			mode := cli.SelectOption("选择操作模式", 2, 3)
-			if isBack(mode) { continue }
+			if isBack(mode) {
+				continue
+			}
 			logger.logf("用户选择操作模式: %d", mode)
 
 			cli.PrintSection("请选择源磁盘 — 输入序号选定远程磁盘")
@@ -355,7 +357,9 @@ func runInteractive() {
 				minIdx = 0
 			}
 			idx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
-			if isBack(idx) { continue }
+			if isBack(idx) {
+				continue
+			}
 			if mode == 2 && idx == 0 {
 				logger.logf("用户选择备份全部磁盘")
 			} else {
@@ -414,7 +418,9 @@ func runInteractive() {
 		fmt.Println("  [2] 保存为压缩文件 (dd -> gzip 文件)")
 		fmt.Println("  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)")
 		mode := cli.SelectOption("请输入序号", 1, 3)
-		if isBack(mode) { continue }
+		if isBack(mode) {
+			continue
+		}
 		logger.logf("用户选择操作模式: %d", mode)
 
 		fmt.Println()
@@ -429,7 +435,9 @@ func runInteractive() {
 			minIdx = 0
 		}
 		srcIdx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
-		if isBack(srcIdx) { continue }
+		if isBack(srcIdx) {
+			continue
+		}
 		if mode == 2 && srcIdx == 0 {
 			logger.logf("用户选择备份全部磁盘")
 		} else {
@@ -458,7 +466,9 @@ func runInteractive() {
 			cli.PrintSection("选择目标磁盘 — 输入序号选定本地磁盘")
 			cli.PrintDiskList(localList, "local")
 			tgtIdx := cli.SelectDisk("请输入序号", 1, len(localList))
-			if isBack(tgtIdx) { continue }
+			if isBack(tgtIdx) {
+				continue
+			}
 			tgtDisk := localList[tgtIdx-1]
 
 			fmt.Println()
@@ -477,9 +487,9 @@ func runInteractive() {
 			compressType = cli.AskCompressionType()
 
 			fmt.Println()
-		doZero := cli.ConfirmZero()
-		fixInitramfs = cli.AskFixInitramfs()
-		fmt.Println()
+			doZero := cli.ConfirmZero()
+			fixInitramfs = cli.AskFixInitramfs()
+			fmt.Println()
 
 			fmt.Printf("  此操作将覆盖 %s 上的所有数据!\n", tgtDisk.Path)
 			if !cli.Confirm("  确认开始克隆? 输入 yes 继续") {
@@ -494,14 +504,14 @@ func runInteractive() {
 
 			totalStart := time.Now()
 			job := clone.New(sshClient, clone.Params{
-				SourcePath: srcDisk.Path,
-				TargetPath: tgtDisk.Path,
-				SourceSize: srcDisk.SizeBytes,
-				BlockSize:  blockSize,
-				ZeroFill:   doZero,
+				SourcePath:       srcDisk.Path,
+				TargetPath:       tgtDisk.Path,
+				SourceSize:       srcDisk.SizeBytes,
+				BlockSize:        blockSize,
+				ZeroFill:         doZero,
 				CompressionLevel: compressLevel,
-		CompressType: compressType,
-		FixInitramfs: fixInitramfs,
+				CompressType:     compressType,
+				FixInitramfs:     fixInitramfs,
 			}, makeProgressFn())
 			job.SetLogFunc(func(format string, args ...interface{}) {
 				fmt.Printf(format+"\n", args...)
@@ -564,6 +574,10 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		fmt.Println("已取消")
 		return
 	}
+
+	// Direct mode defaults: rebuild initramfs for cross-hardware boot
+	// compatibility (applies to both save and clone paths; restore ignores it).
+	fixInitramfs = true
 
 	remoteRaw, err := sshClient.CombinedOutput(remoteLsblkCmd)
 	if err != nil || remoteRaw == "" {
@@ -628,13 +642,49 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			log.Fatalf("文件不存在: %s", restoreFile)
 		}
 		fmt.Printf("文件: %s -> 远程: %s (%s)\n", restoreFile, source, srcDisk.SizeHuman)
+
+		// Verify file integrity if a .sha256 checksum file exists
+		if !verifyChecksum(restoreFile) {
+			if !autoYes {
+				fmt.Print("  校验失败，是否继续恢复? (yes/no): ")
+				var confirm string
+				fmt.Scanln(&confirm)
+				if confirm != "yes" && confirm != "y" {
+					fmt.Println("已取消")
+					return
+				}
+			} else {
+				fmt.Println("  [!] 校验失败，-y 模式继续恢复（风险自负）")
+			}
+		}
+
+		// Check target disk size vs uncompressed image size
+		if uncompSize := clone.GzipUncompressedSize(restoreFile); uncompSize > 0 {
+			if targetSize, _ := getRemoteDiskSize(sshClient, source); targetSize > 0 && uncompSize > targetSize {
+				pct := float64(targetSize) / float64(uncompSize) * 100
+				fmt.Printf("  [!] 目标盘 (%s) 小于解压后镜像 (%s)，只能写入约 %.1f%%\n",
+					disk.FormatBytes(targetSize), disk.FormatBytes(uncompSize), pct)
+				if !autoYes {
+					fmt.Print("  继续恢复? (yes/no): ")
+					var confirm string
+					fmt.Scanln(&confirm)
+					if confirm != "yes" && confirm != "y" {
+						fmt.Println("已取消")
+						return
+					}
+				} else {
+					fmt.Println("  [!] -y 模式继续恢复（风险自负）")
+				}
+			}
+		}
+
 		totalStart := time.Now()
 		job := clone.New(sshClient, clone.Params{
-			TargetPath: source,
-			BlockSize:  bs,
+			TargetPath:       source,
+			BlockSize:        bs,
 			CompressionLevel: compressLevel,
-		CompressType: compressType,
-		FixInitramfs: fixInitramfs,
+			CompressType:     compressType,
+			FixInitramfs:     fixInitramfs,
 		}, makeProgressFn())
 		job.SetLogFunc(func(format string, args ...interface{}) {
 			fmt.Printf(format+"\n", args...)
@@ -681,14 +731,14 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 	totalStart := time.Now()
 
 	job := clone.New(sshClient, clone.Params{
-		SourcePath: source,
-		TargetPath: target,
-		SourceSize: srcDisk.SizeBytes,
-		BlockSize:  bs,
-		ZeroFill:   true,
+		SourcePath:       source,
+		TargetPath:       target,
+		SourceSize:       srcDisk.SizeBytes,
+		BlockSize:        bs,
+		ZeroFill:         true,
 		CompressionLevel: compressLevel,
-		CompressType: compressType,
-		FixInitramfs: fixInitramfs,
+		CompressType:     compressType,
+		FixInitramfs:     fixInitramfs,
 	}, makeProgressFn())
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
@@ -700,8 +750,9 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 	}
 	fmt.Println("克隆完成!")
 	fmt.Printf("总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
-	_ = noFixBoot
-	printFstabWarning(target)
+	if !noFixBoot {
+		printFstabWarning(target)
+	}
 }
 
 func runSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, logger *sessionLogger) {
@@ -868,14 +919,14 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client
 	logger.logf("开始时间: %s", totalStart.Format("2006-01-02 15:04:05"))
 
 	job := clone.New(sshClient, clone.Params{
-		SourcePath: srcDisk.Path,
-		TargetPath: fileName,
-		SourceSize: srcDisk.SizeBytes,
-		BlockSize:  blockSize,
-		ZeroFill:   doZero,
+		SourcePath:       srcDisk.Path,
+		TargetPath:       fileName,
+		SourceSize:       srcDisk.SizeBytes,
+		BlockSize:        blockSize,
+		ZeroFill:         doZero,
 		CompressionLevel: compressLevel,
-		CompressType: compressType,
-		FixInitramfs: fixInitramfs,
+		CompressType:     compressType,
+		FixInitramfs:     fixInitramfs,
 	}, makeProgressFnWithLogger(logger))
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		msg := fmt.Sprintf(format, args...)
@@ -962,11 +1013,11 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 
 	totalStart := time.Now()
 	job := clone.New(sshClient, clone.Params{
-		TargetPath: remoteDisk,
-		BlockSize:  "4M",
+		TargetPath:       remoteDisk,
+		BlockSize:        "4M",
 		CompressionLevel: compressLevel,
-		CompressType: compressType,
-		FixInitramfs: fixInitramfs,
+		CompressType:     compressType,
+		FixInitramfs:     fixInitramfs,
 	}, makeProgressFn())
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
