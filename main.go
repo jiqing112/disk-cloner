@@ -695,6 +695,19 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			os.Exit(1)
 		}
 		fmt.Printf("恢复完成! 总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
+
+		// Post-restore verification: read-only fsck on all target partitions.
+		// Catches torn images before the user reboots into a corrupted system.
+		fmt.Println("  正在验证目标文件系统一致性 (只读 fsck)...")
+		if bad := postRestoreFsck(sshClient, source); len(bad) > 0 {
+			fmt.Printf("  [!] 警告: 以下分区 fsck 报告错误: %s\n", strings.Join(bad, ", "))
+			fmt.Println("  [!] 恢复的文件系统可能不一致,重启前请先执行:")
+			for _, p := range bad {
+				fmt.Printf("        fsck.ext4 -fy %s\n", p)
+			}
+		} else {
+			fmt.Println("  ✓ 目标文件系统一致性检查通过")
+		}
 		return
 	}
 
@@ -1033,6 +1046,19 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	if err := job.RestoreFromFile(fileName); err != nil {
 		fmt.Printf("\n  恢复失败: %v\n", err)
 		return
+	}
+
+	// Post-restore verification: read-only fsck on all target partitions.
+	fmt.Println()
+	fmt.Println("  正在验证目标文件系统一致性 (只读 fsck)...")
+	if bad := postRestoreFsck(sshClient, remoteDisk); len(bad) > 0 {
+		fmt.Printf("  [!] 警告: 以下分区 fsck 报告错误: %s\n", strings.Join(bad, ", "))
+		fmt.Println("  [!] 恢复的文件系统可能不一致,重启前请先执行:")
+		for _, p := range bad {
+			fmt.Printf("        fsck.ext4 -fy %s\n", p)
+		}
+	} else {
+		fmt.Println("  ✓ 目标文件系统一致性检查通过")
 	}
 
 	fmt.Println()
@@ -1544,4 +1570,40 @@ func verifyChecksum(filePath string) bool {
 	}
 	fmt.Println("  ✓ 文件完整性校验通过")
 	return true
+}
+
+// postRestoreFsck runs a read-only filesystem check on each partition of the
+// target disk after a restore. This catches corruption that would otherwise
+// only surface as "Journal has aborted" / "bad block bitmap checksum" on boot.
+//
+// Returns the list of partitions that reported errors (caller may warn).
+// Partitions that aren't ext-family filesystems are silently skipped.
+func postRestoreFsck(sshClient *sshclient.Client, targetDisk string) []string {
+	// Ensure e2fsprogs (fsck.ext4) is available on the remote.
+	sshClient.CombinedOutput("command -v fsck.ext4 || apk add --quiet e2fsprogs 2>/dev/null")
+
+	// List partitions of the target disk via /sys/block, which doesn't need
+	// lsblk and works even on minimal busybox systems.
+	diskBase := targetDisk
+	if i := strings.LastIndex(targetDisk, "/"); i >= 0 {
+		diskBase = targetDisk[i+1:]
+	}
+	out, _ := sshClient.CombinedOutput(fmt.Sprintf(
+		`for p in /sys/block/%s/%s*/partition; do [ -f "$p" ] || continue; `+
+			`echo "/dev/$(basename $(dirname "$p"))"; done`,
+		diskBase, diskBase))
+
+	var bad []string
+	for _, line := range strings.Split(out, "\n") {
+		part := strings.TrimSpace(line)
+		if part == "" || !strings.HasPrefix(part, "/dev/") {
+			continue
+		}
+		// -n = read-only, don't touch. -v = verbose. We just want the exit status.
+		_, err := sshClient.CombinedOutput(fmt.Sprintf("fsck.ext4 -fn %s 2>&1", part))
+		if err != nil {
+			bad = append(bad, part)
+		}
+	}
+	return bad
 }

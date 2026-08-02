@@ -185,6 +185,84 @@ func (j *CloneJob) remoteHasCommand(cmd string) bool {
 	return err == nil
 }
 
+// parseDdBytesRead extracts the number of bytes read by dd from its stderr
+// output. Busybox dd prints a line like "12345+0 records in", GNU coreutils dd
+// prints "1234567 bytes (1.2 MB, 1.1 MiB) copied". Returns -1 if not found.
+func parseDdBytesRead(stderr string) int64 {
+	// GNU coreutils dd: "N bytes (...) copied, ..."
+	for _, line := range strings.Split(stderr, "\n") {
+		if i := strings.Index(line, " bytes"); i > 0 {
+			n, err := strconv.ParseInt(strings.TrimSpace(line[:i]), 10, 64)
+			if err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	// Busybox dd: "<records>+<records> records in" with bs*N = bytes
+	// We need bs to compute, so this path returns -1 unless single-line count.
+	// Most Alpine deployments now have GNU dd via coreutils; fall back to -1.
+	return -1
+}
+
+// preReadSafetyCheck runs before reading the source disk (backup / clone-from-remote).
+// It flushes any pending writes on the source and warns loudly if any partition
+// on the source disk is still mounted or if non-Alpine-RAM-OS processes are
+// writing to it — both of which produce a torn (inconsistent) image.
+//
+// This is the #1 defense against the "ext4 bad block bitmap checksum" /
+// "Journal has aborted" corruption seen after restoring a backup that was
+// taken while the source system was live.
+func (j *CloneJob) preReadSafetyCheck() {
+	src := j.params.SourcePath
+
+	// 1) Flush all pending writes on the remote so whatever is in the page
+	//    cache hits the disk before we start reading. This is cheap insurance.
+	j.logFn("  Flushing remote filesystem buffers (sync)...")
+	j.sshClient.CombinedOutput("sync")
+
+	// 2) Detect partitions of the source disk that are still mounted. A
+	//    mounted partition almost always means the OS is live and writing
+	//    concurrently with our dd read -> torn image.
+	diskBase := src
+	if i := strings.LastIndex(src, "/"); i >= 0 {
+		diskBase = src[i+1:]
+	}
+	out, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+		`for mp in $(grep -oE '/dev/(mapper/)?%s[0-9]+[a-z]?' /proc/mounts 2>/dev/null | sort -u); do echo "MOUNTED $mp"; done; `+
+			`grep -E '(/dev/%s[0-9]+|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print "MOUNT "$2}'`,
+		diskBase, diskBase, diskBase))
+	mounted := []string{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "MOUNT") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				mounted = append(mounted, fields[1])
+			}
+		}
+	}
+	if len(mounted) > 0 {
+		j.logFn("  [!] 警告: 源磁盘的以下分区仍处于挂载状态:")
+		for _, mp := range mounted {
+			j.logFn("        - %s", mp)
+		}
+		j.logFn("  [!] 远程系统可能仍在运行,备份的镜像可能不一致!")
+		j.logFn("  [!] 强烈建议先重启进入 Alpine RAM OS 再备份")
+		j.logFn("  [!] 将继续备份,但恢复后可能出现 ext4 journal/损坏错误")
+	}
+
+	// 3) Freeze the block device if the kernel supports it. This blocks
+	//    further writes from reaching the device until we unfreeze, giving
+	//    us a stable snapshot. Best-effort: silently ignored if unsupported.
+	j.sshClient.CombinedOutput(fmt.Sprintf("blockdev --freeze %s 2>/dev/null", src))
+}
+
+// postReadUnfreeze releases the freeze taken by preReadSafetyCheck. Must be
+// called after the source read completes (success or failure). Best-effort.
+func (j *CloneJob) postReadUnfreeze() {
+	j.sshClient.CombinedOutput(fmt.Sprintf("blockdev --unfreeze %s 2>/dev/null", j.params.SourcePath))
+}
+
 // buildCompressCmd returns the compress command segment for the remote pipeline.
 // It detects available tools (gzip, pigz) and builds the appropriate command.
 // Also ensures the chosen tool is installed. The result is cached so tool
@@ -249,6 +327,10 @@ func (j *CloneJob) Run() error {
 		return err
 	}
 
+	// Flush source & warn if mounted; freeze block device for a stable read.
+	j.preReadSafetyCheck()
+	defer j.postReadUnfreeze()
+
 	// Zero-fill free space on remote disk to improve compression ratio
 	if j.params.ZeroFill {
 		if err := j.zeroFillFreeSpace(); err != nil {
@@ -299,6 +381,10 @@ func (j *CloneJob) RunToFile() error {
 	if err := validateDevicePath(j.params.SourcePath); err != nil {
 		return err
 	}
+
+	// Flush source & warn if mounted; freeze block device for a stable read.
+	j.preReadSafetyCheck()
+	defer j.postReadUnfreeze()
 
 	// Zero-fill free space before dd to improve gzip compression
 	if j.params.ZeroFill {
@@ -458,6 +544,12 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 			errMsg += "\n  stderr: " + strings.TrimSpace(stderrOut)
 		}
 		finalErr = fmt.Errorf("%s", errMsg)
+	} else if j.params.SourceSize > 0 && written < j.params.SourceSize {
+		// Short write: image was truncated in transit. The filesystem on
+		// disk will be missing tail blocks, which on ext4 typically shows
+		// up as "bad block bitmap checksum" / "Journal has aborted" on boot.
+		finalErr = fmt.Errorf("restore truncated: wrote %d bytes but image is %d bytes (%.1f%% of expected) — target filesystem will be corrupt",
+			written, j.params.SourceSize, float64(written)/float64(j.params.SourceSize)*100)
 	}
 
 	j.progressFn(Progress{Done: true, Error: finalErr})
@@ -892,6 +984,14 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 			errMsg += "\n  stderr: " + strings.TrimSpace(stderrOut)
 		}
 		finalErr = fmt.Errorf("%s", errMsg)
+	} else {
+		// Verify dd actually read the full source disk. dd reports bytes-read
+		// on stderr ("N bytes copied"). If it read less than SourceSize, the
+		// backup is truncated and restoring it will corrupt the target fs.
+		if ddRead := parseDdBytesRead(stderrOut); ddRead > 0 && j.params.SourceSize > 0 && ddRead < j.params.SourceSize {
+			finalErr = fmt.Errorf("backup truncated: dd read %d bytes but source disk is %d bytes (%.1f%% of expected) — backup is corrupt, do not restore it",
+				ddRead, j.params.SourceSize, float64(ddRead)/float64(j.params.SourceSize)*100)
+		}
 	}
 
 	j.progressFn(Progress{Done: true, Error: finalErr})
