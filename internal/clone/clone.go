@@ -54,6 +54,12 @@ type CloneJob struct {
 	// CompressType when pigz is unavailable and we fall back to gzip.
 	compressCmd  string
 	compressTool string
+
+	// ddSupportsFdatasync is probed once: GNU coreutils dd supports
+	// conv=fdatasync, BusyBox dd does not. ddTested marks whether the
+	// probe has run.
+	ddSupportsFdatasync bool
+	ddTested            bool
 }
 
 func New(sshClient *sshclient.Client, params Params, progressFn func(Progress)) *CloneJob {
@@ -183,6 +189,28 @@ func formatBytesCompat(n int64) string {
 func (j *CloneJob) remoteHasCommand(cmd string) bool {
 	_, err := j.sshClient.CombinedOutput("command -v " + cmd)
 	return err == nil
+}
+
+// probeDdFdatasync checks once whether the remote dd supports conv=fdatasync.
+// BusyBox dd (the default on Alpine RAM OS) does NOT support it and dies with
+// "invalid conversion: fdatasync" — which causes the restore to fail with
+// "write error: EOF" because dd exits immediately and the SSH stdin closes.
+// GNU coreutils dd supports it. We fall back to a post-write `sync` command
+// (which BusyBox supports) when fdatasync is unavailable.
+func (j *CloneJob) probeDdFdatasync() {
+	if j.ddTested {
+		return
+	}
+	j.ddTested = true
+	// Run a no-op dd with conv=fdatasync. If it errors, dd doesn't support it.
+	out, err := j.sshClient.CombinedOutput("dd if=/dev/zero of=/dev/null bs=1 count=1 conv=fdatasync 2>&1")
+	if err == nil && !strings.Contains(strings.ToLower(out), "invalid") && !strings.Contains(strings.ToLower(out), "error") {
+		j.ddSupportsFdatasync = true
+		j.logFn("  dd: GNU coreutils (conv=fdatasync supported)")
+	} else {
+		j.ddSupportsFdatasync = false
+		j.logFn("  dd: BusyBox (conv=fdatasync not supported, using post-write sync)")
+	}
 }
 
 // parseDdBytesRead extracts the number of bytes read by dd from its stderr
@@ -464,10 +492,13 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	// Start remote dd with stdin pipe.
 	// conv=fdatasync forces dd to flush data to disk before exiting, so the
 	// ext4 journal and superblock are consistent when the machine reboots.
-	// Without this, data lingering in the kernel page cache when the SSH
-	// session closes / VM reboots causes "bad block bitmap checksum" and
-	// "Journal has aborted" on the next boot.
-	remoteCmd := fmt.Sprintf("dd of=%s bs=%s conv=fdatasync", j.params.TargetPath, bsBytes)
+	// Not all dd implementations support it (BusyBox dd does not), so we
+	// probe first; the post-write `sync` command is the universal fallback.
+	j.probeDdFdatasync()
+	remoteCmd := fmt.Sprintf("dd of=%s bs=%s", j.params.TargetPath, bsBytes)
+	if j.ddSupportsFdatasync {
+		remoteCmd += " conv=fdatasync"
+	}
 
 	session, err := j.sshClient.ExecuteStdin(remoteCmd)
 	if err != nil {
