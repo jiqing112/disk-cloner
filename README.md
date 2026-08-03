@@ -72,6 +72,8 @@ bash reinstall.sh alpine --hold 1
 
 > 如果使用 Windows 运行程序做模式 2 或模式 3，Windows 端不需要进入 RAM OS（Windows 不做 dd 操作）。
 
+> 接收端（克隆的目标机、恢复的目标机）硬盘容量必须 ≥ 源盘容量。整盘 dd 不会自动调整分区，目标盘偏小时会截断 ext4 元数据，导致恢复后出现 `bad block bitmap checksum` / `Journal has aborted` 错误。
+
 ---
 
 ## 下载程序
