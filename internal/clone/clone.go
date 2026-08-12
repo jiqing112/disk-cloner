@@ -739,12 +739,38 @@ echo "DONE"
 
 // FixInitramfs rebuilds the remote system's initramfs with --no-hostonly
 // so the backup can boot on different hardware. Runs via chroot.
+//
+// This is a thin wrapper around FixBoot for backwards compatibility.
 func (j *CloneJob) FixInitramfs() error {
+	return j.FixBoot("")
+}
+
+// FixBoot performs a full remote boot repair: chroot into the restored
+// system on the remote, rebuild initramfs with --no-hostonly, reinstall
+// GRUB to the target disk, regenerate grub.cfg, and clean stale fstab
+// entries. Necessary after every restore because:
+//
+//   - GRUB's core.img embeds block addresses baked in at install time.
+//     When a disk is dd'd to a different disk (vda -> sda, different
+//     geometry, different gap size before partition 1), the embedded
+//     block list can become unreadable, producing GRUB's
+//     "error: unknown filesystem. Entering rescue mode...".
+//   - initramfs built with hostonly contains only the source machine's
+//     drivers; --no-hostonly rebuilds it with all drivers so the system
+//     boots on any hardware.
+//
+// If targetDisk is empty, GRUB reinstall is skipped (used by save mode
+// where we only rebuild initramfs on the source before imaging).
+func (j *CloneJob) FixBoot(targetDisk string) error {
 	if j.sshClient == nil {
 		return fmt.Errorf("SSH client is nil")
 	}
 
-	j.logFn("  Rebuilding initramfs (--no-hostonly for cross-hardware boot)...")
+	if targetDisk != "" {
+		j.logFn("  重建引导 (GRUB + initramfs) 以兼容不同硬件...")
+	} else {
+		j.logFn("  Rebuilding initramfs (--no-hostonly for cross-hardware boot)...")
+	}
 
 	// Step 1: install LVM tools and activate volumes
 	j.sshClient.CombinedOutput("apk add --quiet lvm2 2>/dev/null")
@@ -769,7 +795,7 @@ func (j *CloneJob) FixInitramfs() error {
 
 		// Try mounting to see if it's root
 		_, rcErr := j.sshClient.CombinedOutput(fmt.Sprintf(
-			`mp=$(mktemp -d) && mount %s "$mp" 2>/dev/null && { [ -f "$mp/etc/os-release" ] || [ -f "$mp/etc/fstab" ]; rc=$?; umount "$mp" 2>/dev/null; rmdir "$mp" 2>/dev/null; exit $rc; } && rmdir "$mp" 2>/dev/null; exit 1`,
+			`mp=$(mktemp -d) && mount %s "$mp" 2>/dev/null && { [ -f "$mp/etc/os-release" ] || [ -f "$mp/etc/fstab" ]; rc=$?; umount "$mp" 2>/dev/null; rmdir "$mp" >/dev/null 2>&1; exit $rc; } && rmdir "$mp" 2>/dev/null; exit 1`,
 			dev,
 		))
 		if rcErr == nil {
@@ -783,9 +809,17 @@ func (j *CloneJob) FixInitramfs() error {
 
 	j.logFn("    Root: %s", rootDev)
 
-	// Step 2: mount root + bind
-	// Note: no set -e here because mount commands may fail and we handle errors manually
+	// Detect whether /boot is a separate partition by parsing fstab.
+	// GRUB's grub2-install needs /boot mounted (or it will use the root).
+	bootScript := `grep -E '^[^#].*[[:space:]]/boot([[:space:]]|$)' /mnt/etc/fstab 2>/dev/null | awk '{print $1}' | head -1`
+	j.sshClient.CombinedOutput(fmt.Sprintf(`mount %s /mnt 2>/dev/null; BOOTENT=$(sh -c %s); umount /mnt 2>/dev/null`,
+		rootDev, shellQuote(bootScript)))
+
+	// Step 2: mount root + bind mounts, then chroot to fix initramfs + GRUB.
+	// No set -e here because we handle errors manually and want to clean up
+	// mount points even on failure.
 	script := fmt.Sprintf(`ROOT=%s
+TARGETDISK=%s
 
 # Unmount /mnt if something is already mounted there
 umount /mnt 2>/dev/null
@@ -793,12 +827,41 @@ umount /mnt 2>/dev/null
 mount "$ROOT" /mnt 2>/dev/null || { echo "FAIL mount"; exit 1; }
 [ ! -d /mnt/usr/bin ] && [ ! -d /mnt/usr/sbin ] && { echo "FAIL noroot"; exit 1; }
 
+# Mount /boot and /boot/efi if they are separate partitions (parsed from fstab).
+# Skip swap and pseudo filesystems. Resolve UUID=/LABEL= references.
+parse_fstab_dev() {
+  local entry="$1" dev=""
+  case "$entry" in
+    UUID=*)  dev=$(blkid -U "${entry#UUID=}" 2>/dev/null) ;;
+    LABEL=*) dev=$(blkid -L "${entry#LABEL=}" 2>/dev/null) ;;
+    /dev/*)  dev="$entry" ;;
+  esac
+  echo "$dev"
+}
+BOOTENT=$(awk '!/^[[:space:]]*#/ && $2=="/boot" {print $1; exit}' /mnt/etc/fstab 2>/dev/null)
+if [ -n "$BOOTENT" ]; then
+  BOOTDEV=$(parse_fstab_dev "$BOOTENT")
+  if [ -n "$BOOTDEV" ] && [ -b "$BOOTDEV" ]; then
+    mount "$BOOTDEV" /mnt/boot 2>/dev/null && echo "  mounted /boot <- $BOOTDEV"
+  fi
+fi
+EFIENT=$(awk '!/^[[:space:]]*#/ && $2=="/boot/efi" {print $1; exit}' /mnt/etc/fstab 2>/dev/null)
+if [ -n "$EFIENT" ]; then
+  EFIDEV=$(parse_fstab_dev "$EFIENT")
+  if [ -n "$EFIDEV" ] && [ -b "$EFIDEV" ]; then
+    mkdir -p /mnt/boot/efi 2>/dev/null
+    mount "$EFIDEV" /mnt/boot/efi 2>/dev/null && echo "  mounted /boot/efi <- $EFIDEV"
+  fi
+fi
+
 mount --bind /dev /mnt/dev 2>/dev/null
 mount --bind /proc /mnt/proc 2>/dev/null
 mount --bind /sys /mnt/sys 2>/dev/null
 mount -t tmpfs tmpfs /mnt/run 2>/dev/null || mkdir -p /mnt/run
 
 RC=0
+
+# --- Rebuild initramfs with all drivers (cross-hardware boot) ---
 DONE=0
 if [ -x /mnt/usr/bin/dracut ] || [ -x /mnt/usr/sbin/dracut ]; then
   echo "  -> dracut --no-hostonly"
@@ -812,26 +875,92 @@ if [ "$DONE" = "0" ] && [ -x /mnt/usr/bin/mkinitcpio ]; then
   echo "  -> mkinitcpio -P"
   chroot /mnt mkinitcpio -P 2>&1 && DONE=1 || RC=1
 fi
-[ "$DONE" = "0" ] && echo "NO_TOOL" && RC=1
+[ "$DONE" = "0" ] && echo "NO_INITRAMFS_TOOL" && RC=1
+
+# --- Reinstall GRUB to target disk (fixes "unknown filesystem" after dd) ---
+# Only when called from restore mode (targetDisk provided). Without a target
+# disk we are running on the source (save/clone mode) and must NOT rewrite
+# the source's MBR.
+if [ -n "$TARGETDISK" ]; then
+  # Ensure /etc/mtab exists inside chroot (some minimal images lack it)
+  [ -e /mnt/etc/mtab ] || ln -sf /proc/self/mounts /mnt/etc/mtab
+
+  GRUB_RC=1
+  if [ -x /mnt/usr/sbin/grub2-install ]; then
+    echo "  -> grub2-install --recheck $TARGETDISK"
+    chroot /mnt /usr/sbin/grub2-install --recheck "$TARGETDISK" 2>&1 && GRUB_RC=0
+    if [ $GRUB_RC -eq 0 ] && [ -x /mnt/usr/sbin/grub2-mkconfig ]; then
+      chroot /mnt /usr/sbin/grub2-mkconfig -o /boot/grub2/grub.cfg 2>&1
+    fi
+  elif [ -x /mnt/usr/sbin/grub-install ]; then
+    echo "  -> grub-install --recheck $TARGETDISK"
+    chroot /mnt /usr/sbin/grub-install --recheck "$TARGETDISK" 2>&1 && GRUB_RC=0
+    if [ $GRUB_RC -eq 0 ] && [ -x /mnt/usr/sbin/grub-mkconfig ]; then
+      chroot /mnt /usr/sbin/grub-mkconfig -o /boot/grub/grub.cfg 2>&1
+    fi
+  else
+    echo "NO_GRUB_TOOL"
+  fi
+  [ $GRUB_RC -ne 0 ] && echo "GRUB_INSTALL_FAILED" && RC=1
+
+  # --- Fix fstab: comment out mounts for disks that no longer exist ---
+  if [ -f /mnt/etc/fstab ]; then
+    cp /mnt/etc/fstab /mnt/etc/fstab.bak 2>/dev/null
+    awk '
+      /^[[:space:]]*#/ { print; next }
+      {
+        dev=$1; mp=$2
+        if (mp == "" || mp == "none" || mp == "swap") { print; next }
+        if (mp == "/" || mp == "/boot" || mp ~ /^\/boot\//) { print; next }
+        # Resolve and check
+        actual=""
+        if (dev ~ /^UUID=/)      actual=( "blkid -U " substr(dev,6) )
+        else if (dev ~ /^LABEL=/) actual=( "blkid -L " substr(dev,7) )
+        else if (dev ~ /^\/dev\//) actual=dev
+        if (actual != "" && system("[ -b " actual " ] 2>/dev/null") == 0) {
+          print
+        } else {
+          print "# " $0 "   # disabled by disk-cloner (device missing after restore)"
+        }
+      }
+    ' /mnt/etc/fstab > /mnt/etc/fstab.new && mv /mnt/etc/fstab.new /mnt/etc/fstab
+  fi
+fi
 
 umount -l /mnt/run 2>/dev/null
+umount -l /mnt/boot/efi 2>/dev/null
+umount -l /mnt/boot 2>/dev/null
 umount -l /mnt/sys 2>/dev/null
 umount -l /mnt/proc 2>/dev/null
 umount -l /mnt/dev 2>/dev/null
 umount -l /mnt 2>/dev/null
 exit $RC
-`, rootDev)
+`, shellQuote(rootDev), shellQuote(targetDisk))
 
 	out2, err2 := j.sshClient.CombinedOutput("sh -c " + shellQuote(script))
-	if err2 != nil || strings.Contains(out2, "FAIL") || strings.Contains(out2, "NO_TOOL") {
-		if strings.Contains(out2, "NO_TOOL") {
+	if err2 != nil || strings.Contains(out2, "FAIL") || strings.Contains(out2, "NO_INITRAMFS_TOOL") {
+		switch {
+		case strings.Contains(out2, "NO_INITRAMFS_TOOL"):
 			j.logFn("  [!] No initramfs tool found (dracut/update-initramfs/mkinitcpio), skipping")
-		} else {
-			j.logFn("  [!] Initramfs rebuild failed — you may need to fix boot manually")
+		case strings.Contains(out2, "FAIL mount"):
+			j.logFn("  [!] Failed to mount root partition")
+		case strings.Contains(out2, "FAIL noroot"):
+			j.logFn("  [!] Mounted partition does not look like a root filesystem")
+		default:
+			j.logFn("  [!] Boot repair failed — you may need to fix boot manually")
 		}
-		return nil // non-fatal
+		// Non-fatal: backup/restore still succeeded; user can fix boot manually.
+		return nil
 	}
-	j.logFn("  ✓ Initramfs rebuilt")
+	if strings.Contains(out2, "GRUB_INSTALL_FAILED") {
+		j.logFn("  [!] GRUB reinstall failed — you may need to run grub2-install manually")
+	} else if strings.Contains(out2, "NO_GRUB_TOOL") {
+		j.logFn("  [!] No GRUB install tool found (grub2-install/grub-install), skipping GRUB reinstall")
+	} else if targetDisk != "" {
+		j.logFn("  ✓ GRUB reinstalled and initramfs rebuilt")
+	} else {
+		j.logFn("  ✓ Initramfs rebuilt")
+	}
 	return nil
 }
 

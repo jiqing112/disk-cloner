@@ -13,6 +13,7 @@
 - [模式 2 — 保存为 gzip 文件](#模式-2--保存为-gzip-文件)
 - [模式 3 — 恢复文件到远程磁盘](#模式-3--恢复文件到远程磁盘)
 - [命令行模式](#命令行模式)
+- [引导修复 (GRUB + initramfs)](#引导修复-grub--initramfs)
 - [关键功能详解](#关键功能详解)
 - [克隆后必须做的事](#克隆后必须做的事)
 - [平台说明](#平台说明)
@@ -273,17 +274,22 @@ chmod +x disk-cloner-linux-amd64
   [================>-----------------------]  45.2%  118.5 MB/s  18.1GB/40.0GB  用时: 2分35秒  ETA: 2分55秒
 ```
 
-**第十步：克隆完成**
+**第十步：克隆完成 + 自动修复引导**
 
 ```
   克隆完成!
+  修复引导（确保目标盘可启动）...
+    Root: /dev/sda1
+  -> dracut --no-hostonly --regenerate-all --force
+  -> grub2-install --recheck /dev/sda
+  ✓ GRUB reinstalled and initramfs rebuilt
 
   ===============================================
   全部完成! 总耗时: 12分34秒
   ===============================================
 ```
 
-程序会显示 3 次 fstab 警告（间隔 10 秒），提示重启前检查挂载配置。
+模式 1 完成后**自动重装 GRUB + 重建 initramfs + 修 fstab**（详见 [引导修复](#引导修复-grub--initramfs)），通常**直接重启即可启动**。
 
 然后提示：
 
@@ -554,15 +560,154 @@ bash reinstall.sh alpine --hold 1
   [================>-----------------------]  45.2%  118.5 MB/s  18.1GB/40.0GB  用时: 2分35秒  ETA: 2分55秒
 ```
 
-**第九步：恢复完成**
+**第九步：恢复完成 + 自动修复引导**
 
 ```
-  ===============================================
   恢复完成! 总耗时: 12分34秒
+
+  修复引导（GRUB + initramfs，确保目标机能启动）...
+    Root: /dev/sda1
+  -> dracut --no-hostonly
+  -> grub2-install --recheck /dev/sda
+  ✓ GRUB reinstalled and initramfs rebuilt
+
+  正在验证目标文件系统一致性 (只读 fsck)...
+  ✓ 目标文件系统一致性检查通过
+
+  ===============================================
+  全部完成! 总耗时: 12分58秒
   ===============================================
 
   继续其他操作? 输入 yes 继续，其他退出:
 ```
+
+模式 3 完成后**自动重装 GRUB + 重建 initramfs + 修 fstab**（详见 [引导修复](#引导修复-grub--initramfs)），通常**直接重启目标机即可启动**。
+
+---
+
+## 引导修复 (GRUB + initramfs)
+
+整盘 dd 复制后，目标盘**几乎总是需要修复引导**才能正常启动。常见症状：
+
+```
+GRUB error: unknown filesystem. Entering rescue mode...
+grub rescue> _
+```
+
+或
+
+```
+VFS: Unable to mount root fs on unknown-block(0,0)
+dracut:/# _
+```
+
+### 为什么 dd 后引导会坏
+
+整盘 dd 只搬运数据，不会按目标机环境重装引导。dd 过去的镜像里有两样东西是**源机器专属**的：
+
+1. **GRUB core.img**（MBBR / BIOS Boot Partition 里的引导代码）
+   - core.img 内部用块偏移直接定位 `/boot/grub2/grub.cfg`，这些偏移在 GRUB 安装时按当时磁盘的几何参数（磁头数、每磁道扇区数、分区起始位置）硬编码
+   - 源盘是 virtio（vda）→ 目标盘是 SATA（sda），或源/目标盘容量不同导致分区表 gap 不同，core.img 里的偏移就读不到正确位置 → `unknown filesystem`
+   - 即使能读到，core.img 内置的 xfs/ext4 模块也只针对源磁盘上的文件系统元数据版本
+
+2. **initramfs**（启动早期根文件系统）
+   - 默认 hostonly 模式只打包**当前硬件的驱动**（云服务器通常只有 virtio 驱动）
+   - 恢复到 VMware / Hyper-V / KVM-SATA 后，内核找不到磁盘（virtio 驱动不匹配）→ `dracut emergency` / `VFS unable to mount root fs`
+
+### 自动修复（默认行为）
+
+**模式 1（克隆）、模式 3（恢复）完成后，程序会自动执行引导修复**，无需任何手动步骤。修复日志：
+
+```
+  修复引导（GRUB + initramfs，确保目标机能启动）...
+    Root: /dev/sda1
+  -> dracut --no-hostonly
+  -> grub2-install --recheck /dev/sda
+  ✓ GRUB reinstalled and initramfs rebuilt
+```
+
+具体做的事：
+
+1. `mdev -s` 扫描并创建分区设备节点（Alpine 精简环境需要）
+2. `lvm vgscan + vgchange -ay` 激活 LVM 卷组（如有）
+3. 通过 `blkid` 找到根分区（支持 ext4 / xfs / btrfs），自动检测 fstab 单独挂载 `/boot` 和 `/boot/efi`
+4. bind mount `/dev /proc /sys` + tmpfs `/run`
+5. chroot 进系统，根据发行版自动选工具：
+   - `dracut --no-hostonly --force --regenerate-all`（Fedora / RHEL / CentOS / Rocky / Alma）
+   - `update-initramfs -u -k all`（Debian / Ubuntu）
+   - `mkinitcpio -P`（Arch / Manjaro）
+6. `grub2-install --recheck <目标磁盘>`（或 `grub-install`）重装 GRUB
+7. `grub2-mkconfig -o /boot/grub2/grub.cfg`（或 `grub-mkconfig`）重新生成菜单
+8. 修复 `/etc/fstab`：把目标机上不存在的额外数据盘挂载条目自动注释掉，备份原文件为 `fstab.bak`
+
+> **注意**：保存模式（模式 2）的 `重建 initramfs` 选项**只**重建 initramfs（在源机执行），不重装 GRUB——因为 GRUB 要装到目标盘，而模式 2 还没有目标盘。模式 1 / 模式 3 才会装 GRUB。
+
+### 独立模式：手动修复已经坏掉的盘
+
+如果之前用旧版本恢复后已经无法启动（停在 `grub rescue>`），不必重新 dd，**进 Alpine RAM OS 直接修复即可**：
+
+```bash
+# 1. 让目标机进 Alpine RAM OS
+bash reinstall.sh alpine --hold 1
+
+# 2. SSH 进去后运行独立修复模式
+./disk-cloner-linux-amd64 --fix-boot-disk /dev/sda
+```
+
+输出示例：
+
+```
+  修复引导 - 独立模式
+  刷新分区表...
+  检测 LVM...
+  查找根文件系统...
+    根分区: /dev/sda1 (xfs)
+    系统类型: centos
+  挂载虚拟文件系统...
+  重建 initramfs (包含所有硬件驱动)...
+    -> dracut --no-hostonly --regenerate-all --force
+  修复 GRUB 引导...
+    检测到 BIOS/Legacy 模式
+    -> grub2-install --recheck /dev/sda
+    -> grub2-mkconfig -o /boot/grub2/grub.cfg
+  修复 fstab (移除不存在的额外磁盘挂载)...
+  清理挂载点...
+  ✓ 引导修复完成!
+```
+
+修复完后 `reboot` 即可正常启动。
+
+### 完全手动修复（不想用本程序时）
+
+也可以用 CentOS / Rocky / Ubuntu 安装 ISO 进入 rescue 模式，手动 chroot 修复：
+
+```bash
+# 假设救援模式已把系统挂到 /mnt
+mount --bind /dev /mnt/dev
+mount --bind /proc /mnt/proc
+mount --bind /sys /mnt/sys
+chroot /mnt
+
+# CentOS / Rocky / Alma / Fedora
+dracut --no-hostonly --force --regenerate-all
+grub2-install --recheck /dev/sda
+grub2-mkconfig -o /boot/grub2/grub.cfg
+
+# Debian / Ubuntu
+update-initramfs -u -k all
+grub-install --recheck /dev/sda
+update-grub
+
+exit; reboot
+```
+
+### BIOS vs UEFI
+
+修复时程序会自动检测 `/boot/efi/EFI` 目录是否存在：
+- **存在** = UEFI 模式 → `grub2-install --target=x86_64-efi --efi-directory=/boot/efi` + 用 `efibootmgr` 添加 UEFI 启动项
+- **不存在** = BIOS / Legacy 模式 → `grub2-install --recheck <磁盘>`
+
+**前提**：源机器和目标机的启动模式要一致。CentOS 7 / 旧版云服务器多数是 BIOS；现代 UEFI 服务器恢复到 BIOS 虚拟机（或反过来）即使修复了 GRUB 也不能启动。可用 `ls /sys/firmware/efi` 检查：存在目录 = UEFI，不存在 = BIOS。
 
 ---
 
@@ -605,7 +750,15 @@ disk-cloner -H 192.168.1.100 -p password -s /dev/sda -o auto -z 0 -y
 | `-z` | 压缩级别 0-9（0=不压缩，1=最快，9=最小） | 1 |
 | `-y` | 跳过确认提示 | false |
 | `-V` | 显示版本号 | — |
-| `--fix-boot-disk` | 修复引导（独立模式，实验性） | — |
+| `--fix-boot-disk <磁盘>` | 独立修复引导：chroot 进系统重装 GRUB + 重建 initramfs + 修 fstab（详见 [引导修复](#引导修复-grub--initramfs)） | — |
+| `--no-fix-boot` | 模式 1 命令行（`-t`）时跳过自动引导修复 | — |
+
+### 独立修复引导
+
+```bash
+# 在已进入 Alpine RAM OS 的目标机上，直接修复磁盘引导
+./disk-cloner-linux-amd64 --fix-boot-disk /dev/sda
+```
 
 ### 密码含特殊字符
 
@@ -642,9 +795,11 @@ disk-cloner -H 192.168.1.100 -p password -s /dev/sda -o auto -z 0 -y
     Done: /dev/mapper/J3160--vg-root
 ```
 
-### initramfs 重建
+### initramfs 重建（备份前选项）
 
-备份前可选择重建远程系统的 initramfs，使其包含**所有硬件驱动**（virtio、nvme、各种 SCSI/SATA 控制器、ext4/xfs/btrfs 文件系统驱动等）。这样备份的镜像恢复到不同硬件的机器上也能正常启动。
+**模式 2 保存**前的"重建 initramfs [Y/n]"选项，在备份前到源系统 chroot 一次，让 initramfs 包含**所有硬件驱动**（virtio、nvme、各种 SCSI/SATA 控制器、ext4/xfs/btrfs 文件系统驱动等）。
+
+> 此选项**只重建 initramfs，不重装 GRUB**——因为模式 2 还没有目标盘。GRUB 的重装在**模式 1 / 模式 3** 恢复时自动做，详见 [引导修复](#引导修复-grub--initramfs)。
 
 **原理**：`dracut --no-hostonly` 把 `/lib/modules/` 下所有内核模块都打包进 initramfs，而不是只包含当前硬件的驱动（hostonly 模式）。
 
@@ -757,27 +912,72 @@ update-initramfs -u -k all
 
 ## 克隆后必须做的事
 
-克隆到磁盘完成后，程序会显示 3 次警告（间隔 10 秒）。**重启前请务必执行**：
+**模式 1（克隆）和模式 3（恢复）**完成后，程序会**自动执行引导修复**（重装 GRUB + 重建 initramfs + 注释 fstab 中不存在的磁盘挂载），通常**直接重启即可启动**。
+
+下面列出几种仍需手动处理的情况：
+
+### 1. 扩分区用上更大的目标盘
+
+整盘 dd 后分区大小还是源盘的，目标盘剩余空间未分配。例如 30GB 镜像恢复到 1TB 盘上，需要手动扩展：
 
 ```bash
-# 1. 创建设备节点（Alpine 精简环境需要）
-mdev -s
+# 扩展分区表里的分区（第 1 个分区）
+growpart /dev/sda 1
 
-# 2. 用 lsblk 查看分区号
-lsblk
-# 挂载根分区（根据实际分区号调整）
-mount /dev/sda4 /mnt
+# 扩展文件系统（xfs 用 xfs_growfs，ext4 用 resize2fs）
+xfs_growfs /              # xfs（CentOS 7 默认）
+# resize2fs /dev/sda1     # ext4
 
-# 3. 编辑 fstab，注释掉源服务器独有的数据盘挂载
+# 验证
+df -h /
+```
+
+### 2. 目标盘比源盘小（罕见，且会截断数据）
+
+恢复时程序会警告 `目标盘 (xx) 小于解压后镜像 (xx)`，dd 会被截断。重启前需修复 GPT 备份分区表：
+
+```bash
+# GPT 分区表（程序自动检测，备份头在盘尾被截断时使用）
+sgdisk -e /dev/sda
+partprobe /dev/sda
+
+# 修复文件系统
+xfs_repair /dev/sda1       # xfs
+# e2fsck -fy /dev/sda1     # ext4
+```
+
+### 3. 启动模式不匹配（BIOS ↔ UEFI）
+
+源机器是 BIOS、目标机是 UEFI（或反过来）时，自动修复也救不了。**必须让目标虚拟机的启动模式与源一致**：
+
+```bash
+# 检查源机器的启动模式
+ls /sys/firmware/efi
+# 存在目录 = UEFI；报 No such file = BIOS
+```
+
+虚拟机平台的对应设置：
+
+| 平台 | BIOS 模式 | UEFI 模式 |
+|------|----------|-----------|
+| VMware | 默认 | Firmware = EFI |
+| Hyper-V | Generation 1 VM | Generation 2 VM |
+| VirtualBox | 默认 | Settings → System → Motherboard → Enable EFI |
+| PVE / KVM | 默认 (SeaBIOS) | OVMF |
+| 云厂商 | 一般默认 | 通常不支持自定义 |
+
+### 4. fstab 仍卡 90 秒（自动修复失败时）
+
+如果自动修复没注释干净 fstab（比如 fstab 用了非标准格式），重启后 systemd 会卡 90 秒等不存在的设备，然后进 emergency mode。手动处理：
+
+```bash
+# 进 Alpine RAM OS 或救援模式
+mount /dev/sda1 /mnt        # 按实际根分区
 vi /mnt/etc/fstab
-# 注释掉 /data、/mnt/* 等不存在的磁盘条目
-
-# 4. 卸载并重启
+# 注释掉 /data、/mnt/* 等不存在的磁盘条目（程序已备份原文件为 fstab.bak）
 umount /mnt
 reboot
 ```
-
-> 不处理 fstab → systemd 等不存在的设备 90 秒 → 进入 emergency mode
 
 ---
 
@@ -814,7 +1014,9 @@ reboot
 | 磁盘扫描 | 远程 `lsblk`（util-linux） | 远程服务器 |
 | 文件对话框 | PowerShell WinForms | Windows 客户端 |
 | 文件校验 | SHA256 | 客户端 |
-| initramfs 重建 | chroot + dracut / update-initramfs / mkinitcpio | 远程服务器 |
+| 引导修复（远程） | chroot + dracut / update-initramfs / mkinitcpio + grub2-install + grub2-mkconfig + fstab 清理 | 远程服务器（模式 1/3 自动执行） |
+| 引导修复（本地） | 同上，单独模式 `--fix-boot-disk` | 本地（目标机进 RAM OS 后） |
+| 文件系统一致性检查 | blkid 检测类型 + fsck.ext4 -fn（仅 ext 家族；xfs/btrfs 跳过） | 远程服务器 |
 | LVM 支持 | vgscan + vgchange -ay | 远程服务器 |
 | 进度刷新 | 异步 Sync，窗口最小化不影响 | 客户端 |
 | 控制台编码 | `chcp 65001`（UTF-8） | Windows 客户端 |
@@ -856,7 +1058,39 @@ git push origin v1.0.0
 
 ### Q: 备份的镜像恢复到虚拟机后不能启动？
 
-A: 备份时选择"重建 initramfs [Y/n]: y"，程序会自动重建 initramfs 包含所有硬件驱动。或者在进入 Alpine RAM OS 之前，在正常运行的系统上手动执行 `dracut --no-hostonly --force --regenerate-all`（Fedora）或 `update-initramfs -u -k all`（Debian）。
+A: 检查恢复日志末尾。**新版程序在模式 1 / 模式 3 恢复完成后会自动重装 GRUB 和重建 initramfs**（日志会有 `修复引导（GRUB + initramfs）...`）。如果你用的是旧版本，或自动修复失败，请用独立修复：
+
+```bash
+# 在目标机进 Alpine RAM OS 后
+./disk-cloner-linux-amd64 --fix-boot-disk /dev/sda
+```
+
+详见 [引导修复](#引导修复-grub--initramfs)。
+
+### Q: 恢复后报 `GRUB error: unknown filesystem / grub rescue>`？
+
+A: 这是 GRUB **第一阶段**错误，core.img 读不到 `/boot` 所在分区。原因：
+
+1. **跨总线迁移**：源盘是 virtio（vda）、目标盘是 SATA（sda），GRUB core.img 里的块偏移失配。**这是正常的**，新版程序在恢复时会自动 `grub2-install` 重装 GRUB，无需手动处理。
+2. **旧版本程序**：升级到新版后用 `--fix-boot-disk` 修复即可。
+3. **启动模式不一致**：源机器 BIOS、目标机 UEFI（或反之）。检查 `ls /sys/firmware/efi`，让源/目标机模式一致。
+
+### Q: 恢复后报 `VFS: Unable to mount root fs` 或 `dracut emergency`？
+
+A: 这是内核**第二阶段**错误，initramfs 里没有目标机的磁盘驱动。原因：源机器的 initramfs 是 hostonly 模式，只含 virtio 驱动，目标机是 SATA/SCSI/NVMe 时识别不了。**新版程序会自动 `dracut --no-hostonly --force --regenerate-all`** 解决。如果是旧版备份文件，恢复时新版程序会重新执行这一步。
+
+### Q: 恢复后 fsck 提示 `bad magic number in super-block`？
+
+A: 这是**误报**。旧版程序对所有分区硬跑 `fsck.ext4`，遇到 xfs/btrfs 分区必然报这个错——并不是真的损坏。新版程序会先用 `blkid` 检测文件系统类型，xfs/btrfs 静默跳过。
+
+如果担心 xfs 真的损坏（备份时源机器没进 RAM OS），手动验证：
+
+```bash
+# 进 Alpine RAM OS
+xfs_repair -n /dev/sda1    # 只读检查
+# 报错再修复：
+xfs_repair /dev/sda1
+```
 
 ### Q: 零填充很慢怎么办？
 
@@ -865,6 +1099,16 @@ A: 零填充需要写入全部空闲空间，磁盘 IO 决定速度。如果局�
 ### Q: 目标盘比源盘小怎么办？
 
 A: 恢复时程序会检测目标盘大小并警告。如果实际数据量小于目标盘容量，可以继续恢复，但需要恢复后手动修复 GPT 分区表（`sgdisk -e /dev/sda`）。
+
+### Q: 目标盘比源盘大，多余空间怎么用？
+
+A: 整盘 dd 后分区大小还是源盘的，目标盘剩余空间未分配。扩展：
+
+```bash
+growpart /dev/sda 1
+xfs_growfs /              # xfs
+# resize2fs /dev/sda1     # ext4
+```
 
 ### Q: 压缩包太大怎么办？
 
@@ -876,7 +1120,7 @@ A: 1) 确认 IP 和端口正确。2) 确认远程服务器已进入 Alpine RAM O
 
 ### Q: 远程服务器磁盘名不是 sda？
 
-A: 程序自动扫描并列出所有磁盘（sda、vda、nvme0n1 等），选择对应的序号即可。
+A: 程序自动扫描并列出所有磁盘（sda、vda、nvme0n1 等），选择对应的序号即可。整盘 dd 后磁盘名可能改变（源 vda → 目标 sda），这是正常的——引导修复会按目标磁盘名重装 GRUB。
 
 ---
 

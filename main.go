@@ -526,13 +526,21 @@ func runInteractive() {
 
 			fmt.Println("  克隆完成!")
 			fmt.Println()
-			_ = fixboot.Run
+
+			// Reinstall GRUB + rebuild initramfs on the freshly cloned disk.
+			// Without this, the cloned disk will fail to boot with
+			// "GRUB: unknown filesystem" because the source's core.img embeds
+			// block addresses that don't match the new disk geometry, and the
+			// source's initramfs only has drivers for the source hardware.
+			fmt.Println("  修复引导（确保目标盘可启动）...")
+			if err := fixboot.Run(fixboot.Config{TargetDisk: tgtDisk.Path}); err != nil {
+				fmt.Printf("  [!] 引导修复失败: %v（克隆已成功，请手动修复引导）\n", err)
+			}
 
 			fmt.Println("  ===============================================")
 			fmt.Printf("  全部完成! 总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
 			fmt.Println("  ===============================================")
 
-			printFstabWarning(tgtDisk.Path)
 			if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
 				waitExit()
 				return
@@ -694,6 +702,14 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			fmt.Printf("\n恢复失败: %v\n", err)
 			os.Exit(1)
 		}
+
+		// Reinstall GRUB + rebuild initramfs on the restored disk so it boots
+		// on this target hardware. See FixBoot docs for why this is mandatory.
+		fmt.Println("  正在修复引导（GRUB + initramfs）...")
+		if err := job.FixBoot(source); err != nil {
+			fmt.Printf("  [!] 引导修复失败: %v（恢复已成功，请手动修复引导）\n", err)
+		}
+
 		fmt.Printf("恢复完成! 总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
 
 		// Post-restore verification: read-only fsck on all target partitions.
@@ -703,7 +719,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			fmt.Printf("  [!] 警告: 以下分区 fsck 报告错误: %s\n", strings.Join(bad, ", "))
 			fmt.Println("  [!] 恢复的文件系统可能不一致,重启前请先执行:")
 			for _, p := range bad {
-				fmt.Printf("        fsck.ext4 -fy %s\n", p)
+				fmt.Printf("        fsck -fy %s\n", p)
 			}
 		} else {
 			fmt.Println("  ✓ 目标文件系统一致性检查通过")
@@ -764,7 +780,17 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 	}
 	fmt.Println("克隆完成!")
 	fmt.Printf("总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
+
+	// Reinstall GRUB + rebuild initramfs on the freshly cloned disk so it
+	// boots on this target hardware (the cloned image still has the source
+	// machine's GRUB and initramfs, which won't work as-is on different HW).
 	if !noFixBoot {
+		fmt.Println("  正在修复引导（GRUB + initramfs）...")
+		if err := fixboot.Run(fixboot.Config{TargetDisk: target}); err != nil {
+			fmt.Printf("  [!] 引导修复失败: %v（克隆已成功，请手动修复引导）\n", err)
+			printFstabWarning(target)
+		}
+	} else {
 		printFstabWarning(target)
 	}
 }
@@ -1048,6 +1074,18 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 		return
 	}
 
+	// Reinstall GRUB and rebuild initramfs on the freshly restored disk.
+	// This is essential: the dd'd image carries the source machine's GRUB
+	// core.img (with source-specific embedded block addresses) and source
+	// initramfs (with source-only drivers). Without this step the restored
+	// disk boots into "GRUB error: unknown filesystem / rescue mode>" or
+	// kernel panic "VFS: unable to mount root fs".
+	fmt.Println()
+	fmt.Println("  修复引导（GRUB + initramfs，确保目标机能启动）...")
+	if err := job.FixBoot(remoteDisk); err != nil {
+		fmt.Printf("  [!] 引导修复失败: %v（恢复已成功，请手动修复引导）\n", err)
+	}
+
 	// Post-restore verification: read-only fsck on all target partitions.
 	fmt.Println()
 	fmt.Println("  正在验证目标文件系统一致性 (只读 fsck)...")
@@ -1055,7 +1093,7 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 		fmt.Printf("  [!] 警告: 以下分区 fsck 报告错误: %s\n", strings.Join(bad, ", "))
 		fmt.Println("  [!] 恢复的文件系统可能不一致,重启前请先执行:")
 		for _, p := range bad {
-			fmt.Printf("        fsck.ext4 -fy %s\n", p)
+			fmt.Printf("        fsck -fy %s\n", p)
 		}
 	} else {
 		fmt.Println("  ✓ 目标文件系统一致性检查通过")
@@ -1577,9 +1615,12 @@ func verifyChecksum(filePath string) bool {
 // only surface as "Journal has aborted" / "bad block bitmap checksum" on boot.
 //
 // Returns the list of partitions that reported errors (caller may warn).
-// Partitions that aren't ext-family filesystems are silently skipped.
+// Partitions whose filesystem type cannot be identified, or that use a
+// filesystem we can't check read-only (xfs has no safe offline check —
+// xfs_repair -n requires the filesystem to be unmounted and clean), are
+// silently skipped to avoid false positives.
 func postRestoreFsck(sshClient *sshclient.Client, targetDisk string) []string {
-	// Ensure e2fsprogs (fsck.ext4) is available on the remote.
+	// Ensure fsck tools are available on the remote.
 	sshClient.CombinedOutput("command -v fsck.ext4 || apk add --quiet e2fsprogs 2>/dev/null")
 
 	// List partitions of the target disk via /sys/block, which doesn't need
@@ -1599,10 +1640,32 @@ func postRestoreFsck(sshClient *sshclient.Client, targetDisk string) []string {
 		if part == "" || !strings.HasPrefix(part, "/dev/") {
 			continue
 		}
-		// -n = read-only, don't touch. -v = verbose. We just want the exit status.
-		_, err := sshClient.CombinedOutput(fmt.Sprintf("fsck.ext4 -fn %s 2>&1", part))
-		if err != nil {
-			bad = append(bad, part)
+
+		// Detect filesystem type with blkid. Running an ext-family fsck
+		// against an xfs partition always fails with "bad magic number in
+		// super-block" — that's a tool/FS mismatch, not real corruption.
+		fsTypeOut, _ := sshClient.CombinedOutput(fmt.Sprintf(
+			`blkid -o value -s TYPE %s 2>/dev/null`, part))
+		fsType := strings.TrimSpace(fsTypeOut)
+
+		switch fsType {
+		case "ext2", "ext3", "ext4":
+			// -n = read-only, don't touch. We just want the exit status.
+			if _, err := sshClient.CombinedOutput(fmt.Sprintf("fsck.ext4 -fn %s 2>&1", part)); err != nil {
+				bad = append(bad, part)
+			}
+		case "xfs":
+			// xfs_repair -n requires an unmounted, clean FS — too fragile
+			// to run automatically post-restore. Skip silently; if xfs is
+			// broken the system will fail to boot and the user can run
+			// xfs_repair manually from a live OS.
+			continue
+		case "btrfs":
+			// btrfs check is read-only-safe but slow; skip for now.
+			continue
+		default:
+			// Unknown / swap / vfat — skip.
+			continue
 		}
 	}
 	return bad
