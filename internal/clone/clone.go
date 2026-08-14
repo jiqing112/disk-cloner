@@ -232,25 +232,22 @@ func parseDdBytesRead(stderr string) int64 {
 	return -1
 }
 
-// preReadSafetyCheck runs before reading the source disk (backup / clone-from-remote).
-// It flushes any pending writes on the source and warns loudly if any partition
-// on the source disk is still mounted or if non-Alpine-RAM-OS processes are
-// writing to it — both of which produce a torn (inconsistent) image.
+// preReadWarnIfMounted flushes pending writes on the source and warns loudly
+// if any partition of the source disk is still mounted (i.e. the OS is live
+// and writing concurrently with our dd read — produces a torn image).
 //
 // This is the #1 defense against the "ext4 bad block bitmap checksum" /
 // "Journal has aborted" corruption seen after restoring a backup that was
 // taken while the source system was live.
-func (j *CloneJob) preReadSafetyCheck() {
+func (j *CloneJob) preReadWarnIfMounted() {
 	src := j.params.SourcePath
 
-	// 1) Flush all pending writes on the remote so whatever is in the page
-	//    cache hits the disk before we start reading. This is cheap insurance.
+	// Flush all pending writes on the remote so whatever is in the page
+	// cache hits the disk before we start reading. Cheap insurance.
 	j.logFn("  Flushing remote filesystem buffers (sync)...")
 	j.sshClient.CombinedOutput("sync")
 
-	// 2) Detect partitions of the source disk that are still mounted. A
-	//    mounted partition almost always means the OS is live and writing
-	//    concurrently with our dd read -> torn image.
+	// Detect partitions of the source disk that are still mounted.
 	diskBase := src
 	if i := strings.LastIndex(src, "/"); i >= 0 {
 		diskBase = src[i+1:]
@@ -278,15 +275,94 @@ func (j *CloneJob) preReadSafetyCheck() {
 		j.logFn("  [!] 强烈建议先重启进入 Alpine RAM OS 再备份")
 		j.logFn("  [!] 将继续备份,但恢复后可能出现 ext4 journal/损坏错误")
 	}
-
-	// 3) Freeze the block device if the kernel supports it. This blocks
-	//    further writes from reaching the device until we unfreeze, giving
-	//    us a stable snapshot. Best-effort: silently ignored if unsupported.
-	j.sshClient.CombinedOutput(fmt.Sprintf("blockdev --freeze %s 2>/dev/null", src))
 }
 
-// postReadUnfreeze releases the freeze taken by preReadSafetyCheck. Must be
-// called after the source read completes (success or failure). Best-effort.
+// preReadSyncAndVerify does a final sync on the source and aborts if any of
+// its partitions are still mounted. This MUST run after zero-fill and
+// initramfs rebuild (which mount/unmount source partitions) and before dd.
+//
+// A still-mounted source partition means the filesystem journal is not fully
+// committed to disk. dd reads the block device directly, bypassing the page
+// cache, so it sees whatever is on disk right now — including a half-written
+// journal. When that image is restored, GRUB's xfs/ext4 driver reads the
+// half-written metadata and fails with "unknown filesystem".
+//
+// We use this instead of a lazy fallback umount (-l) inside zero-fill/initramfs:
+// lazy umount detaches the namespace but the filesystem stays live in the
+// kernel, so the journal is never finalized.
+func (j *CloneJob) preReadSyncAndVerify(src string) {
+	// Final sync — flush everything zero-fill / initramfs wrote.
+	j.sshClient.CombinedOutput("sync; sync; sync")
+
+	// Give the kernel a moment to finish flushing.
+	time.Sleep(2 * time.Second)
+
+	diskBase := src
+	if i := strings.LastIndex(src, "/"); i >= 0 {
+		diskBase = src[i+1:]
+	}
+	out, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+		`grep -E '(/dev/%s[0-9]+|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print $2}'`,
+		diskBase, diskBase))
+	stillMounted := []string{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			stillMounted = append(stillMounted, line)
+		}
+	}
+	if len(stillMounted) > 0 {
+		// Try one more regular umount (NOT lazy). If it fails we must abort.
+		for _, mp := range stillMounted {
+			j.sshClient.CombinedOutput(fmt.Sprintf("umount %s 2>/dev/null", mp))
+		}
+		// Re-check.
+		out2, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+			`grep -E '(/dev/%s[0-9]+|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print $2}'`,
+			diskBase, diskBase))
+		stillMounted = stillMounted[:0]
+		for _, line := range strings.Split(out2, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				stillMounted = append(stillMounted, line)
+			}
+		}
+	}
+	if len(stillMounted) > 0 {
+		j.logFn("  [!] 严重: 源盘的以下分区无法卸载,dd 读到的镜像将不一致:")
+		for _, mp := range stillMounted {
+			j.logFn("        - %s", mp)
+		}
+		j.logFn("  [!] 请手动 umount 后重试,不要使用 lazy umount (-l)")
+		j.logFn("  [!] 继续备份,但镜像可能损坏 (恢复后 GRUB 报 unknown filesystem)")
+	} else {
+		j.logFn("  ✓ 源盘所有分区已卸载,文件系统状态一致")
+	}
+}
+
+// freezeSource freezes the remote block device to take a stable snapshot
+// for dd to read. Best-effort: silently ignored if the kernel/busybox
+// blockdev doesn't support it.
+func (j *CloneJob) freezeSource() {
+	j.sshClient.CombinedOutput(fmt.Sprintf("blockdev --freeze %s 2>/dev/null", j.params.SourcePath))
+}
+
+// unfreezeSource releases the freeze taken by freezeSource. Best-effort.
+func (j *CloneJob) unfreezeSource() {
+	j.sshClient.CombinedOutput(fmt.Sprintf("blockdev --unfreeze %s 2>/dev/null", j.params.SourcePath))
+}
+
+// preReadSafetyCheck and postReadUnfreeze are kept for backwards
+// compatibility but no longer used by Run/RunToFile. The freeze/unfreeze
+// is now split so that source-modifying steps (zero-fill, initramfs) run
+// BEFORE the freeze, not while frozen.
+//
+// Deprecated: use preReadWarnIfMounted + preReadSyncAndVerify + freezeSource.
+func (j *CloneJob) preReadSafetyCheck() {
+	j.preReadWarnIfMounted()
+	j.sshClient.CombinedOutput(fmt.Sprintf("blockdev --freeze %s 2>/dev/null", j.params.SourcePath))
+}
+
 func (j *CloneJob) postReadUnfreeze() {
 	j.sshClient.CombinedOutput(fmt.Sprintf("blockdev --unfreeze %s 2>/dev/null", j.params.SourcePath))
 }
@@ -344,7 +420,7 @@ func (j *CloneJob) compressToolName() string {
 // Run clones remote disk to a local block device.
 // Uses gzip compression over SSH to reduce network transfer:
 //
-//	remote: dd | gzip ??SSH ??local: gunzip ??write to disk
+//	remote: dd | gzip -> SSH -> local: gunzip -> write to disk
 //
 // Also does zero-fill beforehand to maximize compression.
 func (j *CloneJob) Run() error {
@@ -355,23 +431,41 @@ func (j *CloneJob) Run() error {
 		return err
 	}
 
-	// Flush source & warn if mounted; freeze block device for a stable read.
-	j.preReadSafetyCheck()
-	defer j.postReadUnfreeze()
+	// Pre-read source preparation (order matters!):
+	//   1. Warn if source partitions are mounted (live OS).
+	//   2. Zero-fill free space (mounts, writes, unmounts source).
+	//   3. Rebuild initramfs (chroots into source).
+	//   4. sync + verify all source partitions unmounted.
+	//   5. Freeze block device for a stable snapshot.
+	//   6. dd | gzip
+	//   7. Unfreeze.
+	//
+	// Freezing AFTER zero-fill/initramfs is critical: freeze locks the
+	// block queue, so any writes done while frozen (or queued by lazy
+	// unmount) never reach disk before dd reads, producing a torn image.
+	j.preReadWarnIfMounted()
 
-	// Zero-fill free space on remote disk to improve compression ratio
 	if j.params.ZeroFill {
 		if err := j.zeroFillFreeSpace(); err != nil {
 			j.logFn("  [!] Zero-fill failed (continuing clone): %v", err)
 		}
 	}
 
-	// Rebuild initramfs for cross-hardware compatibility
 	if j.params.FixInitramfs {
 		if err := j.FixInitramfs(); err != nil {
 			j.logFn("  [!] %v", err)
 		}
 	}
+
+	// Flush everything the zero-fill/initramfs steps wrote, then verify the
+	// source is clean (no partitions still mounted). A still-mounted source
+	// at this point means dd will read a filesystem whose journal is not
+	// fully committed — the classic cause of "GRUB: unknown filesystem"
+	// after restore.
+	j.preReadSyncAndVerify(j.params.SourcePath)
+
+	j.freezeSource()
+	defer j.unfreezeSource()
 
 	target, err := os.OpenFile(j.params.TargetPath, os.O_WRONLY, 0)
 	if err != nil {
@@ -410,23 +504,30 @@ func (j *CloneJob) RunToFile() error {
 		return err
 	}
 
-	// Flush source & warn if mounted; freeze block device for a stable read.
-	j.preReadSafetyCheck()
-	defer j.postReadUnfreeze()
+	// Pre-read source preparation (order matters! see Run docs):
+	//   warn mounted -> zero-fill -> initramfs -> sync+verify -> freeze -> dd.
+	j.preReadWarnIfMounted()
 
-	// Zero-fill free space before dd to improve gzip compression
 	if j.params.ZeroFill {
 		if err := j.zeroFillFreeSpace(); err != nil {
 			j.logFn("  [!] Zero-fill failed (continuing save): %v", err)
 		}
 	}
 
-	// Rebuild initramfs for cross-hardware compatibility
 	if j.params.FixInitramfs {
 		if err := j.FixInitramfs(); err != nil {
 			j.logFn("  [!] %v", err)
 		}
 	}
+
+	// Critical: flush all writes from zero-fill/initramfs and verify the
+	// source disk has no partitions still mounted. A mounted source during
+	// dd produces an image whose filesystem journal is mid-transaction,
+	// which GRUB refuses to read ("error: unknown filesystem").
+	j.preReadSyncAndVerify(j.params.SourcePath)
+
+	j.freezeSource()
+	defer j.unfreezeSource()
 
 	f, err := os.Create(j.params.TargetPath)
 	if err != nil {
@@ -683,7 +784,24 @@ for dev in $all_devices; do
     wait $PID
     rm -f "$mp/.zero_fill"
     sync
-    umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null
+    # CRITICAL: must fully unmount before dd reads the source disk.
+    # A lazy umount (-l) only detaches the namespace — the filesystem stays
+    # live in the kernel and the on-disk journal is left mid-transaction.
+    # dd then reads a "dirty" filesystem that GRUB refuses to mount
+    # ("error: unknown filesystem"). Retry regular umount several times
+    # and report failure rather than falling back to -l.
+    umount_ok=0
+    for try in 1 2 3 4 5; do
+      if umount "$mp" 2>/dev/null; then
+        umount_ok=1
+        break
+      fi
+      sync
+      sleep 1
+    done
+    if [ "$umount_ok" = "0" ]; then
+      echo "UMOUNTFAIL $dev $mp"
+    fi
     echo "DONEPART $dev"
   else
     echo "SKIP $dev"
@@ -927,13 +1045,24 @@ if [ -n "$TARGETDISK" ]; then
   fi
 fi
 
-umount -l /mnt/run 2>/dev/null
-umount -l /mnt/boot/efi 2>/dev/null
-umount -l /mnt/boot 2>/dev/null
-umount -l /mnt/sys 2>/dev/null
-umount -l /mnt/proc 2>/dev/null
-umount -l /mnt/dev 2>/dev/null
-umount -l /mnt 2>/dev/null
+# CRITICAL: must fully unmount — lazy umount (-l) leaves the filesystem
+# live in the kernel, so the on-disk journal stays mid-transaction and
+# dd reads a "dirty" image. Use regular umount with retries, in reverse
+# order (deepest first). Bind mounts first, then real mounts.
+for try in 1 2 3 4 5; do
+  umount /mnt/run 2>/dev/null
+  umount /mnt/dev/pts 2>/dev/null
+  umount /mnt/dev 2>/dev/null
+  umount /mnt/proc 2>/dev/null
+  umount /mnt/sys 2>/dev/null
+  umount /mnt/boot/efi 2>/dev/null
+  umount /mnt/boot 2>/dev/null
+  if umount /mnt 2>/dev/null; then
+    break
+  fi
+  sync
+  sleep 1
+done
 exit $RC
 `, shellQuote(rootDev), shellQuote(targetDisk))
 

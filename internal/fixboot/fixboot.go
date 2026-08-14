@@ -596,10 +596,21 @@ func mountTmpfs(target string) error {
 }
 
 func umountSingle(target string) {
-	runQuiet("umount", target)
+	// Retry regular umount; do NOT use lazy umount (-l) because it leaves
+	// the filesystem live in the kernel and the journal mid-transaction,
+	// which corrupts subsequent dd reads.
+	for try := 0; try < 5; try++ {
+		if runQuiet("umount", target) == nil {
+			return
+		}
+		runQuiet("sync")
+		time.Sleep(time.Second)
+	}
 }
 
 // umountAll unmounts everything under mountRoot in reverse order.
+// Uses regular umount with retries (NOT lazy umount) so that the filesystem
+// journal is properly committed to disk before any subsequent dd operation.
 func umountAll() {
 	// Read /proc/mounts to find all mounts under mountRoot
 	data, err := os.ReadFile("/proc/mounts")
@@ -631,6 +642,25 @@ func umountAll() {
 		}
 	}
 
+	// Try up to 5 rounds of regular umount. After each round re-read
+	// /proc/mounts to skip already-unmounted entries.
+	for try := 0; try < 5; try++ {
+		remaining := mounts[:0]
+		for _, mp := range mounts {
+			if runQuiet("umount", mp) != nil {
+				remaining = append(remaining, mp)
+			}
+		}
+		mounts = remaining
+		if len(mounts) == 0 {
+			break
+		}
+		runQuiet("sync")
+		time.Sleep(time.Second)
+	}
+
+	// Last resort: if anything is still mounted, force it. This should
+	// only happen if a process inside chroot is still holding files open.
 	for _, mp := range mounts {
 		runQuiet("umount", "-l", mp)
 	}
