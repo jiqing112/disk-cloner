@@ -38,3 +38,10 @@ func ReadInput(prompt, def string) string {
 func ReadPassword(prompt string) string {
 	return ReadInput(prompt, "")
 }
+
+// ReadInputPath reads a file path. The Windows console driver handles line
+// editing; Tab completion is not provided (dragging a file into the console
+// window is the usual way to input paths).
+func ReadInputPath(prompt, def string) string {
+	return ReadInput(prompt, def)
+}

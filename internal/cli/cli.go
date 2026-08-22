@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"strconv"
@@ -33,22 +32,6 @@ func ReadInt(prompt string, def int) int {
 		return def
 	}
 	return val
-}
-
-// ReadInputPath reads a file path from stdin in cooked terminal mode,
-// preserving tab completion and OS line editing. Works on both platforms.
-func ReadInputPath(prompt, def string) string {
-	fmt.Printf("  %s: ", prompt)
-	reader := bufio.NewReader(os.Stdin)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return def
-	}
-	input := strings.TrimSpace(line)
-	if input == "" {
-		return def
-	}
-	return input
 }
 
 func PrintSection(title string) {

@@ -1001,18 +1001,28 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client
 }
 
 func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client) {
-	fileName := cli.ReadInputPath("本地文件 (.img.gz, 回车浏览)", "")
-
-	if fileName == "" {
-		fileName = browseLocalFiles()
-		if fileName == "" {
+	var fileName string
+	for {
+		input := cli.ReadInputPath("本地文件路径 (Tab=补全, 回车=浏览, q=返回)", "")
+		lower := strings.ToLower(input)
+		if lower == "q" || lower == "quit" {
 			return
 		}
-	}
-
-	if _, err := os.Stat(fileName); err != nil {
-		fmt.Printf("\n  文件不存在: %s\n", fileName)
-		return
+		if input == "" {
+			fileName = browseLocalFiles()
+			if fileName == "" {
+				// 用户在文件列表按 q 返回 — 回到手动输入流程，不直接退出
+				continue
+			}
+		} else {
+			fileName = input
+		}
+		if _, err := os.Stat(fileName); err != nil {
+			fmt.Printf("\n  [!] 无法访问文件: %s\n      %v\n", fileName, err)
+			fmt.Println("  请重新输入路径 (Tab 可补全, 回车浏览列表, 输入 q 返回)")
+			continue
+		}
+		break
 	}
 
 	fmt.Println()
