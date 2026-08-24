@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -82,6 +83,13 @@ func validateDevicePath(path string) error {
 		return fmt.Errorf("invalid device path: %q (must match /dev/...)", path)
 	}
 	return nil
+}
+
+// ValidateDevicePath exports the device-path safety check so callers can
+// validate user-supplied remote disk paths before embedding them in shell
+// commands (prevents command injection via lsblk/umount/grep etc.).
+func ValidateDevicePath(path string) error {
+	return validateDevicePath(path)
 }
 
 var safeBSRe = regexp.MustCompile(`^[0-9]+[KMGkmg]?$`)
@@ -248,13 +256,14 @@ func (j *CloneJob) preReadWarnIfMounted() {
 	j.sshClient.CombinedOutput("sync")
 
 	// Detect partitions of the source disk that are still mounted.
+	// Partition suffix is (p?[0-9]+) to cover both sda1 and nvme0n1p1 styles.
 	diskBase := src
 	if i := strings.LastIndex(src, "/"); i >= 0 {
 		diskBase = src[i+1:]
 	}
 	out, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
-		`for mp in $(grep -oE '/dev/(mapper/)?%s[0-9]+[a-z]?' /proc/mounts 2>/dev/null | sort -u); do echo "MOUNTED $mp"; done; `+
-			`grep -E '(/dev/%s[0-9]+|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print "MOUNT "$2}'`,
+		`for mp in $(grep -oE '/dev/(mapper/)?%s(p[0-9]+|[0-9]+)' /proc/mounts 2>/dev/null | sort -u); do echo "MOUNTED $mp"; done; `+
+			`grep -E '(/dev/%s(p[0-9]+|[0-9]+)|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print "MOUNT "$2}'`,
 		diskBase, diskBase, diskBase))
 	mounted := []string{}
 	for _, line := range strings.Split(out, "\n") {
@@ -302,7 +311,7 @@ func (j *CloneJob) preReadSyncAndVerify(src string) {
 		diskBase = src[i+1:]
 	}
 	out, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
-		`grep -E '(/dev/%s[0-9]+|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print $2}'`,
+		`grep -E '(/dev/%s(p[0-9]+|[0-9]+)|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print $2}'`,
 		diskBase, diskBase))
 	stillMounted := []string{}
 	for _, line := range strings.Split(out, "\n") {
@@ -318,7 +327,7 @@ func (j *CloneJob) preReadSyncAndVerify(src string) {
 		}
 		// Re-check.
 		out2, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
-			`grep -E '(/dev/%s[0-9]+|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print $2}'`,
+			`grep -E '(/dev/%s(p[0-9]+|[0-9]+)|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print $2}'`,
 			diskBase, diskBase))
 		stillMounted = stillMounted[:0]
 		for _, line := range strings.Split(out2, "\n") {
@@ -543,6 +552,13 @@ func (j *CloneJob) RunToFile() error {
 		return err
 	}
 
+	// Flush to disk before returning: the caller generates the .sha256 file
+	// immediately after and may show "save complete", so the image must be
+	// durable by then (protects against power loss right after saving).
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync file: %w", err)
+	}
+
 	return nil
 }
 
@@ -619,13 +635,13 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 	defer signal.Stop(sigCh)
-	cancelled := false
+	var cancelled atomic.Bool
 	go func() {
 		for {
 			select {
 			case <-sigCh:
-				if !cancelled {
-					cancelled = true
+				if !cancelled.Load() {
+					cancelled.Store(true)
 					_ = session.Signal(ssh.SIGTERM)
 					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
 				} else {
@@ -649,7 +665,7 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	// metadata is flushed to the underlying block device before we return.
 	// conv=fdatasync in dd only syncs the dd output stream; a separate sync
 	// guarantees the kernel has written all dirty pages from the block device.
-	if !cancelled && copyErr == nil {
+	if !cancelled.Load() && copyErr == nil {
 		j.sshClient.CombinedOutput("sync")
 	}
 
@@ -660,7 +676,7 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	}
 
 	var finalErr error
-	if cancelled {
+	if cancelled.Load() {
 		finalErr = fmt.Errorf("cancelled by user")
 	} else if copyErr != nil {
 		finalErr = copyErr
@@ -927,15 +943,9 @@ func (j *CloneJob) FixBoot(targetDisk string) error {
 
 	j.logFn("    Root: %s", rootDev)
 
-	// Detect whether /boot is a separate partition by parsing fstab.
-	// GRUB's grub2-install needs /boot mounted (or it will use the root).
-	bootScript := `grep -E '^[^#].*[[:space:]]/boot([[:space:]]|$)' /mnt/etc/fstab 2>/dev/null | awk '{print $1}' | head -1`
-	j.sshClient.CombinedOutput(fmt.Sprintf(`mount %s /mnt 2>/dev/null; BOOTENT=$(sh -c %s); umount /mnt 2>/dev/null`,
-		rootDev, shellQuote(bootScript)))
-
 	// Step 2: mount root + bind mounts, then chroot to fix initramfs + GRUB.
-	// No set -e here because we handle errors manually and want to clean up
-	// mount points even on failure.
+	// /boot and /boot/efi are detected and mounted from fstab inside the
+	// script below (no separate probe needed).
 	script := fmt.Sprintf(`ROOT=%s
 TARGETDISK=%s
 
@@ -1021,7 +1031,7 @@ if [ -n "$TARGETDISK" ]; then
   fi
   [ $GRUB_RC -ne 0 ] && echo "GRUB_INSTALL_FAILED" && RC=1
 
-  # --- Fix fstab: comment out mounts for disks that no longer exist ---
+  # --- Fix fstab: comment out mounts for devices that no longer exist ---
   if [ -f /mnt/etc/fstab ]; then
     cp /mnt/etc/fstab /mnt/etc/fstab.bak 2>/dev/null
     awk '
@@ -1030,11 +1040,21 @@ if [ -n "$TARGETDISK" ]; then
         dev=$1; mp=$2
         if (mp == "" || mp == "none" || mp == "swap") { print; next }
         if (mp == "/" || mp == "/boot" || mp ~ /^\/boot\//) { print; next }
-        # Resolve and check
+        # Resolve the device to a real /dev node. UUID=/LABEL= must be
+        # resolved via command output (getline), NOT by pasting the blkid
+        # command into [ -b ] -- that would always be false and comment out
+        # every valid entry.
         actual=""
-        if (dev ~ /^UUID=/)      actual=( "blkid -U " substr(dev,6) )
-        else if (dev ~ /^LABEL=/) actual=( "blkid -L " substr(dev,7) )
-        else if (dev ~ /^\/dev\//) actual=dev
+        if (dev ~ /^UUID=/) {
+          cmd="blkid -U " substr(dev,6) " 2>/dev/null"
+          cmd | getline actual
+          close(cmd)
+        } else if (dev ~ /^LABEL=/) {
+          cmd="blkid -L " substr(dev,7) " 2>/dev/null"
+          cmd | getline actual
+          close(cmd)
+        } else if (dev ~ /^\/dev\//) actual=dev
+        gsub(/[[:space:]]/, "", actual)
         if (actual != "" && system("[ -b " actual " ] 2>/dev/null") == 0) {
           print
         } else {
@@ -1067,28 +1087,31 @@ exit $RC
 `, shellQuote(rootDev), shellQuote(targetDisk))
 
 	out2, err2 := j.sshClient.CombinedOutput("sh -c " + shellQuote(script))
-	if err2 != nil || strings.Contains(out2, "FAIL") || strings.Contains(out2, "NO_INITRAMFS_TOOL") {
-		switch {
-		case strings.Contains(out2, "NO_INITRAMFS_TOOL"):
-			j.logFn("  [!] No initramfs tool found (dracut/update-initramfs/mkinitcpio), skipping")
-		case strings.Contains(out2, "FAIL mount"):
-			j.logFn("  [!] Failed to mount root partition")
-		case strings.Contains(out2, "FAIL noroot"):
-			j.logFn("  [!] Mounted partition does not look like a root filesystem")
-		default:
-			j.logFn("  [!] Boot repair failed — you may need to fix boot manually")
-		}
+
+	// Classify by output markers FIRST: the script exits non-zero (RC=1)
+	// both for mount failures and for GRUB-install failure, so checking
+	// err2 before the markers would hide the specific GRUB_INSTALL_FAILED
+	// message behind the generic one.
+	switch {
+	case strings.Contains(out2, "NO_INITRAMFS_TOOL"):
+		j.logFn("  [!] No initramfs tool found (dracut/update-initramfs/mkinitcpio), skipping")
+	case strings.Contains(out2, "FAIL mount"):
+		j.logFn("  [!] Failed to mount root partition")
+	case strings.Contains(out2, "FAIL noroot"):
+		j.logFn("  [!] Mounted partition does not look like a root filesystem")
+	case strings.Contains(out2, "GRUB_INSTALL_FAILED"):
+		j.logFn("  [!] Initramfs rebuilt, but GRUB reinstall failed — you may need to run grub2-install manually")
+	case err2 != nil:
 		// Non-fatal: backup/restore still succeeded; user can fix boot manually.
-		return nil
-	}
-	if strings.Contains(out2, "GRUB_INSTALL_FAILED") {
-		j.logFn("  [!] GRUB reinstall failed — you may need to run grub2-install manually")
-	} else if strings.Contains(out2, "NO_GRUB_TOOL") {
-		j.logFn("  [!] No GRUB install tool found (grub2-install/grub-install), skipping GRUB reinstall")
-	} else if targetDisk != "" {
-		j.logFn("  ✓ GRUB reinstalled and initramfs rebuilt")
-	} else {
-		j.logFn("  ✓ Initramfs rebuilt")
+		j.logFn("  [!] Boot repair failed — you may need to fix boot manually")
+	default:
+		if strings.Contains(out2, "NO_GRUB_TOOL") {
+			j.logFn("  ✓ Initramfs rebuilt (no GRUB install tool found; skipped GRUB reinstall)")
+		} else if targetDisk != "" {
+			j.logFn("  ✓ GRUB reinstalled and initramfs rebuilt")
+		} else {
+			j.logFn("  ✓ Initramfs rebuilt")
+		}
 	}
 	return nil
 }
@@ -1132,13 +1155,13 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 	defer signal.Stop(sigCh)
-	cancelled := false
+	var cancelled atomic.Bool
 	go func() {
 		for {
 			select {
 			case <-sigCh:
-				if !cancelled {
-					cancelled = true
+				if !cancelled.Load() {
+					cancelled.Store(true)
 					_ = session.Signal(ssh.SIGTERM)
 					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
 				} else {
@@ -1168,7 +1191,7 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	}
 
 	var finalErr error
-	if cancelled {
+	if cancelled.Load() {
 		finalErr = fmt.Errorf("cancelled by user")
 	} else if copyErr != nil {
 		finalErr = copyErr
@@ -1227,13 +1250,13 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 	defer signal.Stop(sigCh)
-	cancelled := false
+	var cancelled atomic.Bool
 	go func() {
 		for {
 			select {
 			case <-sigCh:
-				if !cancelled {
-					cancelled = true
+				if !cancelled.Load() {
+					cancelled.Store(true)
 					_ = session.Signal(ssh.SIGTERM)
 					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
 				} else {
@@ -1257,7 +1280,7 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 	}
 
 	var finalErr error
-	if cancelled {
+	if cancelled.Load() {
 		finalErr = fmt.Errorf("cancelled by user")
 	} else if copyErr != nil {
 		finalErr = copyErr
@@ -1321,13 +1344,13 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
 	defer signal.Stop(sigCh)
-	cancelled := false
+	var cancelled atomic.Bool
 	go func() {
 		for {
 			select {
 			case <-sigCh:
-				if !cancelled {
-					cancelled = true
+				if !cancelled.Load() {
+					cancelled.Store(true)
 					_ = session.Signal(ssh.SIGTERM)
 					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
 				} else {
@@ -1349,7 +1372,7 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 	}
 
 	var finalErr error
-	if cancelled {
+	if cancelled.Load() {
 		finalErr = fmt.Errorf("cancelled by user")
 	} else if copyErr != nil {
 		finalErr = copyErr

@@ -162,9 +162,10 @@ func ensureRemoteDeps(sshClient *sshclient.Client) {
 	checks := []struct{ cmd, pkg string }{
 		{"lsblk", "util-linux"},
 		{"gzip", "gzip"},
-		{"pigz", "pigz"},
 		{"fsck.ext4", "e2fsprogs"},
 	}
+	// Note: pigz is intentionally NOT pre-installed here — buildCompressCmd
+	// installs it on demand only when the user actually selects pigz.
 	var missing []string
 	for _, c := range checks {
 		if _, err := sshClient.CombinedOutput("command -v " + c.cmd); err != nil {
@@ -376,17 +377,17 @@ func runInteractive() {
 				continue
 			}
 
-			disk := remoteList[idx-1]
+			srcDisk := remoteList[idx-1]
 
 			if mode == 2 {
-				runSaveToFile(ip, disk, sshClient, logger)
+				runSaveToFile(ip, srcDisk, sshClient, logger)
 				if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
 					waitExit()
 					return
 				}
 				continue
 			} else {
-				runRestoreToRemote(ip, disk, sshClient)
+				runRestoreToRemote(ip, srcDisk, sshClient)
 				if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
 					waitExit()
 					return
@@ -1031,10 +1032,23 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 
 	remoteDisk := cli.ReadInput("远程目标磁盘，确认请回车", srcDisk.Path)
 
+	// Validate BEFORE the path is embedded in any remote shell command
+	// (lsblk size check etc.) — blocks command injection via this input.
+	if err := clone.ValidateDevicePath(remoteDisk); err != nil {
+		fmt.Printf("  [!] 无效的设备路径: %v\n", err)
+		return
+	}
+
+	// Show the real size of the target disk (may differ from the source).
+	targetLabel := srcDisk.SizeHuman
+	if tgtSize, err := getRemoteDiskSize(sshClient, remoteDisk); err == nil && tgtSize > 0 {
+		targetLabel = disk.FormatBytes(tgtSize)
+	}
+
 	fmt.Println()
 	fmt.Println("  +--------------------------------------------+")
 	fmt.Printf("  |  源文件: %s\n", fileName)
-	fmt.Printf("  |  目标:   %s:%s (%s)\n", ip, remoteDisk, srcDisk.SizeHuman)
+	fmt.Printf("  |  目标:   %s:%s (%s)\n", ip, remoteDisk, targetLabel)
 	fmt.Println("  +--------------------------------------------+")
 	fmt.Println()
 	fmt.Printf("  此操作将覆盖远程 %s 上的所有数据!\n", remoteDisk)

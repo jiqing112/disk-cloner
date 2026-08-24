@@ -221,11 +221,7 @@ func Run(cfg Config) error {
 	// ── 9. Fix fstab: remove extra disk mounts ─────────────────────
 	log("修复 fstab (移除不存在的额外磁盘挂载)...")
 	if err := fixFstab(mountRoot); err != nil {
-		log("  ??fstab 修复失败: %v (不影响启?? 可手动处??", err)
-		_ = copyFile(
-			filepath.Join(mountRoot, "etc/fstab"),
-			filepath.Join(mountRoot, "etc/fstab.bak"),
-		)
+		log("  ✗ fstab 修复失败: %v (不影响启动, 可手动处理)", err)
 	}
 
 	// ── 10. Cleanup ─────────────────────────────────────────────────
