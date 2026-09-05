@@ -111,13 +111,19 @@ func Connect(cfg Config) (*Client, error) {
 		// Enhance the error message for common Windows-specific issues
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "handshake failed: EOF") {
-			return nil, fmt.Errorf("ssh handshake: server closed connection before completing SSH protocol\n"+
+			// Probe the raw TCP banner so the user can see whether the
+			// endpoint actually speaks SSH (or what does).
+			detail := ""
+			if probe, perr := ProbeSSH(cfg); perr == nil && probe.Banner != "" {
+				detail = fmt.Sprintf("\n  Server banner: %s", probe.Banner)
+			}
+			return nil, fmt.Errorf("ssh handshake: server closed connection before completing SSH protocol%s\n"+
 				"  Possible causes:\n"+
 				"  - Windows firewall or antivirus is intercepting SSH traffic\n"+
 				"  - Corporate proxy/VPN is blocking SSH protocol on port 22\n"+
 				"  - Server has IP-based access restrictions (check /etc/hosts.allow)\n"+
 				"  - Try a different network (mobile hotspot) to rule out firewall\n"+
-				"  Original error: %s", errMsg)
+				"  Original error: %s", detail, errMsg)
 		}
 		return nil, fmt.Errorf("ssh dial: %w", err)
 	}

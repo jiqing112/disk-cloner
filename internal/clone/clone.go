@@ -3,6 +3,8 @@ package clone
 import (
 	"bufio"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -61,6 +63,10 @@ type CloneJob struct {
 	// probe has run.
 	ddSupportsFdatasync bool
 	ddTested            bool
+
+	// ChecksumHex is set by RunToFile on success: SHA256 hex of the complete
+	// output file, computed while streaming (no second read pass needed).
+	ChecksumHex string
 }
 
 func New(sshClient *sshclient.Client, params Params, progressFn func(Progress)) *CloneJob {
@@ -102,7 +108,7 @@ func validateBS(bs string) error {
 }
 
 // bsToBytes converts human-readable block size to bytes string.
-// Busybox dd does NOT support suffixes like "4M" ??only plain byte counts.
+// Busybox dd does NOT support suffixes like "4M" — only plain byte counts.
 func bsToBytes(bs string) string {
 	if bs == "" {
 		return "4194304"
@@ -174,6 +180,20 @@ func readGzipISize(path string) int64 {
 	}
 
 	return size
+}
+
+// IsGzipFile reports whether the file starts with the gzip magic bytes (1f 8b).
+func IsGzipFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var magic [2]byte
+	if _, err := io.ReadFull(f, magic[:]); err != nil {
+		return false
+	}
+	return magic[0] == 0x1f && magic[1] == 0x8b
 }
 
 func shellQuote(s string) string {
@@ -508,11 +528,11 @@ func (j *CloneJob) Run() error {
 // RunToFile saves remote disk as a gzip compressed file.
 // Remote does dd | gzip, only compressed data travels over the network.
 // The file is a standard RFC 1952 gzip — compatible with gunzip/dd everywhere.
+// With CompressionLevel == 0 the image is written uncompressed (raw .img).
 func (j *CloneJob) RunToFile() error {
 	if err := validateDevicePath(j.params.SourcePath); err != nil {
 		return err
 	}
-
 	// Pre-read source preparation (order matters! see Run docs):
 	//   warn mounted -> zero-fill -> initramfs -> sync+verify -> freeze -> dd.
 	j.preReadWarnIfMounted()
@@ -544,12 +564,24 @@ func (j *CloneJob) RunToFile() error {
 	}
 	defer f.Close()
 
-	// Build the compress command first so compressToolName reflects the
-	// actual tool (pigz may fall back to gzip).
-	_ = j.buildCompressCmd()
-	j.logFn("  Remote compressing (dd|%s -> net -> file)", j.compressToolName())
-	if err := j.streamCompressedRaw(f); err != nil {
-		return err
+	// Hash the output while streaming so no second read pass over the
+	// (possibly multi-GB) file is needed for the .sha256 file.
+	hasher := sha256.New()
+	out := io.MultiWriter(f, hasher)
+
+	if j.params.CompressionLevel > 0 {
+		// Build the compress command first so compressToolName reflects the
+		// actual tool (pigz may fall back to gzip).
+		_ = j.buildCompressCmd()
+		j.logFn("  Remote compressing (dd|%s -> net -> file)", j.compressToolName())
+		if err := j.streamCompressedRaw(out); err != nil {
+			return err
+		}
+	} else {
+		j.logFn("  No compression (dd -> net -> file)")
+		if err := j.streamRaw(out); err != nil {
+			return err
+		}
 	}
 
 	// Flush to disk before returning: the caller generates the .sha256 file
@@ -558,6 +590,7 @@ func (j *CloneJob) RunToFile() error {
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("sync file: %w", err)
 	}
+	j.ChecksumHex = hex.EncodeToString(hasher.Sum(nil))
 
 	return nil
 }
@@ -579,23 +612,32 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	}
 	j.logFn("  源文件: %s (%s)", filePath, formatBytesCompat(fileInfo.Size()))
 
-	// Read uncompressed size from gzip footer (last 4 bytes = ISIZE modulo 2^32)
-	if uncompSize := readGzipISize(filePath); uncompSize > 0 {
-		j.params.SourceSize = uncompSize
-	}
-
-	// Open and decompress
+	// Open the image. Standard .img.gz files are gzip; raw .img files
+	// (saved with compression level 0) are streamed as-is.
 	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("open file: %w", err)
 	}
 	defer f.Close()
 
-	gzr, err := gzip.NewReader(f)
-	if err != nil {
-		return fmt.Errorf("init gzip decompressor: %w (file may not be gzip)", err)
+	var src io.Reader = f
+	if IsGzipFile(filePath) {
+		// Read uncompressed size from gzip footer (last 4 bytes = ISIZE
+		// modulo 2^32)
+		if uncompSize := readGzipISize(filePath); uncompSize > 0 {
+			j.params.SourceSize = uncompSize
+		}
+
+		gzr, err := gzip.NewReader(f)
+		if err != nil {
+			return fmt.Errorf("init gzip decompressor: %w", err)
+		}
+		defer gzr.Close()
+		src = gzr
+	} else {
+		j.logFn("  非 gzip 文件, 按原始镜像恢复")
+		j.params.SourceSize = fileInfo.Size()
 	}
-	defer gzr.Close()
 
 	// Start remote dd with stdin pipe
 	bs := j.params.BlockSize
@@ -654,7 +696,7 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	}()
 
 	// Copy decompressed data to remote dd via SSH stdin
-	written, copyErr := j.copyWithProgress(session.Stdin, gzr)
+	written, copyErr := j.copyWithProgress(session.Stdin, src)
 
 	// Close stdin to signal EOF to remote dd
 	session.Stdin.Close()
@@ -852,6 +894,7 @@ echo "DONE"
 			j.logFn("    Done: %s", strings.TrimPrefix(line, "DONEPART "))
 		} else if strings.HasPrefix(line, "SKIP ") {
 			j.logFn("    Skipped: %s", strings.TrimPrefix(line, "SKIP "))
+			skipped++
 		} else if line == "NO_PARTS" {
 			j.logFn("    No partitions found (raw disk)")
 		} else if line == "DONE" {
@@ -1116,7 +1159,7 @@ exit $RC
 	return nil
 }
 
-// streamCompressed: remote dd|gzip ??SSH ??local gzip.Reader ??dst
+// streamCompressed: remote dd|gzip -> SSH -> local gzip.Reader -> dst
 // This transfers compressed data over the network, then decompresses locally.
 func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	if j.sshClient == nil {
@@ -1213,9 +1256,11 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	return finalErr
 }
 
-// streamCompressedRaw: remote dd|gzip -> SSH -> dst (no local decompression).
-// The remote sends already-compressed data; we write it directly to disk.
-// This is used by RunToFile where the output file is already .gz format.
+// streamCompressedRaw: remote dd|gzip -> SSH -> dst. The compressed bytes are
+// written as-is to dst (the output file is already .gz format), while a local
+// gzip reader decompresses the same stream to report true uncompressed
+// progress — without this the progress bar would show compressed/total bytes
+// and plateau at the compression ratio instead of reaching 100%.
 func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 	if j.sshClient == nil {
 		return fmt.Errorf("SSH client is nil")
@@ -1268,8 +1313,19 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 		}
 	}()
 
-	// Write compressed bytes directly ??no local gzip/decompression
-	written, copyErr := j.copyWithProgress(dst, session.Stdout)
+	// Tee the compressed stream into dst while decompressing a copy to count
+	// real disk bytes for the progress bar (see function doc above).
+	fw := &errWriter{w: dst}
+	gzr, err := gzip.NewReader(io.TeeReader(session.Stdout, fw))
+	if err != nil {
+		return fmt.Errorf("init gzip decompressor: %w (remote gzip may not be installed)", err)
+	}
+	defer gzr.Close()
+
+	written, copyErr := j.copyWithProgress(io.Discard, gzr)
+	if copyErr == nil && fw.err != nil {
+		copyErr = fmt.Errorf("write error: %w", fw.err)
+	}
 
 	sessionErr := session.Wait()
 
@@ -1310,7 +1366,7 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 	return finalErr
 }
 
-// streamRaw: remote dd ??SSH ??dst (no compression in pipe, caller wraps in gzip if needed)
+// streamRaw: remote dd -> SSH -> dst (no compression in pipe, caller wraps in gzip if needed)
 func (j *CloneJob) streamRaw(dst io.Writer) error {
 	if j.sshClient == nil {
 		return fmt.Errorf("SSH client is nil")
@@ -1392,6 +1448,22 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 
 	j.progressFn(Progress{Done: true, Error: finalErr})
 	return finalErr
+}
+
+// errWriter records the first write error from the underlying writer so it
+// can be reported with the right label (a write failure surfaces through
+// io.TeeReader as a read error otherwise).
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	n, err := e.w.Write(p)
+	if err != nil && e.err == nil {
+		e.err = err
+	}
+	return n, err
 }
 
 func (j *CloneJob) copyWithProgress(dst io.Writer, src io.Reader) (int64, error) {

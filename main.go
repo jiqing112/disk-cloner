@@ -26,7 +26,7 @@ import (
 const (
 	remoteLsblkCmd = "lsblk -Jb -o NAME,SIZE,TYPE,MOUNTPOINT,MODEL,SERIAL,TRAN,ROTA,RM,FSTYPE,LABEL"
 	clearLine      = "\r                                                                                \r"
-	version        = "3.0.0"
+	version        = "3.1.0"
 )
 
 var compressLevel = 1 // default gzip compression level 1-9, 0 = no compression
@@ -38,7 +38,7 @@ func main() {
 		remoteIP    = flag.String("H", "", "远程服务器 IP")
 		remotePort  = flag.Int("P", 22, "SSH 端口")
 		remoteUser  = flag.String("u", "root", "SSH 用户名")
-		remotePass  = flag.String("p", "", "SSH 密码")
+		remotePass  = flag.String("p", "", "SSH 密码 (也可用环境变量 DISK_CLONER_PASSWORD)")
 		source      = flag.String("s", "", "源磁盘 (远程)")
 		target      = flag.String("t", "", "目标磁盘 (本地)")
 		bs          = flag.String("bs", "4M", "dd 块大小")
@@ -75,6 +75,14 @@ func main() {
 	}
 	flag.Parse()
 
+	// Allow the SSH password via environment variable so it doesn't show up
+	// in `ps` output or shell history.
+	if *remotePass == "" {
+		if envPass := os.Getenv("DISK_CLONER_PASSWORD"); envPass != "" {
+			*remotePass = envPass
+		}
+	}
+
 	compressLevel = *compressLv
 	if compressLevel < 0 || compressLevel > 9 {
 		compressLevel = 1
@@ -89,6 +97,10 @@ func main() {
 	ensureDeps()
 
 	if *fixBootDev != "" {
+		if runtime.GOOS != "linux" {
+			fmt.Println("  [!] --fix-boot-disk 需要挂载/chroot 本地磁盘, 仅支持在 Linux (Alpine RAM OS) 上运行")
+			os.Exit(1)
+		}
 		fmt.Println()
 		fmt.Println("  修复引导 - 独立模式")
 		if err := fixboot.Run(fixboot.Config{TargetDisk: *fixBootDev}); err != nil {
@@ -228,10 +240,13 @@ func runInteractive() {
 		}
 	}()
 
+connectLoop:
 	for {
-		// Close previous SSH connection if going back
+		// Close the previous SSH connection when reconnecting (q from mode
+		// selection, or a failed attempt) so connections don't leak.
 		if sshClient != nil {
 			sshClient.Close()
+			sshClient = nil
 		}
 
 		fmt.Println("  远程服务器配置")
@@ -337,236 +352,201 @@ func runInteractive() {
 		cli.PrintSection(fmt.Sprintf("远程磁盘 (%s)", ip))
 		cli.PrintDiskList(remoteList, "remote")
 
-		if runtime.GOOS == "windows" {
+		// Local disks are only needed for clone mode; Windows supports
+		// save/restore only.
+		isWindows := runtime.GOOS == "windows"
+		var localList []cli.DiskItem
+		if !isWindows {
 			fmt.Println()
-			fmt.Println("  (Windows 仅支持保存和恢复)")
+			fmt.Println("  ─────────────────────────────────────────────")
+			fmt.Print("  正在扫描本地磁盘...")
+			localDisks, err := disk.GetLocalDisks()
+			if err != nil {
+				fmt.Printf(clearLine+"  本地扫描失败: %v\n", err)
+				fmt.Println("    请确认本地已安装 lsblk (apk add util-linux)")
+				fmt.Println()
+				fmt.Println("  可使用保存为文件模式继续")
+				fmt.Println()
+			}
+			localList = filterDisks(localDisks)
+
+			if len(localList) > 0 {
+				cli.PrintSection("本地磁盘")
+				cli.PrintDiskList(localList, "local")
+			}
+		}
+
+		// Operation loop: stays on the same SSH connection so the user can
+		// run several operations in a row ("继续其他操作? yes").
+	opLoop:
+		for {
+			// Refresh the local disk list between operations (a clone may
+			// have changed the disks attached locally).
+			if !isWindows {
+				if localDisks, err := disk.GetLocalDisks(); err == nil {
+					localList = filterDisks(localDisks)
+				}
+			}
+
+			fmt.Println()
+			fmt.Println("  操作模式 — 输入序号选择:")
+			fmt.Println("  [1] 克隆到本地磁盘 (dd -> 磁盘)")
 			fmt.Println("  [2] 保存为压缩文件 (dd -> gzip 文件)")
 			fmt.Println("  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)")
-			fmt.Println("  请输入序号 2 或 3 选择操作模式")
-			mode := cli.SelectOption("选择操作模式", 2, 3)
+			minMode, maxMode := 1, 3
+			if isWindows {
+				fmt.Println("  (Windows 仅支持保存和恢复)")
+				minMode, maxMode = 2, 3
+			}
+			mode := cli.SelectOption("请输入序号", minMode, maxMode)
 			if isBack(mode) {
-				continue
+				// q → back to SSH configuration (re-connect menu)
+				continue connectLoop
 			}
 			logger.logf("用户选择操作模式: %d", mode)
 
-			cli.PrintSection("请选择源磁盘 — 输入序号选定远程磁盘")
-			cli.PrintDiskList(remoteList, "remote")
-			if mode == 2 {
-				fmt.Println("  [0] 备份全部磁盘")
-			}
-			minIdx := 1
-			if mode == 2 {
-				minIdx = 0
-			}
-			idx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
-			if isBack(idx) {
-				continue
-			}
-			if mode == 2 && idx == 0 {
-				logger.logf("用户选择备份全部磁盘")
-			} else {
-				logger.logf("用户选择源磁盘: %s (%s)", remoteList[idx-1].Path, remoteList[idx-1].SizeHuman)
+			// Disk selection: q goes back one step — target disk select →
+			// source disk select → operation mode.
+			var srcDisk, tgtDisk cli.DiskItem
+			batchAll := false
+		selLoop:
+			for {
+				cli.PrintSection("选择源磁盘 — 输入序号选定远程磁盘")
+				cli.PrintDiskList(remoteList, "remote")
+				if mode == 2 {
+					fmt.Println("  [0] 备份全部磁盘")
+				}
+				minIdx := 1
+				if mode == 2 {
+					minIdx = 0
+				}
+				srcIdx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
+				if isBack(srcIdx) {
+					continue opLoop
+				}
+				if mode == 2 && srcIdx == 0 {
+					batchAll = true
+					logger.logf("用户选择备份全部磁盘")
+				} else {
+					srcDisk = remoteList[srcIdx-1]
+					logger.logf("用户选择源磁盘: %s (%s)", srcDisk.Path, srcDisk.SizeHuman)
+				}
+
+				if mode == 1 {
+					if len(localList) == 0 {
+						fmt.Println("\n  本地未发现磁盘, 无法克隆")
+						fmt.Println("  请重新输入或选择保存为文件模式")
+						fmt.Println()
+						continue opLoop
+					}
+					cli.PrintSection("选择目标磁盘 — 输入序号选定本地磁盘")
+					cli.PrintDiskList(localList, "local")
+					tgtIdx := cli.SelectDisk("请输入序号", 1, len(localList))
+					if isBack(tgtIdx) {
+						continue selLoop
+					}
+					tgtDisk = localList[tgtIdx-1]
+				}
+				break
 			}
 
-			if mode == 2 && idx == 0 {
+			if batchAll {
 				batchSaveToFile(ip, remoteList, sshClient, logger)
-				if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
-					waitExit()
-					return
+			} else if mode == 1 {
+				fmt.Println()
+				fmt.Println("  +--------------------------------------------+")
+				fmt.Printf("  |  源:   %s:%s (%s)\n", ip, srcDisk.Path, srcDisk.SizeHuman)
+				fmt.Printf("  |  目标: 本地 %s (%s)\n", tgtDisk.Path, tgtDisk.SizeHuman)
+				fmt.Println("  +--------------------------------------------+")
+
+				if tgtDisk.SizeBytes < srcDisk.SizeBytes {
+					fmt.Printf("\n  警告: 目标盘 (%s) 小于源盘 (%s),整盘克隆会被截断,恢复后目标文件系统将损坏!\n",
+						tgtDisk.SizeHuman, srcDisk.SizeHuman)
+					if !cli.Confirm("  确认仍要强制克隆? 输入 yes 继续") {
+						fmt.Println("  已取消")
+						continue
+					}
 				}
-				continue
-			}
 
-			srcDisk := remoteList[idx-1]
+				blockSize := cli.ReadInput("块大小", "4M")
+				compressLevel = cli.AskCompressionLevel()
+				compressType = cli.AskCompressionType()
 
-			if mode == 2 {
+				fmt.Println()
+				doZero := cli.ConfirmZero()
+				fixInitramfs = cli.AskFixInitramfs()
+				fmt.Println()
+
+				fmt.Printf("  此操作将覆盖 %s 上的所有数据!\n", tgtDisk.Path)
+				if !cli.Confirm("  确认开始克隆? 输入 yes 继续") {
+					fmt.Println("  已取消")
+					fmt.Println()
+					continue
+				}
+
+				fmt.Println()
+				fmt.Println("  开始克隆...")
+				fmt.Println()
+
+				totalStart := time.Now()
+				job := clone.New(sshClient, clone.Params{
+					SourcePath:       srcDisk.Path,
+					TargetPath:       tgtDisk.Path,
+					SourceSize:       srcDisk.SizeBytes,
+					BlockSize:        blockSize,
+					ZeroFill:         doZero,
+					CompressionLevel: compressLevel,
+					CompressType:     compressType,
+					FixInitramfs:     fixInitramfs,
+				}, makeProgressFn())
+				job.SetLogFunc(func(format string, args ...interface{}) {
+					fmt.Printf(format+"\n", args...)
+				})
+
+				if err := job.Run(); err != nil {
+					fmt.Printf("\n  克隆失败: %v\n", err)
+					fmt.Println()
+					continue
+				}
+
+				fmt.Println("  克隆完成!")
+				fmt.Println()
+
+				// Reinstall GRUB + rebuild initramfs on the freshly cloned
+				// disk. Without this, the cloned disk will fail to boot with
+				// "GRUB: unknown filesystem" because the source's core.img
+				// embeds block addresses that don't match the new disk
+				// geometry, and the source's initramfs only has drivers for
+				// the source hardware.
+				fmt.Println("  修复引导（确保目标盘可启动）...")
+				if err := fixboot.Run(fixboot.Config{TargetDisk: tgtDisk.Path}); err != nil {
+					fmt.Printf("  [!] 引导修复失败: %v（克隆已成功，请手动修复引导）\n", err)
+				}
+
+				fmt.Println("  ===============================================")
+				fmt.Printf("  全部完成! 总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
+				fmt.Println("  ===============================================")
+			} else if mode == 2 {
 				runSaveToFile(ip, srcDisk, sshClient, logger)
-				if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
-					waitExit()
-					return
-				}
-				continue
 			} else {
 				runRestoreToRemote(ip, srcDisk, sshClient)
-				if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
-					waitExit()
-					return
-				}
-				continue
 			}
-		}
-
-		fmt.Println()
-		fmt.Println("  ─────────────────────────────────────────────")
-		fmt.Print("  正在扫描本地磁盘...")
-		localDisks, err := disk.GetLocalDisks()
-		if err != nil {
-			fmt.Printf(clearLine+"  本地扫描失败: %v\n", err)
-			fmt.Println("    请确认本地已安装 lsblk (apk add util-linux)")
-			fmt.Println()
-			fmt.Println("  可使用保存为文件模式继续")
-			fmt.Println()
-		}
-		localList := filterDisks(localDisks)
-
-		if len(localList) > 0 {
-			cli.PrintSection("本地磁盘")
-			cli.PrintDiskList(localList, "local")
-		}
-
-		fmt.Println()
-		fmt.Println("  操作模式 — 输入序号选择:")
-		fmt.Println("  [1] 克隆到本地磁盘 (dd -> 磁盘)")
-		fmt.Println("  [2] 保存为压缩文件 (dd -> gzip 文件)")
-		fmt.Println("  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)")
-		mode := cli.SelectOption("请输入序号", 1, 3)
-		if isBack(mode) {
-			continue
-		}
-		logger.logf("用户选择操作模式: %d", mode)
-
-		fmt.Println()
-		cli.PrintSection("选择源磁盘 — 输入序号选定远程磁盘")
-		cli.PrintDiskList(remoteList, "remote")
-		if mode == 2 {
-			fmt.Println("  [0] 备份全部磁盘")
-		}
-
-		minIdx := 1
-		if mode == 2 {
-			minIdx = 0
-		}
-		srcIdx := cli.SelectDisk("请输入序号", minIdx, len(remoteList))
-		if isBack(srcIdx) {
-			continue
-		}
-		if mode == 2 && srcIdx == 0 {
-			logger.logf("用户选择备份全部磁盘")
-		} else {
-			logger.logf("用户选择源磁盘: %s (%s)", remoteList[srcIdx-1].Path, remoteList[srcIdx-1].SizeHuman)
-		}
-
-		if mode == 2 && srcIdx == 0 {
-			batchSaveToFile(ip, remoteList, sshClient, logger)
-			if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
-				waitExit()
-				return
-			}
-			continue
-		}
-
-		srcDisk := remoteList[srcIdx-1]
-
-		if mode == 1 {
-			if len(localList) == 0 {
-				fmt.Println("\n  本地未发现磁盘, 无法克隆")
-				fmt.Println("  请重新输入或选择保存为文件模式")
-				fmt.Println()
-				continue
-			}
-
-			cli.PrintSection("选择目标磁盘 — 输入序号选定本地磁盘")
-			cli.PrintDiskList(localList, "local")
-			tgtIdx := cli.SelectDisk("请输入序号", 1, len(localList))
-			if isBack(tgtIdx) {
-				continue
-			}
-			tgtDisk := localList[tgtIdx-1]
-
-			fmt.Println()
-			fmt.Println("  +--------------------------------------------+")
-			fmt.Printf("  |  源:   %s:%s (%s)\n", ip, srcDisk.Path, srcDisk.SizeHuman)
-			fmt.Printf("  |  目标: 本地 %s (%s)\n", tgtDisk.Path, tgtDisk.SizeHuman)
-			fmt.Println("  +--------------------------------------------+")
-
-			if tgtDisk.SizeBytes < srcDisk.SizeBytes {
-				fmt.Printf("\n  警告: 目标盘 (%s) 小于源盘 (%s)\n",
-					tgtDisk.SizeHuman, srcDisk.SizeHuman)
-			}
-
-			blockSize := cli.ReadInput("块大小", "4M")
-			compressLevel = cli.AskCompressionLevel()
-			compressType = cli.AskCompressionType()
-
-			fmt.Println()
-			doZero := cli.ConfirmZero()
-			fixInitramfs = cli.AskFixInitramfs()
-			fmt.Println()
-
-			fmt.Printf("  此操作将覆盖 %s 上的所有数据!\n", tgtDisk.Path)
-			if !cli.Confirm("  确认开始克隆? 输入 yes 继续") {
-				fmt.Println("  已取消")
-				fmt.Println()
-				continue
-			}
-
-			fmt.Println()
-			fmt.Println("  开始克隆...")
-			fmt.Println()
-
-			totalStart := time.Now()
-			job := clone.New(sshClient, clone.Params{
-				SourcePath:       srcDisk.Path,
-				TargetPath:       tgtDisk.Path,
-				SourceSize:       srcDisk.SizeBytes,
-				BlockSize:        blockSize,
-				ZeroFill:         doZero,
-				CompressionLevel: compressLevel,
-				CompressType:     compressType,
-				FixInitramfs:     fixInitramfs,
-			}, makeProgressFn())
-			job.SetLogFunc(func(format string, args ...interface{}) {
-				fmt.Printf(format+"\n", args...)
-			})
-
-			if err := job.Run(); err != nil {
-				fmt.Printf("\n  克隆失败: %v\n", err)
-				fmt.Println()
-				continue
-			}
-
-			fmt.Println("  克隆完成!")
-			fmt.Println()
-
-			// Reinstall GRUB + rebuild initramfs on the freshly cloned disk.
-			// Without this, the cloned disk will fail to boot with
-			// "GRUB: unknown filesystem" because the source's core.img embeds
-			// block addresses that don't match the new disk geometry, and the
-			// source's initramfs only has drivers for the source hardware.
-			fmt.Println("  修复引导（确保目标盘可启动）...")
-			if err := fixboot.Run(fixboot.Config{TargetDisk: tgtDisk.Path}); err != nil {
-				fmt.Printf("  [!] 引导修复失败: %v（克隆已成功，请手动修复引导）\n", err)
-			}
-
-			fmt.Println("  ===============================================")
-			fmt.Printf("  全部完成! 总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
-			fmt.Println("  ===============================================")
 
 			if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
 				waitExit()
 				return
 			}
-			continue
-		} else if mode == 2 {
-			runSaveToFile(ip, srcDisk, sshClient, logger)
-			if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
-				waitExit()
-				return
-			}
-			continue
-		} else {
-			runRestoreToRemote(ip, srcDisk, sshClient)
-			if !cli.Confirm("  继续其他操作? 输入 yes 继续，其他退出") {
-				waitExit()
-				return
-			}
-			continue
+			// yes → back to the operation mode prompt, SSH connection kept.
 		}
 	}
 }
 
 func runDirect(ip string, port int, user, pass, source, target, bs string,
 	autoYes bool, saveFile string, noFixBoot bool, restoreFile string) {
+
+	if err := clone.ValidateDevicePath(source); err != nil {
+		log.Fatalf("无效的磁盘路径 %q: %v", source, err)
+	}
 
 	sshClient, err := sshclient.Connect(sshclient.Config{
 		Host: ip, Port: port, User: user, Password: pass, Timeout: 30,
@@ -591,7 +571,14 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 	remoteRaw, err := sshClient.CombinedOutput(remoteLsblkCmd)
 	if err != nil || remoteRaw == "" {
-		log.Fatalf("远程扫描失败: %v", err)
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		if remoteRaw != "" {
+			msg = remoteRaw
+		}
+		log.Fatalf("远程扫描失败: %s\n  请确认远程已安装 lsblk (apk add util-linux)", msg)
 	}
 	remoteDisks, err := disk.ParseJSON(remoteRaw)
 	if err != nil {
@@ -608,9 +595,13 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			dateStr := time.Now().Format("2006-01-02")
 			dateDir := filepath.Join(".", dateStr)
 			os.MkdirAll(dateDir, 0755)
-			saveFile = filepath.Join(dateDir, makeFileName(ip, source, srcDisk.SizeHuman, dateStr))
+			saveFile = filepath.Join(dateDir, makeFileName(ip, source, srcDisk.SizeHuman, dateStr, saveExtFor(compressLevel)))
 		}
-		fmt.Printf("文件: %s (gzip)\n", saveFile)
+		if compressLevel == 0 {
+			fmt.Printf("文件: %s (不压缩)\n", saveFile)
+		} else {
+			fmt.Printf("文件: %s (gzip)\n", saveFile)
+		}
 		cliDisk := cli.DiskItem{Path: srcDisk.Path, SizeBytes: srcDisk.SizeBytes, SizeHuman: srcDisk.SizeHuman, Name: srcDisk.Name}
 
 		// Direct (command-line) save: use flag values directly instead of
@@ -668,8 +659,16 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			}
 		}
 
-		// Check target disk size vs uncompressed image size
-		if uncompSize := clone.GzipUncompressedSize(restoreFile); uncompSize > 0 {
+		// Check target disk size vs uncompressed image size.
+		// Raw .img files (compression level 0) have no gzip footer — the
+		// file size IS the uncompressed size.
+		uncompSize := clone.GzipUncompressedSize(restoreFile)
+		if uncompSize == 0 && !clone.IsGzipFile(restoreFile) {
+			if fi, statErr := os.Stat(restoreFile); statErr == nil {
+				uncompSize = fi.Size()
+			}
+		}
+		if uncompSize > 0 {
 			if targetSize, _ := getRemoteDiskSize(sshClient, source); targetSize > 0 && uncompSize > targetSize {
 				pct := float64(targetSize) / float64(uncompSize) * 100
 				fmt.Printf("  [!] 目标盘 (%s) 小于解压后镜像 (%s)，只能写入约 %.1f%%\n",
@@ -804,7 +803,7 @@ func runSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client,
 	fmt.Printf("  保存目录: %s\n", dateDir)
 	logger.logf("保存目录: %s", dateDir)
 
-	defaultName := makeFileName(ip, srcDisk.Name, srcDisk.SizeHuman, dateStr)
+	defaultName := makeFileName(ip, srcDisk.Name, srcDisk.SizeHuman, dateStr, ".img.gz")
 	fileName := filepath.Join(dateDir, defaultName)
 	fileName = cli.ReadInput("文件名", fileName)
 	logger.logf("用户输入文件名: %s", fileName)
@@ -844,7 +843,7 @@ func batchSaveToFile(ip string, disks []cli.DiskItem, sshClient *sshclient.Clien
 	for i, d := range disks {
 		fmt.Println()
 		fmt.Printf("  --- 备份 %d/%d: %s ---\n", i+1, len(disks), d.Path)
-		fileName := filepath.Join(dateDir, makeFileName(ip, d.Name, d.SizeHuman, dateStr))
+		fileName := filepath.Join(dateDir, makeFileName(ip, d.Name, d.SizeHuman, dateStr, saveExtFor(compressLevel)))
 
 		// Each disk gets its own log file containing the common preamble
 		// (connection / readiness / scan) inherited via fork() plus the
@@ -923,6 +922,14 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 	compressType = cli.AskCompressionType()
 	logger.logf("压缩级别: %d  压缩方式: %s", compressLevel, compressTypeName(compressType))
 
+	// Level 0 saves an uncompressed raw image — adjust the extension so the
+	// file isn't named .img.gz while containing raw bytes.
+	if compressLevel == 0 && strings.HasSuffix(fileName, ".img.gz") {
+		fileName = strings.TrimSuffix(fileName, ".img.gz") + ".img"
+		fmt.Printf("  不压缩: 保存为原始镜像 %s\n", fileName)
+		logger.logf("不压缩模式: 文件名调整为 %s", fileName)
+	}
+
 	doZero := cli.ConfirmZero()
 	fixInitramfs = cli.AskFixInitramfs()
 	logger.logf("零填充空闲空间: %v", doZero)
@@ -979,9 +986,15 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client
 		fmt.Printf("\n  保存失败: %v\n", err)
 		return
 	}
-	logger.logf("dd|gzip 传输完成")
+	logger.logf("传输完成")
 
-	saveChecksum(fileName)
+	// The checksum was computed while streaming; only recompute (slow second
+	// pass) if the job didn't provide one.
+	if job.ChecksumHex != "" {
+		writeChecksumFile(fileName, job.ChecksumHex)
+	} else {
+		saveChecksum(fileName)
+	}
 	logger.logf("校验文件已生成: %s.sha256", fileName)
 
 	if info, err := os.Stat(fileName); err == nil {
@@ -1061,8 +1074,15 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	fmt.Println("  开始恢复...")
 	fmt.Println()
 
-	// Check target disk size vs uncompressed image size
+	// Check target disk size vs uncompressed image size.
+	// Raw .img files (compression level 0) have no gzip footer — the
+	// file size IS the uncompressed size.
 	uncompSize := clone.GzipUncompressedSize(fileName)
+	if uncompSize == 0 && !clone.IsGzipFile(fileName) {
+		if fi, statErr := os.Stat(fileName); statErr == nil {
+			uncompSize = fi.Size()
+		}
+	}
 	if uncompSize > 0 {
 		targetSize, _ := getRemoteDiskSize(sshClient, remoteDisk)
 		if targetSize > 0 && uncompSize > targetSize {
@@ -1210,8 +1230,15 @@ func browseLocalFiles() string {
 		}
 	}
 
+	// Raw uncompressed images (saved with compression level 0)
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".img") {
+			files = append(files, e.Name())
+		}
+	}
+
 	if len(files) == 0 {
-		fmt.Println("\n  当前目录未找到 .img.gz 文件")
+		fmt.Println("\n  当前目录未找到 .img.gz / .img 镜像文件")
 		fmt.Println("  在 Windows 上可直接将文件拖拽到 cmd 窗口获取路径")
 		return ""
 	}
@@ -1361,7 +1388,7 @@ func waitExit() {
 	fmt.Scanln()
 }
 
-func makeFileName(ip, diskName, sizeHuman, dateStr string) string {
+func makeFileName(ip, diskName, sizeHuman, dateStr, ext string) string {
 	if i := strings.LastIndex(diskName, "/"); i >= 0 {
 		diskName = diskName[i+1:]
 	}
@@ -1373,9 +1400,19 @@ func makeFileName(ip, diskName, sizeHuman, dateStr string) string {
 		}
 	}
 	if size != "" {
-		return fmt.Sprintf("%s-%s-%s-%s.img.gz", ip, diskName, size, dateStr)
+		return fmt.Sprintf("%s-%s-%s-%s%s", ip, diskName, size, dateStr, ext)
 	}
-	return fmt.Sprintf("%s-%s-%s.img.gz", ip, diskName, dateStr)
+	return fmt.Sprintf("%s-%s-%s%s", ip, diskName, dateStr, ext)
+}
+
+// saveExtFor returns the image file extension for a compression level:
+// level 0 saves an uncompressed raw image (.img), anything else a gzip
+// archive (.img.gz).
+func saveExtFor(level int) string {
+	if level == 0 {
+		return ".img"
+	}
+	return ".img.gz"
 }
 
 // extractIP attempts to extract an IPv4 address from user input.
@@ -1580,6 +1617,13 @@ func countType(disks []disk.DiskInfo, t string) int {
 		}
 	}
 	return n
+}
+
+// writeChecksumFile writes a precomputed SHA256 hex digest in the standard
+// "sha256sum" text format.
+func writeChecksumFile(filePath, hexStr string) {
+	os.WriteFile(filePath+".sha256", []byte(fmt.Sprintf("%s  %s\n", hexStr, filepath.Base(filePath))), 0644)
+	fmt.Printf("  校验文件: %s.sha256\n", filePath)
 }
 
 // saveChecksum computes SHA256 of a file and writes it to filePath+".sha256".

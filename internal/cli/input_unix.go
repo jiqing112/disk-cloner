@@ -113,16 +113,14 @@ func ReadInput(prompt, def string) string {
 }
 
 // readLineSimple is a fallback for non-terminal stdin (pipes, redirects).
+// Data that arrives without a trailing newline (EOF) is still returned.
 func readLineSimple(def string) string {
 	var buf [4096]byte
 	total := 0
 	for {
 		n, err := os.Stdin.Read(buf[total:])
 		total += n
-		if err != nil || total == 0 {
-			return def
-		}
-		for i := total - n; i < total; i++ {
+		for i := 0; i < total; i++ {
 			if buf[i] == '\n' || buf[i] == '\r' {
 				input := strings.TrimSpace(string(buf[:i]))
 				if input == "" {
@@ -130,6 +128,14 @@ func readLineSimple(def string) string {
 				}
 				return input
 			}
+		}
+		if err != nil {
+			// EOF (or error) before a newline: use what we got.
+			input := strings.TrimSpace(string(buf[:total]))
+			if input == "" {
+				return def
+			}
+			return input
 		}
 		if total >= len(buf) {
 			break
