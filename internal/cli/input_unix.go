@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -99,7 +100,7 @@ func ReadInput(prompt, def string) string {
 			}
 
 		case b == 27:
-			os.Stdin.Read(oneByte[:2])
+			readEscapeFollowup(oneByte)
 
 		default:
 		}
@@ -237,7 +238,7 @@ func ReadInputPath(prompt, def string) string {
 			}
 
 		case b == 27:
-			os.Stdin.Read(oneByte[:2])
+			readEscapeFollowup(oneByte)
 
 		default:
 		}
@@ -379,6 +380,20 @@ func entryIsDir(lookup, name string) (bool, bool) {
 	return info.IsDir(), true
 }
 
+// readEscapeFollowup consumes up to 2 bytes of a terminal escape sequence
+// after ESC. It only reads when bytes are already available (50ms window),
+// so pressing Esc alone no longer blocks the prompt waiting for input that
+// never comes.
+func readEscapeFollowup(oneByte []byte) int {
+	fds := []unix.PollFd{{Fd: int32(os.Stdin.Fd()), Events: unix.POLLIN}}
+	n, err := unix.Poll(fds, 50)
+	if err != nil || n == 0 {
+		return 0
+	}
+	n2, _ := os.Stdin.Read(oneByte[:2])
+	return n2
+}
+
 // printMatches prints candidate names in columns.
 // The terminal is in raw mode, so newlines are \r\n.
 func printMatches(items []string) {
@@ -386,8 +401,9 @@ func printMatches(items []string) {
 	const perLine = 3
 	for i, it := range items {
 		display := it
-		if len(display) > nameWidth {
-			display = display[:nameWidth-1] + "~"
+		// Truncate by rune, never mid-sequence (CJK filenames).
+		if runes := []rune(display); len(runes) > nameWidth-1 {
+			display = string(runes[:nameWidth-1]) + "~"
 		}
 		fmt.Printf("  %-*s", nameWidth, display)
 		if (i+1)%perLine == 0 {

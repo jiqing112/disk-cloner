@@ -14,6 +14,13 @@ import (
 type Client struct {
 	conn   *ssh.Client
 	Config Config
+
+	// ServerKeyFingerprint is the SHA256 fingerprint of the server's host
+	// key. Host keys are intentionally NOT pinned: the remote boots a fresh
+	// Alpine RAM OS that regenerates its host keys on every boot, so strict
+	// pinning (TOFU) would break the normal workflow. The fingerprint is
+	// recorded and displayed instead so it can be verified manually.
+	ServerKeyFingerprint string
 }
 
 type Config struct {
@@ -98,11 +105,17 @@ func Connect(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("no authentication method available (provide password or SSH key)")
 	}
 
+	// Accept any host key but record its fingerprint (see
+	// Client.ServerKeyFingerprint for why strict pinning is not used).
+	var serverKey ssh.PublicKey
 	sshCfg := &ssh.ClientConfig{
-		User:            cfg.User,
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         time.Duration(cfg.Timeout) * time.Second,
+		User: cfg.User,
+		Auth: authMethods,
+		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			serverKey = key
+			return nil
+		},
+		Timeout: time.Duration(cfg.Timeout) * time.Second,
 	}
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
@@ -128,7 +141,11 @@ func Connect(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("ssh dial: %w", err)
 	}
 
-	return &Client{conn: conn, Config: cfg}, nil
+	c := &Client{conn: conn, Config: cfg}
+	if serverKey != nil {
+		c.ServerKeyFingerprint = ssh.FingerprintSHA256(serverKey)
+	}
+	return c, nil
 }
 
 // Execute starts a command on the remote server and returns a Session
@@ -258,8 +275,8 @@ func (s *Session) Wait() error {
 	return s.session.Wait()
 }
 
-func (s *Session) Close() {
-	s.session.Close()
+func (s *Session) Close() error {
+	return s.session.Close()
 }
 
 func (s *Session) Signal(sig ssh.Signal) error {

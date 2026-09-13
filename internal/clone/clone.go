@@ -98,6 +98,13 @@ func ValidateDevicePath(path string) error {
 	return validateDevicePath(path)
 }
 
+// ValidateBlockSize exports the block-size safety check so callers can
+// validate user input before any long-running pre-transfer step
+// (zero-fill, initramfs rebuild) — a bad block size must fail fast.
+func ValidateBlockSize(bs string) error {
+	return validateBS(bs)
+}
+
 var safeBSRe = regexp.MustCompile(`^[0-9]+[KMGkmg]?$`)
 
 func validateBS(bs string) error {
@@ -194,6 +201,32 @@ func IsGzipFile(path string) bool {
 		return false
 	}
 	return magic[0] == 0x1f && magic[1] == 0x8b
+}
+
+// sizeFileSuffix is appended to the image path for the sidecar file that
+// records the exact uncompressed size. gzip's ISIZE footer wraps modulo 2^32
+// above 4 GiB, so for larger images the sidecar written at save time is the
+// only exact source for the uncompressed size.
+const sizeFileSuffix = ".size"
+
+// WriteSizeFile records the uncompressed image size in a "<path>.size"
+// sidecar file. Called after a successful save.
+func WriteSizeFile(path string, size int64) {
+	os.WriteFile(path+sizeFileSuffix, []byte(strconv.FormatInt(size, 10)+"\n"), 0644)
+}
+
+// ReadSizeFile returns the uncompressed size recorded by WriteSizeFile,
+// or 0 if the sidecar is missing or unparsable.
+func ReadSizeFile(path string) int64 {
+	data, err := os.ReadFile(path + sizeFileSuffix)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 func shellQuote(s string) string {
@@ -306,9 +339,10 @@ func (j *CloneJob) preReadWarnIfMounted() {
 	}
 }
 
-// preReadSyncAndVerify does a final sync on the source and aborts if any of
-// its partitions are still mounted. This MUST run after zero-fill and
-// initramfs rebuild (which mount/unmount source partitions) and before dd.
+// preReadSyncAndVerify does a final sync on the source and returns an error
+// (aborting the transfer) if any of its partitions are still mounted. This
+// MUST run after zero-fill and initramfs rebuild (which mount/unmount source
+// partitions) and before dd.
 //
 // A still-mounted source partition means the filesystem journal is not fully
 // committed to disk. dd reads the block device directly, bypassing the page
@@ -319,7 +353,7 @@ func (j *CloneJob) preReadWarnIfMounted() {
 // We use this instead of a lazy fallback umount (-l) inside zero-fill/initramfs:
 // lazy umount detaches the namespace but the filesystem stays live in the
 // kernel, so the journal is never finalized.
-func (j *CloneJob) preReadSyncAndVerify(src string) {
+func (j *CloneJob) preReadSyncAndVerify(src string) error {
 	// Final sync — flush everything zero-fill / initramfs wrote.
 	j.sshClient.CombinedOutput("sync; sync; sync")
 
@@ -363,10 +397,11 @@ func (j *CloneJob) preReadSyncAndVerify(src string) {
 			j.logFn("        - %s", mp)
 		}
 		j.logFn("  [!] 请手动 umount 后重试,不要使用 lazy umount (-l)")
-		j.logFn("  [!] 继续备份,但镜像可能损坏 (恢复后 GRUB 报 unknown filesystem)")
-	} else {
-		j.logFn("  ✓ 源盘所有分区已卸载,文件系统状态一致")
+		return fmt.Errorf("source partitions still mounted: %s — aborted to avoid producing a corrupt image",
+			strings.Join(stillMounted, ", "))
 	}
+	j.logFn("  ✓ 源盘所有分区已卸载,文件系统状态一致")
+	return nil
 }
 
 // freezeSource freezes the remote block device to take a stable snapshot
@@ -490,8 +525,10 @@ func (j *CloneJob) Run() error {
 	// source is clean (no partitions still mounted). A still-mounted source
 	// at this point means dd will read a filesystem whose journal is not
 	// fully committed — the classic cause of "GRUB: unknown filesystem"
-	// after restore.
-	j.preReadSyncAndVerify(j.params.SourcePath)
+	// after restore. Abort rather than produce a corrupt image.
+	if err := j.preReadSyncAndVerify(j.params.SourcePath); err != nil {
+		return err
+	}
 
 	j.freezeSource()
 	defer j.unfreezeSource()
@@ -552,8 +589,11 @@ func (j *CloneJob) RunToFile() error {
 	// Critical: flush all writes from zero-fill/initramfs and verify the
 	// source disk has no partitions still mounted. A mounted source during
 	// dd produces an image whose filesystem journal is mid-transaction,
-	// which GRUB refuses to read ("error: unknown filesystem").
-	j.preReadSyncAndVerify(j.params.SourcePath)
+	// which GRUB refuses to read ("error: unknown filesystem"). Abort
+	// rather than write a corrupt file.
+	if err := j.preReadSyncAndVerify(j.params.SourcePath); err != nil {
+		return err
+	}
 
 	j.freezeSource()
 	defer j.unfreezeSource()
@@ -622,9 +662,12 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 
 	var src io.Reader = f
 	if IsGzipFile(filePath) {
-		// Read uncompressed size from gzip footer (last 4 bytes = ISIZE
-		// modulo 2^32)
-		if uncompSize := readGzipISize(filePath); uncompSize > 0 {
+		// Uncompressed size: prefer the .size sidecar written at save time
+		// (exact for any size) over the gzip ISIZE footer, which is only
+		// exact up to 4 GiB (it wraps modulo 2^32 above that).
+		if uncompSize := ReadSizeFile(filePath); uncompSize > 0 {
+			j.params.SourceSize = uncompSize
+		} else if uncompSize := readGzipISize(filePath); uncompSize > 0 {
 			j.params.SourceSize = uncompSize
 		}
 
@@ -696,7 +739,7 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	}()
 
 	// Copy decompressed data to remote dd via SSH stdin
-	written, copyErr := j.copyWithProgress(session.Stdin, src)
+	written, copyErr := j.copyWithProgress(session.Stdin, src, &cancelled, session.Session)
 
 	// Close stdin to signal EOF to remote dd
 	session.Stdin.Close()
@@ -814,11 +857,25 @@ for p in /sys/block/"$diskbase"/"$diskbase"*/partition; do
   parts="$parts /dev/$pname"
 done
 
-# LVM logical volumes (any LV on this machine)
+# LVM logical volumes backed by partitions of THIS disk only.
+# /sys/block/dm-N/slaves/ lists the PV partitions behind each dm device;
+# a slave named <diskbase>* means the LV lives on the source disk. Filling
+# LVs on other disks would waste hours writing disks the user didn't select.
 lvm_lvs=""
-for lv in /dev/mapper/*; do
-  [ "$lv" = "/dev/mapper/control" ] && continue
-  [ -b "$lv" ] && lvm_lvs="$lvm_lvs $lv"
+for d in /sys/block/dm-*; do
+  [ -d "$d/slaves" ] || continue
+  name=$(cat "$d/dm/name" 2>/dev/null)
+  [ -n "$name" ] || continue
+  owned=0
+  for s in "$d"/slaves/*; do
+    sname=${s##*/}
+    case "$sname" in
+      "$diskbase"|"$diskbase"p[0-9]*|"$diskbase"[0-9]*) owned=1 ;;
+    esac
+  done
+  if [ "$owned" = "1" ] && [ -b "/dev/mapper/$name" ]; then
+    lvm_lvs="$lvm_lvs /dev/mapper/$name"
+  fi
 done
 
 all_devices="$parts $lvm_lvs"
@@ -895,6 +952,8 @@ echo "DONE"
 		} else if strings.HasPrefix(line, "SKIP ") {
 			j.logFn("    Skipped: %s", strings.TrimPrefix(line, "SKIP "))
 			skipped++
+		} else if strings.HasPrefix(line, "UMOUNTFAIL ") {
+			j.logFn("  [!] Warning: could not unmount %s after zero-fill", strings.TrimPrefix(line, "UMOUNTFAIL "))
 		} else if line == "NO_PARTS" {
 			j.logFn("    No partitions found (raw disk)")
 		} else if line == "DONE" {
@@ -1223,7 +1282,7 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	}
 	defer gzr.Close()
 
-	written, copyErr := j.copyWithProgress(dst, gzr)
+	written, copyErr := j.copyWithProgress(dst, gzr, &cancelled, session)
 
 	sessionErr := session.Wait()
 
@@ -1322,7 +1381,7 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 	}
 	defer gzr.Close()
 
-	written, copyErr := j.copyWithProgress(io.Discard, gzr)
+	written, copyErr := j.copyWithProgress(io.Discard, gzr, &cancelled, session)
 	if copyErr == nil && fw.err != nil {
 		copyErr = fmt.Errorf("write error: %w", fw.err)
 	}
@@ -1418,7 +1477,7 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 		}
 	}()
 
-	written, copyErr := j.copyWithProgress(dst, session.Stdout)
+	written, copyErr := j.copyWithProgress(dst, session.Stdout, &cancelled, session)
 	sessionErr := session.Wait()
 
 	stderrOut := ""
@@ -1466,12 +1525,53 @@ func (e *errWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (j *CloneJob) copyWithProgress(dst io.Writer, src io.Reader) (int64, error) {
+// copyWithProgress copies src to dst while reporting progress once per
+// second. cancelled lets the Ctrl+C handler stop the copy locally instead of
+// relying on the remote process dying from SIGTERM (which dropbear, for
+// example, does not support). stallCloser (the SSH session) is closed by a
+// watchdog if the connection dies while no data is flowing — otherwise the
+// blocked Read would hang forever.
+func (j *CloneJob) copyWithProgress(dst io.Writer, src io.Reader, cancelled *atomic.Bool, stallCloser io.Closer) (int64, error) {
 	buf := make([]byte, 4*1024*1024) // 4MB
 	var written int64
 	start := time.Now()
 	lastUpdate := time.Now()
 	var lastWritten int64
+
+	// Stall watchdog: if the SSH connection dies while the copy is blocked
+	// in Read (no data, no EOF), closing the session unblocks it. If the
+	// connection is alive but silent, warn once and keep waiting.
+	var lastData atomic.Int64
+	lastData.Store(time.Now().Unix())
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	if stallCloser != nil {
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			warnedStall := false
+			for {
+				select {
+				case <-watchDone:
+					return
+				case <-ticker.C:
+					idle := time.Since(time.Unix(lastData.Load(), 0))
+					if idle < 60*time.Second {
+						continue
+					}
+					if !j.sshClient.IsConnected() {
+						j.logFn("  [!] SSH 连接已断开 (已 %d 秒没有数据), 强制中断传输", int(idle.Seconds()))
+						_ = stallCloser.Close()
+						return
+					}
+					if !warnedStall {
+						j.logFn("  [!] 已 %d 秒没有收到数据 (连接仍存活, 继续等待)...", int(idle.Seconds()))
+						warnedStall = true
+					}
+				}
+			}
+		}()
+	}
 
 	// Sliding window of speed samples (1 per second, last 30 seconds)
 	var speedRing [30]float64
@@ -1480,8 +1580,12 @@ func (j *CloneJob) copyWithProgress(dst io.Writer, src io.Reader) (int64, error)
 	warnedSlow := false
 
 	for {
+		if cancelled != nil && cancelled.Load() {
+			return written, fmt.Errorf("cancelled by user")
+		}
 		n, readErr := src.Read(buf)
 		if n > 0 {
+			lastData.Store(time.Now().Unix())
 			_, werr := dst.Write(buf[:n])
 			if werr != nil {
 				return written, fmt.Errorf("write error: %w", werr)

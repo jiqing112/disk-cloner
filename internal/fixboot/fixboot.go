@@ -158,25 +158,43 @@ func Run(cfg Config) error {
 	efiDir := filepath.Join(mountRoot, "boot/efi/EFI")
 	isEFI := dirExists(efiDir)
 
+	// Track a failed install so Run can report it instead of printing a
+	// misleading success line.
+	grubFailed := false
+	grubToolFound := false
+
+	// bootID names the NVRAM boot entry; match the distro's EFI directory
+	// so it lines up with the shim path.
+	bootID := "Linux"
+	switch distro {
+	case "fedora", "rhel", "centos", "rocky", "alma", "opensuse", "suse",
+		"arch", "manjaro", "debian", "ubuntu", "linuxmint":
+		bootID = distro
+	}
+
 	if isEFI {
 		log("  检测到 UEFI 模式")
 		// Fedora/RHEL
 		if fileExists(filepath.Join(mountRoot, "usr/sbin/grub2-install")) {
+			grubToolFound = true
 			err = chrootExec(mountRoot, "grub2-install",
 				"--target=x86_64-efi",
 				"--efi-directory=/boot/efi",
-				"--bootloader-id=fedora",
+				"--bootloader-id="+bootID,
 				"--recheck")
 			if err != nil {
+				grubFailed = true
 				log("  [!] grub2-install 失败: %v (可能需要手动处理)", err)
 			}
 			chrootExec(mountRoot, "grub2-mkconfig", "-o", "/boot/grub2/grub.cfg")
 		} else if fileExists(filepath.Join(mountRoot, "usr/sbin/grub-install")) {
+			grubToolFound = true
 			err = chrootExec(mountRoot, "grub-install",
 				"--target=x86_64-efi",
 				"--efi-directory=/boot/efi",
 				"--recheck")
 			if err != nil {
+				grubFailed = true
 				log("  [!] grub-install 失败: %v", err)
 			}
 			chrootExec(mountRoot, "grub-mkconfig", "-o", "/boot/grub/grub.cfg")
@@ -184,16 +202,25 @@ func Run(cfg Config) error {
 
 		// Add UEFI boot entry if efibootmgr is available
 		if commandExists("efibootmgr") {
-			efiPart := findEFIPartNum(cfg.TargetDisk, fstabMounts)
-			if efiPart != "" {
+			if efiDev, ok := fstabMounts["/boot/efi"]; ok && efiDev != "" {
+				// The ESP may live on a different disk than the clone
+				// target — efibootmgr must reference the disk that
+				// actually hosts it.
+				efiDisk, efiPart := findEFIPart(efiDev)
+				if efiDisk == "" {
+					efiDisk = cfg.TargetDisk
+				}
+				if efiPart == "" {
+					efiPart = "1"
+				}
 				shimPath := findShimPath(mountRoot)
 				if shimPath != "" {
 					run("efibootmgr", "-c",
-						"-d", cfg.TargetDisk,
+						"-d", efiDisk,
 						"-p", efiPart,
-						"-L", "Linux",
+						"-L", bootID,
 						"-l", shimPath)
-					log("  ✓ UEFI 引导项已添加")
+					log("  ✓ UEFI 引导项已添加 (%s 分区 %s)", efiDisk, efiPart)
 				}
 			}
 		} else {
@@ -203,20 +230,30 @@ func Run(cfg Config) error {
 	} else {
 		log("  检测到 BIOS/Legacy 模式")
 		if fileExists(filepath.Join(mountRoot, "usr/sbin/grub2-install")) {
+			grubToolFound = true
 			err = chrootExec(mountRoot, "grub2-install", "--recheck", cfg.TargetDisk)
 			if err != nil {
+				grubFailed = true
 				log("  [!] grub2-install 失败: %v", err)
 			}
 			chrootExec(mountRoot, "grub2-mkconfig", "-o", "/boot/grub2/grub.cfg")
 		} else if fileExists(filepath.Join(mountRoot, "usr/sbin/grub-install")) {
+			grubToolFound = true
 			err = chrootExec(mountRoot, "grub-install", "--recheck", cfg.TargetDisk)
 			if err != nil {
+				grubFailed = true
 				log("  [!] grub-install 失败: %v", err)
 			}
 			chrootExec(mountRoot, "grub-mkconfig", "-o", "/boot/grub/grub.cfg")
 		}
 	}
-	log("  ✓ GRUB 修复完成")
+	if grubFailed {
+		log("  ✗ GRUB 重装失败")
+	} else if grubToolFound {
+		log("  ✓ GRUB 修复完成")
+	} else {
+		log("  [!] 未找到 GRUB 安装工具 (grub2-install/grub-install), 跳过 GRUB 重装")
+	}
 
 	// ── 9. Fix fstab: remove extra disk mounts ─────────────────────
 	log("修复 fstab (移除不存在的额外磁盘挂载)...")
@@ -227,6 +264,9 @@ func Run(cfg Config) error {
 	// ── 10. Cleanup ─────────────────────────────────────────────────
 	log("清理挂载点...")
 	umountAll()
+	if grubFailed {
+		return fmt.Errorf("GRUB 重装失败, 目标盘可能无法启动 (initramfs 已重建); 请手动执行 grub-install --recheck %s", cfg.TargetDisk)
+	}
 	log("✓ 引导修复完成!")
 
 	return nil
@@ -479,19 +519,26 @@ func resolveDevice(dev string) string {
 	return ""
 }
 
-func findEFIPartNum(disk string, fstabMounts map[string]string) string {
-	efiDev, ok := fstabMounts["/boot/efi"]
-	if !ok {
-		return ""
+// findEFIPart splits an EFI system partition device (e.g. /dev/sda1 or
+// /dev/nvme0n1p1) into its disk and partition number. The ESP may live on a
+// different disk than the clone target, so efibootmgr must reference the
+// disk that actually hosts it.
+func findEFIPart(efiDev string) (string, string) {
+	i := len(efiDev)
+	for i > 0 && efiDev[i-1] >= '0' && efiDev[i-1] <= '9' {
+		i--
 	}
-	// Extract partition number from device path
-	// e.g. /dev/sda1 → 1, /dev/nvme0n1p1 → 1
-	efiDev = strings.TrimPrefix(efiDev, disk)
-	efiDev = strings.TrimPrefix(efiDev, "p") // for NVMe
-	if efiDev != "" {
-		return efiDev
+	part := efiDev[i:]
+	disk := efiDev[:i]
+	// nvme0n1p1 / mmcblk0p1 style: the trailing "p" is a separator, not
+	// part of the disk name (only strip it when the rest carries digits).
+	if strings.HasSuffix(disk, "p") {
+		base := disk[:len(disk)-1]
+		if strings.ContainsAny(filepath.Base(base), "0123456789") {
+			disk = base
+		}
 	}
-	return "1" // default to partition 1
+	return disk, part
 }
 
 func findShimPath(mountpoint string) string {

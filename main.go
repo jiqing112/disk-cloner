@@ -93,7 +93,20 @@ func main() {
 		return
 	}
 
-	setupConsole()
+	// -t (clone to disk), -o (save to file) and -r (restore from file) are
+	// mutually exclusive; accepting several would silently run only one.
+	ops := 0
+	for _, v := range []*string{target, saveFile, restoreFile} {
+		if *v != "" {
+			ops++
+		}
+	}
+	if ops > 1 {
+		fmt.Fprintln(os.Stderr, "错误: 参数 -t / -o / -r 只能同时指定一个")
+		os.Exit(1)
+	}
+
+	cli.SetupConsole()
 	ensureDeps()
 
 	if *fixBootDev != "" {
@@ -119,17 +132,6 @@ func main() {
 	runInteractive()
 }
 
-// setupConsole sets the terminal to UTF-8 mode on Windows,
-// so Chinese file paths are read/written correctly.
-func setupConsole() {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	// Use PowerShell to set console code page to UTF-8 (65001)
-	exec.Command("powershell", "-NoProfile", "-Command",
-		"$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; chcp 65001 >$null").Run()
-}
-
 func ensureDeps() {
 	if runtime.GOOS != "linux" {
 		return
@@ -137,12 +139,12 @@ func ensureDeps() {
 	if _, err := exec.LookPath("apk"); err != nil {
 		return
 	}
+	// Only tools the program actually runs locally: lsblk (disk scan),
+	// lvm/blkid/mount (fixboot), efibootmgr (UEFI boot entry). Filesystem
+	// repair/mkfs tools are only ever needed on the remote side.
 	deps := []struct{ pkg, binary string }{
 		{"util-linux", "lsblk"},
 		{"lvm2", "lvm"},
-		{"e2fsprogs", "mkfs.ext4"},
-		{"xfsprogs", "mkfs.xfs"},
-		{"btrfs-progs", "mkfs.btrfs"},
 		{"efibootmgr", "efibootmgr"},
 	}
 	var missing []string
@@ -215,6 +217,40 @@ func authMethod(pass string) string {
 	return "密码"
 }
 
+// readBlockSize prompts for the dd block size and re-prompts until the value
+// passes validation — a bad block size must fail before zero-fill and
+// initramfs rebuild, not after hours of pre-transfer work.
+func readBlockSize() string {
+	for {
+		bs := cli.ReadInput("块大小", "4M")
+		if err := clone.ValidateBlockSize(bs); err != nil {
+			fmt.Printf("  [!] %v (示例: 4M, 1M, 512K)\n", err)
+			continue
+		}
+		return bs
+	}
+}
+
+// imageSize returns the best-known uncompressed size of a saved image:
+// the .size sidecar written at save time (exact for any size), then the
+// gzip ISIZE footer (exact only up to 4 GiB — ISIZE wraps modulo 2^32
+// above that), then the raw file size for uncompressed .img files.
+// Returns 0 when the size is unknown.
+func imageSize(fileName string) int64 {
+	if s := clone.ReadSizeFile(fileName); s > 0 {
+		return s
+	}
+	if s := clone.GzipUncompressedSize(fileName); s > 0 {
+		return s
+	}
+	if !clone.IsGzipFile(fileName) {
+		if fi, err := os.Stat(fileName); err == nil {
+			return fi.Size()
+		}
+	}
+	return 0
+}
+
 // compressTypeName maps the compressType code to a human-readable name.
 func compressTypeName(t int) string {
 	if t == 1 {
@@ -285,6 +321,9 @@ connectLoop:
 			continue
 		}
 		fmt.Printf(clearLine+"  SSH 连接成功 (%s@%s:%d)\n", user, ip, port)
+		if fp := sshClient.ServerKeyFingerprint; fp != "" {
+			fmt.Printf("  主机密钥: %s (未做已知主机校验, 请在可信网络使用)\n", fp)
+		}
 
 		// Start capturing the session for the optional Mode 2 log file.
 		// Entries are buffered until a save path is known; if the user picks
@@ -468,7 +507,7 @@ connectLoop:
 					}
 				}
 
-				blockSize := cli.ReadInput("块大小", "4M")
+				blockSize := readBlockSize()
 				compressLevel = cli.AskCompressionLevel()
 				compressType = cli.AskCompressionType()
 
@@ -547,6 +586,9 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 	if err := clone.ValidateDevicePath(source); err != nil {
 		log.Fatalf("无效的磁盘路径 %q: %v", source, err)
 	}
+	if err := clone.ValidateBlockSize(bs); err != nil {
+		log.Fatalf("无效的块大小 %q: %v (示例: 4M, 1M, 512K)", bs, err)
+	}
 
 	sshClient, err := sshclient.Connect(sshclient.Config{
 		Host: ip, Port: port, User: user, Password: pass, Timeout: 30,
@@ -555,6 +597,9 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		log.Fatalf("SSH 连接失败: %v", err)
 	}
 	defer sshClient.Close()
+	if fp := sshClient.ServerKeyFingerprint; fp != "" {
+		fmt.Printf("主机密钥: %s (未做已知主机校验)\n", fp)
+	}
 
 	ensureRemoteDeps(sshClient)
 
@@ -596,6 +641,12 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			dateDir := filepath.Join(".", dateStr)
 			os.MkdirAll(dateDir, 0755)
 			saveFile = filepath.Join(dateDir, makeFileName(ip, source, srcDisk.SizeHuman, dateStr, saveExtFor(compressLevel)))
+		}
+		// Level 0 writes raw bytes — don't leave a user-supplied .img.gz
+		// name implying gzip content (the interactive path applies the
+		// same rule in doSaveToFile).
+		if compressLevel == 0 && strings.HasSuffix(saveFile, ".img.gz") {
+			saveFile = strings.TrimSuffix(saveFile, ".img.gz") + ".img"
 		}
 		if compressLevel == 0 {
 			fmt.Printf("文件: %s (不压缩)\n", saveFile)
@@ -660,14 +711,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		}
 
 		// Check target disk size vs uncompressed image size.
-		// Raw .img files (compression level 0) have no gzip footer — the
-		// file size IS the uncompressed size.
-		uncompSize := clone.GzipUncompressedSize(restoreFile)
-		if uncompSize == 0 && !clone.IsGzipFile(restoreFile) {
-			if fi, statErr := os.Stat(restoreFile); statErr == nil {
-				uncompSize = fi.Size()
-			}
-		}
+		uncompSize := imageSize(restoreFile)
 		if uncompSize > 0 {
 			if targetSize, _ := getRemoteDiskSize(sshClient, source); targetSize > 0 && uncompSize > targetSize {
 				pct := float64(targetSize) / float64(uncompSize) * 100
@@ -820,7 +864,7 @@ func batchSaveToFile(ip string, disks []cli.DiskItem, sshClient *sshclient.Clien
 	logger.logf("批量备份保存目录: %s", dateDir)
 	logger.logf("待备份磁盘数: %d", len(disks))
 
-	blockSize := cli.ReadInput("块大小", "4M")
+	blockSize := readBlockSize()
 	compressLevel = cli.AskCompressionLevel()
 	compressType = cli.AskCompressionType()
 	doZero := cli.ConfirmZero()
@@ -915,7 +959,7 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 		fmt.Println("    文件将写入内存文件系统，请确保内存充足")
 		fmt.Println("    或将文件保存到已挂载的物理磁盘路径")
 	}
-	blockSize := cli.ReadInput("块大小", "4M")
+	blockSize := readBlockSize()
 	logger.logf("块大小: %s", blockSize)
 
 	compressLevel = cli.AskCompressionLevel()
@@ -984,6 +1028,15 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client
 	if err := job.RunToFile(); err != nil {
 		logger.logf("保存失败: %v", err)
 		fmt.Printf("\n  保存失败: %v\n", err)
+		// Mark the leftover partial file so it can't be mistaken for a
+		// valid backup later.
+		if _, statErr := os.Stat(fileName); statErr == nil {
+			partial := fileName + ".partial"
+			if rnErr := os.Rename(fileName, partial); rnErr == nil {
+				logger.logf("未完成的文件已重命名为 %s", partial)
+				fmt.Printf("  [!] 未完成的文件已重命名为: %s\n", partial)
+			}
+		}
 		return
 	}
 	logger.logf("传输完成")
@@ -995,7 +1048,10 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client
 	} else {
 		saveChecksum(fileName)
 	}
-	logger.logf("校验文件已生成: %s.sha256", fileName)
+	// Record the exact uncompressed size: gzip's ISIZE footer wraps above
+	// 4 GiB, and restores need the real size to warn about small targets.
+	clone.WriteSizeFile(fileName, srcDisk.SizeBytes)
+	logger.logf("校验/大小文件已生成: %s.sha256 / %s.size", fileName, fileName)
 
 	if info, err := os.Stat(fileName); err == nil {
 		ratio := 0.0
@@ -1058,6 +1114,28 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 		targetLabel = disk.FormatBytes(tgtSize)
 	}
 
+	// Pre-flight checks BEFORE the overwrite confirmation, so a corrupt
+	// image or a too-small target is caught before the user commits.
+	if !verifyChecksum(fileName) {
+		if !cli.Confirm("  校验失败，是否继续恢复? 输入 yes 强制恢复") {
+			return
+		}
+	}
+
+	// Check target disk size vs uncompressed image size.
+	uncompSize := imageSize(fileName)
+	if uncompSize > 0 {
+		targetSize, _ := getRemoteDiskSize(sshClient, remoteDisk)
+		if targetSize > 0 && uncompSize > targetSize {
+			pct := float64(targetSize) / float64(uncompSize) * 100
+			fmt.Printf("  [!] 目标盘 (%s) 小于解压后镜像 (%s)，只能写入约 %.1f%%\n",
+				disk.FormatBytes(targetSize), disk.FormatBytes(uncompSize), pct)
+			if !cli.Confirm("  继续恢复? 输入 yes") {
+				return
+			}
+		}
+	}
+
 	fmt.Println()
 	fmt.Println("  +--------------------------------------------+")
 	fmt.Printf("  |  源文件: %s\n", fileName)
@@ -1074,27 +1152,6 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	fmt.Println("  开始恢复...")
 	fmt.Println()
 
-	// Check target disk size vs uncompressed image size.
-	// Raw .img files (compression level 0) have no gzip footer — the
-	// file size IS the uncompressed size.
-	uncompSize := clone.GzipUncompressedSize(fileName)
-	if uncompSize == 0 && !clone.IsGzipFile(fileName) {
-		if fi, statErr := os.Stat(fileName); statErr == nil {
-			uncompSize = fi.Size()
-		}
-	}
-	if uncompSize > 0 {
-		targetSize, _ := getRemoteDiskSize(sshClient, remoteDisk)
-		if targetSize > 0 && uncompSize > targetSize {
-			pct := float64(targetSize) / float64(uncompSize) * 100
-			fmt.Printf("  [!] 目标盘 (%s) 小于解压后镜像 (%s)，只能写入约 %.1f%%\n",
-				disk.FormatBytes(targetSize), disk.FormatBytes(uncompSize), pct)
-			if !cli.Confirm("  继续恢复? 输入 yes") {
-				return
-			}
-		}
-	}
-
 	totalStart := time.Now()
 	job := clone.New(sshClient, clone.Params{
 		TargetPath:       remoteDisk,
@@ -1106,12 +1163,6 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
 	})
-
-	if !verifyChecksum(fileName) {
-		if !cli.Confirm("  校验失败，是否继续恢复? 输入 yes 强制恢复") {
-			return
-		}
-	}
 
 	if err := job.RestoreFromFile(fileName); err != nil {
 		fmt.Printf("\n  恢复失败: %v\n", err)
