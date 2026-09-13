@@ -25,6 +25,9 @@ func readLine() (string, bool) {
 	for {
 		n, err := os.Stdin.Read(one)
 		if err != nil || n == 0 {
+			if len(buf) == 0 {
+				stdinEOF = true
+			}
 			return string(buf), false
 		}
 		b := one[0]

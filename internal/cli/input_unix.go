@@ -45,6 +45,9 @@ func ReadInput(prompt, def string) string {
 	for {
 		n, err := os.Stdin.Read(oneByte)
 		if err != nil || n == 0 {
+			if len(buf) == 0 {
+				stdinEOF = true
+			}
 			break
 		}
 
@@ -132,6 +135,9 @@ func readLineSimple(def string) string {
 		}
 		if err != nil {
 			// EOF (or error) before a newline: use what we got.
+			if total == 0 {
+				stdinEOF = true
+			}
 			input := strings.TrimSpace(string(buf[:total]))
 			if input == "" {
 				return def
@@ -184,6 +190,9 @@ func ReadInputPath(prompt, def string) string {
 	for {
 		n, err := os.Stdin.Read(oneByte)
 		if err != nil || n == 0 {
+			if len(buf) == 0 {
+				stdinEOF = true
+			}
 			break
 		}
 

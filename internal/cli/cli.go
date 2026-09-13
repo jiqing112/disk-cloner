@@ -52,9 +52,26 @@ func PrintDiskList(disks []DiskItem, location string) {
 	}
 }
 
+// stdinEOF records that stdin has reached EOF (piped/closed input). Menu
+// loops check it so they return (back navigation) instead of spinning
+// forever when no more input can ever arrive.
+var stdinEOF bool
+
+// stdinClosed reports — and clears — whether stdin has hit EOF.
+func stdinClosed() bool {
+	if stdinEOF {
+		stdinEOF = false
+		return true
+	}
+	return false
+}
+
 func SelectDisk(prompt string, minIdx, maxIdx int) int {
 	for {
 		input := ReadInput(prompt, "")
+		if input == "" && stdinClosed() {
+			return -2
+		}
 		lower := strings.ToLower(input)
 		if lower == "q" || lower == "quit" {
 			return -2
@@ -75,6 +92,9 @@ func SelectDisk(prompt string, minIdx, maxIdx int) int {
 func SelectOption(prompt string, minIdx, maxIdx int) int {
 	for {
 		input := ReadInput(prompt, "")
+		if input == "" && stdinClosed() {
+			return -2
+		}
 		lower := strings.ToLower(input)
 		if lower == "q" || lower == "quit" {
 			return -2

@@ -46,7 +46,7 @@ type Progress struct {
 }
 
 type CloneJob struct {
-	sshClient  *sshclient.Client
+	runner     sshclient.Runner
 	params     Params
 	progressFn func(Progress)
 	logFn      LogFunc
@@ -69,9 +69,9 @@ type CloneJob struct {
 	ChecksumHex string
 }
 
-func New(sshClient *sshclient.Client, params Params, progressFn func(Progress)) *CloneJob {
+func New(runner sshclient.Runner, params Params, progressFn func(Progress)) *CloneJob {
 	return &CloneJob{
-		sshClient:  sshClient,
+		runner:     runner,
 		params:     params,
 		progressFn: progressFn,
 		logFn:      func(format string, args ...interface{}) {},
@@ -248,7 +248,7 @@ func formatBytesCompat(n int64) string {
 
 // remoteHasCommand checks if a command exists on the remote server.
 func (j *CloneJob) remoteHasCommand(cmd string) bool {
-	_, err := j.sshClient.CombinedOutput("command -v " + cmd)
+	_, err := j.runner.CombinedOutput("command -v " + cmd)
 	return err == nil
 }
 
@@ -264,7 +264,7 @@ func (j *CloneJob) probeDdFdatasync() {
 	}
 	j.ddTested = true
 	// Run a no-op dd with conv=fdatasync. If it errors, dd doesn't support it.
-	out, err := j.sshClient.CombinedOutput("dd if=/dev/zero of=/dev/null bs=1 count=1 conv=fdatasync 2>&1")
+	out, err := j.runner.CombinedOutput("dd if=/dev/zero of=/dev/null bs=1 count=1 conv=fdatasync 2>&1")
 	if err == nil && !strings.Contains(strings.ToLower(out), "invalid") && !strings.Contains(strings.ToLower(out), "error") {
 		j.ddSupportsFdatasync = true
 		j.logFn("  dd: GNU coreutils (conv=fdatasync supported)")
@@ -306,7 +306,7 @@ func (j *CloneJob) preReadWarnIfMounted() {
 	// Flush all pending writes on the remote so whatever is in the page
 	// cache hits the disk before we start reading. Cheap insurance.
 	j.logFn("  Flushing remote filesystem buffers (sync)...")
-	j.sshClient.CombinedOutput("sync")
+	j.runner.CombinedOutput("sync")
 
 	// Detect partitions of the source disk that are still mounted.
 	// Partition suffix is (p?[0-9]+) to cover both sda1 and nvme0n1p1 styles.
@@ -314,7 +314,7 @@ func (j *CloneJob) preReadWarnIfMounted() {
 	if i := strings.LastIndex(src, "/"); i >= 0 {
 		diskBase = src[i+1:]
 	}
-	out, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+	out, _ := j.runner.CombinedOutput(fmt.Sprintf(
 		`for mp in $(grep -oE '/dev/(mapper/)?%s(p[0-9]+|[0-9]+)' /proc/mounts 2>/dev/null | sort -u); do echo "MOUNTED $mp"; done; `+
 			`grep -E '(/dev/%s(p[0-9]+|[0-9]+)|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print "MOUNT "$2}'`,
 		diskBase, diskBase, diskBase))
@@ -355,7 +355,7 @@ func (j *CloneJob) preReadWarnIfMounted() {
 // kernel, so the journal is never finalized.
 func (j *CloneJob) preReadSyncAndVerify(src string) error {
 	// Final sync — flush everything zero-fill / initramfs wrote.
-	j.sshClient.CombinedOutput("sync; sync; sync")
+	j.runner.CombinedOutput("sync; sync; sync")
 
 	// Give the kernel a moment to finish flushing.
 	time.Sleep(2 * time.Second)
@@ -364,7 +364,7 @@ func (j *CloneJob) preReadSyncAndVerify(src string) error {
 	if i := strings.LastIndex(src, "/"); i >= 0 {
 		diskBase = src[i+1:]
 	}
-	out, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+	out, _ := j.runner.CombinedOutput(fmt.Sprintf(
 		`grep -E '(/dev/%s(p[0-9]+|[0-9]+)|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print $2}'`,
 		diskBase, diskBase))
 	stillMounted := []string{}
@@ -377,10 +377,10 @@ func (j *CloneJob) preReadSyncAndVerify(src string) error {
 	if len(stillMounted) > 0 {
 		// Try one more regular umount (NOT lazy). If it fails we must abort.
 		for _, mp := range stillMounted {
-			j.sshClient.CombinedOutput(fmt.Sprintf("umount %s 2>/dev/null", mp))
+			j.runner.CombinedOutput(fmt.Sprintf("umount %s 2>/dev/null", mp))
 		}
 		// Re-check.
-		out2, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+		out2, _ := j.runner.CombinedOutput(fmt.Sprintf(
 			`grep -E '(/dev/%s(p[0-9]+|[0-9]+)|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print $2}'`,
 			diskBase, diskBase))
 		stillMounted = stillMounted[:0]
@@ -408,12 +408,12 @@ func (j *CloneJob) preReadSyncAndVerify(src string) error {
 // for dd to read. Best-effort: silently ignored if the kernel/busybox
 // blockdev doesn't support it.
 func (j *CloneJob) freezeSource() {
-	j.sshClient.CombinedOutput(fmt.Sprintf("blockdev --freeze %s 2>/dev/null", j.params.SourcePath))
+	j.runner.CombinedOutput(fmt.Sprintf("blockdev --freeze %s 2>/dev/null", j.params.SourcePath))
 }
 
 // unfreezeSource releases the freeze taken by freezeSource. Best-effort.
 func (j *CloneJob) unfreezeSource() {
-	j.sshClient.CombinedOutput(fmt.Sprintf("blockdev --unfreeze %s 2>/dev/null", j.params.SourcePath))
+	j.runner.CombinedOutput(fmt.Sprintf("blockdev --unfreeze %s 2>/dev/null", j.params.SourcePath))
 }
 
 // preReadSafetyCheck and postReadUnfreeze are kept for backwards
@@ -424,11 +424,11 @@ func (j *CloneJob) unfreezeSource() {
 // Deprecated: use preReadWarnIfMounted + preReadSyncAndVerify + freezeSource.
 func (j *CloneJob) preReadSafetyCheck() {
 	j.preReadWarnIfMounted()
-	j.sshClient.CombinedOutput(fmt.Sprintf("blockdev --freeze %s 2>/dev/null", j.params.SourcePath))
+	j.runner.CombinedOutput(fmt.Sprintf("blockdev --freeze %s 2>/dev/null", j.params.SourcePath))
 }
 
 func (j *CloneJob) postReadUnfreeze() {
-	j.sshClient.CombinedOutput(fmt.Sprintf("blockdev --unfreeze %s 2>/dev/null", j.params.SourcePath))
+	j.runner.CombinedOutput(fmt.Sprintf("blockdev --unfreeze %s 2>/dev/null", j.params.SourcePath))
 }
 
 // buildCompressCmd returns the compress command segment for the remote pipeline.
@@ -447,9 +447,9 @@ func (j *CloneJob) buildCompressCmd() string {
 
 	// If pigz requested, try to install and use it
 	if j.params.CompressType == 1 {
-		j.sshClient.CombinedOutput("command -v pigz || apk add --quiet pigz 2>/dev/null")
+		j.runner.CombinedOutput("command -v pigz || apk add --quiet pigz 2>/dev/null")
 		if j.remoteHasCommand("pigz") {
-			ncpus, _ := j.sshClient.CombinedOutput("nproc 2>/dev/null")
+			ncpus, _ := j.runner.CombinedOutput("nproc 2>/dev/null")
 			ncpus = strings.TrimSpace(ncpus)
 			threads := "2"
 			if n, err := strconv.Atoi(ncpus); err == nil && n > 1 {
@@ -463,7 +463,7 @@ func (j *CloneJob) buildCompressCmd() string {
 	}
 
 	// Install or check gzip
-	j.sshClient.CombinedOutput("command -v gzip || apk add --quiet gzip 2>/dev/null")
+	j.runner.CombinedOutput("command -v gzip || apk add --quiet gzip 2>/dev/null")
 	j.compressCmd = fmt.Sprintf("gzip -%d", level)
 	j.compressTool = "gzip"
 	return j.compressCmd
@@ -570,6 +570,43 @@ func (j *CloneJob) RunToFile() error {
 	if err := validateDevicePath(j.params.SourcePath); err != nil {
 		return err
 	}
+	// Create the output before the long pre-transfer steps so an
+	// unwritable path fails immediately instead of after a zero-fill.
+	f, err := os.Create(j.params.TargetPath)
+	if err != nil {
+		return fmt.Errorf("create file: %w", err)
+	}
+	defer f.Close()
+
+	if err := j.runToSink(f); err != nil {
+		return err
+	}
+
+	// Flush to disk before returning: the caller generates the .sha256 file
+	// immediately after and may show "save complete", so the image must be
+	// durable by then (protects against power loss right after saving).
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync file: %w", err)
+	}
+	return nil
+}
+
+// RunToStream saves the remote disk into w — the same pipeline as RunToFile
+// (warn mounted, zero-fill, initramfs rebuild, sync+verify, freeze) but with
+// the image going to any io.Writer, e.g. a remote-storage upload stream that
+// never touches the local disk. The SHA256 of the written stream is
+// available in ChecksumHex after success. The caller owns w: call Abort()
+// when this returns an error, Close() to finalize on success.
+func (j *CloneJob) RunToStream(w io.Writer) error {
+	if err := validateDevicePath(j.params.SourcePath); err != nil {
+		return err
+	}
+	return j.runToSink(w)
+}
+
+// runToSink contains the source preparation and dd|gzip pipeline shared by
+// RunToFile and RunToStream.
+func (j *CloneJob) runToSink(out io.Writer) error {
 	// Pre-read source preparation (order matters! see Run docs):
 	//   warn mounted -> zero-fill -> initramfs -> sync+verify -> freeze -> dd.
 	j.preReadWarnIfMounted()
@@ -598,47 +635,34 @@ func (j *CloneJob) RunToFile() error {
 	j.freezeSource()
 	defer j.unfreezeSource()
 
-	f, err := os.Create(j.params.TargetPath)
-	if err != nil {
-		return fmt.Errorf("create file: %w", err)
-	}
-	defer f.Close()
-
 	// Hash the output while streaming so no second read pass over the
-	// (possibly multi-GB) file is needed for the .sha256 file.
+	// (possibly multi-GB) image is needed for the .sha256 file.
 	hasher := sha256.New()
-	out := io.MultiWriter(f, hasher)
+	out = io.MultiWriter(out, hasher)
 
 	if j.params.CompressionLevel > 0 {
 		// Build the compress command first so compressToolName reflects the
 		// actual tool (pigz may fall back to gzip).
 		_ = j.buildCompressCmd()
-		j.logFn("  Remote compressing (dd|%s -> net -> file)", j.compressToolName())
+		j.logFn("  Remote compressing (dd|%s -> net -> target)", j.compressToolName())
 		if err := j.streamCompressedRaw(out); err != nil {
 			return err
 		}
 	} else {
-		j.logFn("  No compression (dd -> net -> file)")
+		j.logFn("  No compression (dd -> net -> target)")
 		if err := j.streamRaw(out); err != nil {
 			return err
 		}
 	}
 
-	// Flush to disk before returning: the caller generates the .sha256 file
-	// immediately after and may show "save complete", so the image must be
-	// durable by then (protects against power loss right after saving).
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sync file: %w", err)
-	}
 	j.ChecksumHex = hex.EncodeToString(hasher.Sum(nil))
-
 	return nil
 }
 
 // RestoreFromFile reads a local .img.gz file and writes it to a remote disk.
 // Flow: local gzip file -> gunzip -> SSH stdin -> remote dd of=TARGET
 func (j *CloneJob) RestoreFromFile(filePath string) error {
-	if j.sshClient == nil {
+	if j.runner == nil {
 		return fmt.Errorf("SSH client is nil")
 	}
 	if err := validateDevicePath(j.params.TargetPath); err != nil {
@@ -702,7 +726,7 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 		remoteCmd += " conv=fdatasync"
 	}
 
-	session, err := j.sshClient.ExecuteStdin(remoteCmd)
+	session, err := j.runner.ExecuteStdin(remoteCmd)
 	if err != nil {
 		return fmt.Errorf("start remote dd: %w", err)
 	}
@@ -711,7 +735,7 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	// Capture stderr
 	stderrCh := make(chan string, 1)
 	go func() {
-		data, _ := io.ReadAll(session.Stderr)
+		data, _ := io.ReadAll(session.Stderr())
 		stderrCh <- string(data)
 	}()
 
@@ -739,10 +763,16 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	}()
 
 	// Copy decompressed data to remote dd via SSH stdin
-	written, copyErr := j.copyWithProgress(session.Stdin, src, &cancelled, session.Session)
+	written, copyErr := j.copyWithProgress(session.Stdin(), src, &cancelled, session)
 
 	// Close stdin to signal EOF to remote dd
-	session.Stdin.Close()
+	session.Stdin().Close()
+
+	// If the local side failed, tear the channel down too so a dd stuck on
+	// a full target disk (or a dead connection) can't hang the Wait below.
+	if copyErr != nil {
+		session.Close()
+	}
 
 	sessionErr := session.Wait()
 
@@ -751,7 +781,7 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	// conv=fdatasync in dd only syncs the dd output stream; a separate sync
 	// guarantees the kernel has written all dirty pages from the block device.
 	if !cancelled.Load() && copyErr == nil {
-		j.sshClient.CombinedOutput("sync")
+		j.runner.CombinedOutput("sync")
 	}
 
 	stderrOut := ""
@@ -797,7 +827,7 @@ func (j *CloneJob) zeroFillFreeSpace() error {
 
 	// Show partition info before starting
 	j.logFn("  Scanning remote disk partitions (including LVM)...")
-	infoOut, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+	infoOut, _ := j.runner.CombinedOutput(fmt.Sprintf(
 		`disk="%s"; diskbase=$(basename "$disk"); apk add --quiet lvm2 2>/dev/null; lvm vgscan --mknodes 2>/dev/null; lvm vgchange -ay 2>/dev/null; echo "DISK=$diskbase"; for p in /sys/block/"$diskbase"/"$diskbase"*/partition; do [ -f "$p" ] || continue; pname=$(basename $(dirname "$p")); size=$(cat /sys/block/"$diskbase"/"$pname"/size 2>/dev/null); echo "PART $pname $size"; done; lvm lvs --noheadings -o lv_path,lv_size --units b 2>/dev/null | while read lvpath size; do [ -n "$lvpath" ] && echo "LVM $lvpath $size"; done`,
 		diskName,
 	))
@@ -927,13 +957,13 @@ echo "DONE"
 `, diskName)
 
 	// Stream execution — shows each FILL line in real-time
-	session, err := j.sshClient.Execute("sh -c " + shellQuote(script))
+	session, err := j.runner.Execute("sh -c " + shellQuote(script))
 	if err != nil {
 		return fmt.Errorf("start zero-fill: %w", err)
 	}
 	defer session.Close()
 
-	scanner := bufio.NewScanner(session.Stdout)
+	scanner := bufio.NewScanner(session.Stdout())
 	filled := 0
 	skipped := 0
 	for scanner.Scan() {
@@ -998,7 +1028,7 @@ func (j *CloneJob) FixInitramfs() error {
 // If targetDisk is empty, GRUB reinstall is skipped (used by save mode
 // where we only rebuild initramfs on the source before imaging).
 func (j *CloneJob) FixBoot(targetDisk string) error {
-	if j.sshClient == nil {
+	if j.runner == nil {
 		return fmt.Errorf("SSH client is nil")
 	}
 
@@ -1009,10 +1039,10 @@ func (j *CloneJob) FixBoot(targetDisk string) error {
 	}
 
 	// Step 1: install LVM tools and activate volumes
-	j.sshClient.CombinedOutput("apk add --quiet lvm2 2>/dev/null")
-	j.sshClient.CombinedOutput("lvm vgscan --mknodes 2>/dev/null; lvm vgchange -ay 2>/dev/null")
+	j.runner.CombinedOutput("apk add --quiet lvm2 2>/dev/null")
+	j.runner.CombinedOutput("lvm vgscan --mknodes 2>/dev/null; lvm vgchange -ay 2>/dev/null")
 
-	out, _ := j.sshClient.CombinedOutput(fmt.Sprintf(
+	out, _ := j.runner.CombinedOutput(fmt.Sprintf(
 		`lsblk -ln -o NAME,TYPE,FSTYPE 2>/dev/null | awk '$2=="part"&&$3!=""&&$3!="swap"{print "/dev/"$1}'; lsblk -ln -o NAME,TYPE,FSTYPE 2>/dev/null | awk '$2=="lvm"&&$3!=""&&$3!="swap"{print "/dev/mapper/"$1}'`,
 	))
 
@@ -1024,13 +1054,13 @@ func (j *CloneJob) FixBoot(targetDisk string) error {
 		}
 
 		// Check device exists before attempting mount
-		check, _ := j.sshClient.CombinedOutput(fmt.Sprintf("test -b %s && echo OK", dev))
+		check, _ := j.runner.CombinedOutput(fmt.Sprintf("test -b %s && echo OK", dev))
 		if !strings.Contains(check, "OK") {
 			continue
 		}
 
 		// Try mounting to see if it's root
-		_, rcErr := j.sshClient.CombinedOutput(fmt.Sprintf(
+		_, rcErr := j.runner.CombinedOutput(fmt.Sprintf(
 			`mp=$(mktemp -d) && mount %s "$mp" 2>/dev/null && { [ -f "$mp/etc/os-release" ] || [ -f "$mp/etc/fstab" ]; rc=$?; umount "$mp" 2>/dev/null; rmdir "$mp" >/dev/null 2>&1; exit $rc; } && rmdir "$mp" 2>/dev/null; exit 1`,
 			dev,
 		))
@@ -1188,7 +1218,7 @@ done
 exit $RC
 `, shellQuote(rootDev), shellQuote(targetDisk))
 
-	out2, err2 := j.sshClient.CombinedOutput("sh -c " + shellQuote(script))
+	out2, err2 := j.runner.CombinedOutput("sh -c " + shellQuote(script))
 
 	// Classify by output markers FIRST: the script exits non-zero (RC=1)
 	// both for mount failures and for GRUB-install failure, so checking
@@ -1221,7 +1251,7 @@ exit $RC
 // streamCompressed: remote dd|gzip -> SSH -> local gzip.Reader -> dst
 // This transfers compressed data over the network, then decompresses locally.
 func (j *CloneJob) streamCompressed(dst io.Writer) error {
-	if j.sshClient == nil {
+	if j.runner == nil {
 		return fmt.Errorf("SSH client is nil")
 	}
 
@@ -1238,7 +1268,7 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	compress := j.buildCompressCmd()
 	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | %s", j.params.SourcePath, bsBytes, compress)
 
-	session, err := j.sshClient.Execute(remoteCmd)
+	session, err := j.runner.Execute(remoteCmd)
 	if err != nil {
 		return fmt.Errorf("start remote dd|gzip: %w", err)
 	}
@@ -1247,7 +1277,7 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	// Capture stderr
 	stderrCh := make(chan string, 1)
 	go func() {
-		data, _ := io.ReadAll(session.Stderr)
+		data, _ := io.ReadAll(session.Stderr())
 		stderrCh <- string(data)
 	}()
 
@@ -1276,13 +1306,19 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	}()
 
 	// Decompress on-the-fly and write to target
-	gzr, err := gzip.NewReader(session.Stdout)
+	gzr, err := gzip.NewReader(session.Stdout())
 	if err != nil {
 		return fmt.Errorf("init gzip decompressor: %w (remote gzip may not be installed)", err)
 	}
 	defer gzr.Close()
 
 	written, copyErr := j.copyWithProgress(dst, gzr, &cancelled, session)
+	if copyErr != nil {
+		// The local side stopped reading; the remote dd|gzip may be stuck
+		// on a full SSH window. Close the channel so Wait can't block
+		// forever.
+		session.Close()
+	}
 
 	sessionErr := session.Wait()
 
@@ -1321,7 +1357,7 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 // progress — without this the progress bar would show compressed/total bytes
 // and plateau at the compression ratio instead of reaching 100%.
 func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
-	if j.sshClient == nil {
+	if j.runner == nil {
 		return fmt.Errorf("SSH client is nil")
 	}
 
@@ -1337,7 +1373,7 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 	compress := j.buildCompressCmd()
 	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | %s", j.params.SourcePath, bsBytes, compress)
 
-	session, err := j.sshClient.Execute(remoteCmd)
+	session, err := j.runner.Execute(remoteCmd)
 	if err != nil {
 		return fmt.Errorf("start remote dd|gzip: %w", err)
 	}
@@ -1345,7 +1381,7 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 
 	stderrCh := make(chan string, 1)
 	go func() {
-		data, _ := io.ReadAll(session.Stderr)
+		data, _ := io.ReadAll(session.Stderr())
 		stderrCh <- string(data)
 	}()
 
@@ -1375,7 +1411,7 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 	// Tee the compressed stream into dst while decompressing a copy to count
 	// real disk bytes for the progress bar (see function doc above).
 	fw := &errWriter{w: dst}
-	gzr, err := gzip.NewReader(io.TeeReader(session.Stdout, fw))
+	gzr, err := gzip.NewReader(io.TeeReader(session.Stdout(), fw))
 	if err != nil {
 		return fmt.Errorf("init gzip decompressor: %w (remote gzip may not be installed)", err)
 	}
@@ -1384,6 +1420,12 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 	written, copyErr := j.copyWithProgress(io.Discard, gzr, &cancelled, session)
 	if copyErr == nil && fw.err != nil {
 		copyErr = fmt.Errorf("write error: %w", fw.err)
+	}
+	if copyErr != nil {
+		// The local side stopped reading; tear the channel down so the
+		// remote pipeline (stuck on a full SSH window) dies and Wait
+		// can't block forever.
+		session.Close()
 	}
 
 	sessionErr := session.Wait()
@@ -1427,7 +1469,7 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 
 // streamRaw: remote dd -> SSH -> dst (no compression in pipe, caller wraps in gzip if needed)
 func (j *CloneJob) streamRaw(dst io.Writer) error {
-	if j.sshClient == nil {
+	if j.runner == nil {
 		return fmt.Errorf("SSH client is nil")
 	}
 
@@ -1442,7 +1484,7 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 
 	remoteCmd := fmt.Sprintf("dd if=%s bs=%s", j.params.SourcePath, bsBytes)
 
-	session, err := j.sshClient.Execute(remoteCmd)
+	session, err := j.runner.Execute(remoteCmd)
 	if err != nil {
 		return fmt.Errorf("start remote dd: %w", err)
 	}
@@ -1450,7 +1492,7 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 
 	stderrCh := make(chan string, 1)
 	go func() {
-		data, _ := io.ReadAll(session.Stderr)
+		data, _ := io.ReadAll(session.Stderr())
 		stderrCh <- string(data)
 	}()
 
@@ -1477,7 +1519,12 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 		}
 	}()
 
-	written, copyErr := j.copyWithProgress(dst, session.Stdout, &cancelled, session)
+	written, copyErr := j.copyWithProgress(dst, session.Stdout(), &cancelled, session)
+	if copyErr != nil {
+		// The local side stopped writing; the remote dd may be stuck on a
+		// full SSH window. Close the channel so Wait can't block forever.
+		session.Close()
+	}
 	sessionErr := session.Wait()
 
 	stderrOut := ""
@@ -1559,7 +1606,7 @@ func (j *CloneJob) copyWithProgress(dst io.Writer, src io.Reader, cancelled *ato
 					if idle < 60*time.Second {
 						continue
 					}
-					if !j.sshClient.IsConnected() {
+					if !j.runner.IsConnected() {
 						j.logFn("  [!] SSH 连接已断开 (已 %d 秒没有数据), 强制中断传输", int(idle.Seconds()))
 						_ = stallCloser.Close()
 						return
@@ -1657,7 +1704,7 @@ func (j *CloneJob) copyWithProgress(dst io.Writer, src io.Reader, cancelled *ato
 				})
 
 				// Check if SSH connection is still alive
-				if !j.sshClient.IsConnected() {
+				if !j.runner.IsConnected() {
 					return written, fmt.Errorf("SSH connection lost — remote host may have rebooted or shut down")
 				}
 

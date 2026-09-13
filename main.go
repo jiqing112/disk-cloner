@@ -20,13 +20,15 @@ import (
 	"disk-cloner/internal/clone"
 	"disk-cloner/internal/disk"
 	"disk-cloner/internal/fixboot"
+	"disk-cloner/internal/local"
 	sshclient "disk-cloner/internal/ssh"
+	"disk-cloner/internal/storage"
 )
 
 const (
 	remoteLsblkCmd = "lsblk -Jb -o NAME,SIZE,TYPE,MOUNTPOINT,MODEL,SERIAL,TRAN,ROTA,RM,FSTYPE,LABEL"
 	clearLine      = "\r                                                                                \r"
-	version        = "3.1.0"
+	version        = "3.2.0"
 )
 
 var compressLevel = 1 // default gzip compression level 1-9, 0 = no compression
@@ -48,6 +50,8 @@ func main() {
 		noFixBoot   = flag.Bool("no-fix-boot", false, "跳过引导修复")
 		fixBootDev  = flag.String("fix-boot-disk", "", "独立修复引导")
 		restoreFile = flag.String("r", "", "恢复 gzip 文件到远程磁盘")
+		dst         = flag.String("dst", "", "传输到远程存储 (sftp:// ftp:// dav:// davs:// s3://)")
+		localDisk   = flag.String("l", "", "本机磁盘作为源 (程序直接运行在源机 RAM OS, 需 Linux; 搭配 -dst 或 -o)")
 		showVer     = flag.Bool("V", false, "显示版本号")
 	)
 	flag.Usage = func() {
@@ -64,6 +68,8 @@ func main() {
 		fmt.Println("  disk-cloner -H 服务器IP -p 密码 -s /dev/sda -t /dev/sda -y")
 		fmt.Println("  disk-cloner -H 服务器IP -p 密码 -s /dev/sda -o auto -y")
 		fmt.Println("  disk-cloner -H 服务器IP -p 密码 -s /dev/sda -r backup.img.gz -y")
+		fmt.Println("  disk-cloner -H 服务器IP -p 密码 -s /dev/sda -dst 'sftp://user:pass@nas.lan/backup/x.img.gz' -y")
+		fmt.Println("  disk-cloner -l /dev/sda -dst 'sftp://user:pass@nas.lan/backup/' -y   (本机模式, 在源机 RAM OS 上运行)")
 		fmt.Println()
 		fmt.Println("参数:")
 		flag.PrintDefaults()
@@ -93,10 +99,11 @@ func main() {
 		return
 	}
 
-	// -t (clone to disk), -o (save to file) and -r (restore from file) are
-	// mutually exclusive; accepting several would silently run only one.
+	// -t (clone to disk), -o (save to file), -r (restore) and -dst (push to
+	// remote storage) are mutually exclusive; accepting several would
+	// silently run only one.
 	ops := 0
-	for _, v := range []*string{target, saveFile, restoreFile} {
+	for _, v := range []*string{target, saveFile, restoreFile, dst} {
 		if *v != "" {
 			ops++
 		}
@@ -104,6 +111,23 @@ func main() {
 	if ops > 1 {
 		fmt.Fprintln(os.Stderr, "错误: 参数 -t / -o / -r 只能同时指定一个")
 		os.Exit(1)
+	}
+
+	// Local-source mode (-l): the tool itself runs on the machine being
+	// imaged (Alpine RAM OS) and pushes its own disk to storage.
+	if *localDisk != "" {
+		if runtime.GOOS != "linux" {
+			fmt.Fprintln(os.Stderr, "错误: -l (本机模式) 仅支持在 Linux (Alpine RAM OS) 上运行")
+			os.Exit(1)
+		}
+		if *remoteIP != "" || *source != "" || *target != "" || *restoreFile != "" {
+			fmt.Fprintln(os.Stderr, "错误: -l 不能与 -H/-s/-t/-r 同时使用")
+			os.Exit(1)
+		}
+		if (*dst == "") == (*saveFile == "") {
+			fmt.Fprintln(os.Stderr, "错误: -l 需要且只能搭配 -dst 或 -o 之一")
+			os.Exit(1)
+		}
 	}
 
 	cli.SetupConsole()
@@ -123,9 +147,14 @@ func main() {
 		return
 	}
 
-	if *remoteIP != "" && *source != "" && (*target != "" || *saveFile != "" || *restoreFile != "") {
+	if *localDisk != "" {
+		runDirectLocal(*localDisk, *bs, *autoYes, *saveFile, *dst)
+		return
+	}
+
+	if *remoteIP != "" && *source != "" && (*target != "" || *saveFile != "" || *restoreFile != "" || *dst != "") {
 		runDirect(*remoteIP, *remotePort, *remoteUser, *remotePass,
-			*source, *target, *bs, *autoYes, *saveFile, *noFixBoot, *restoreFile)
+			*source, *target, *bs, *autoYes, *saveFile, *noFixBoot, *restoreFile, *dst)
 		return
 	}
 
@@ -269,12 +298,45 @@ func isBack(v int) bool { return v == -2 }
 func runInteractive() {
 	cli.PrintHeader()
 
+	// 启动即选操作模式。模式 4 = 本机硬盘直传远程存储（程序运行在源机
+	// RAM OS 上，无需 SSH）；其余模式随后连接远程服务器，后续流程与
+	// 原来一致。
+	var startMode int
+	for {
+		fmt.Println()
+		fmt.Println("  操作模式 — 输入序号选择:")
+		fmt.Println("  [1] 克隆到本地磁盘 (dd -> 磁盘)")
+		fmt.Println("  [2] 保存为压缩文件 (dd -> gzip 文件)")
+		fmt.Println("  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)")
+		startMinMode, maxMode := 1, 4
+		if runtime.GOOS == "windows" {
+			fmt.Println("  (Windows 不支持克隆到磁盘和本机传输, 其他模式可用)")
+			startMinMode = 2
+			maxMode = 3
+		} else {
+			fmt.Println("  [4] 读取本地硬盘传输到远程存储 (dd -> SFTP/FTP/WebDAV/S3)")
+		}
+		m := cli.SelectOption("请输入序号", startMinMode, maxMode)
+		if isBack(m) {
+			waitExit()
+			return
+		}
+		if m == 4 {
+			runLocalInteractive()
+			continue // 返回操作模式菜单
+		}
+		startMode = m
+		break
+	}
+
 	var sshClient *sshclient.Client
 	defer func() {
 		if sshClient != nil {
 			sshClient.Close()
 		}
 	}()
+
+	firstOp := true
 
 connectLoop:
 	for {
@@ -334,13 +396,13 @@ connectLoop:
 
 		fmt.Println()
 		fmt.Println("  ─────────────────────────────────────────────")
-		readiness := checkRemoteReadiness(sshClient)
+		readiness := checkRemoteReadiness(sshClient, "远程")
 		logger.logf("远程环境: OS=%q RootFS=%q Alpine=%v RAM=%v Detected=%v",
 			readiness.OSLine, readiness.RootFS, readiness.IsAlpine, readiness.IsRAM, readiness.Detected)
 		if readiness.Detected && !readiness.IsSafe() {
 			logger.logf("警告: 远程不是 Alpine RAM OS,继续可能导致数据不一致")
 		}
-		if !confirmUnsafeRemote(readiness, false) {
+		if !confirmUnsafeRemote(readiness, false, "远程") {
 			logger.logf("用户取消: 远程不是 Alpine RAM OS")
 			fmt.Println("  已取消,请先将远程重启进入 Alpine RAM OS 后再试")
 			fmt.Println()
@@ -427,21 +489,27 @@ connectLoop:
 				}
 			}
 
-			fmt.Println()
-			fmt.Println("  操作模式 — 输入序号选择:")
-			fmt.Println("  [1] 克隆到本地磁盘 (dd -> 磁盘)")
-			fmt.Println("  [2] 保存为压缩文件 (dd -> gzip 文件)")
-			fmt.Println("  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)")
-			minMode, maxMode := 1, 3
-			if isWindows {
-				fmt.Println("  (Windows 仅支持保存和恢复)")
-				minMode, maxMode = 2, 3
+			// The operation mode was chosen at startup; on later rounds of
+			// "继续其他操作" the menu re-appears so several different
+			// operations can run in a row on the same connection.
+			mode := startMode
+			if !firstOp {
+				fmt.Println()
+				fmt.Println("  操作模式 — 输入序号选择:")
+				fmt.Println("  [1] 克隆到本地磁盘 (dd -> 磁盘)")
+				fmt.Println("  [2] 保存为压缩文件 (dd -> gzip 文件)")
+				fmt.Println("  [3] 恢复文件到远程磁盘 (gzip 文件 -> dd 远程磁盘)")
+				minMode, maxMode := 1, 3
+				if isWindows {
+					minMode = 2
+				}
+				mode = cli.SelectOption("请输入序号", minMode, maxMode)
+				if isBack(mode) {
+					// q → back to SSH configuration (re-connect menu)
+					continue connectLoop
+				}
 			}
-			mode := cli.SelectOption("请输入序号", minMode, maxMode)
-			if isBack(mode) {
-				// q → back to SSH configuration (re-connect menu)
-				continue connectLoop
-			}
+			firstOp = false
 			logger.logf("用户选择操作模式: %d", mode)
 
 			// Disk selection: q goes back one step — target disk select →
@@ -581,13 +649,23 @@ connectLoop:
 }
 
 func runDirect(ip string, port int, user, pass, source, target, bs string,
-	autoYes bool, saveFile string, noFixBoot bool, restoreFile string) {
+	autoYes bool, saveFile string, noFixBoot bool, restoreFile string, dst string) {
 
 	if err := clone.ValidateDevicePath(source); err != nil {
 		log.Fatalf("无效的磁盘路径 %q: %v", source, err)
 	}
 	if err := clone.ValidateBlockSize(bs); err != nil {
 		log.Fatalf("无效的块大小 %q: %v (示例: 4M, 1M, 512K)", bs, err)
+	}
+	// Validate the storage URL before dialing: a malformed -dst should not
+	// wait for an SSH connection to be rejected.
+	var dstCfg *storage.Config
+	if dst != "" {
+		cfg, err := storage.ParseURL(dst)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		dstCfg = &cfg
 	}
 
 	sshClient, err := sshclient.Connect(sshclient.Config{
@@ -604,8 +682,8 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 	ensureRemoteDeps(sshClient)
 
 	// Detect Alpine RAM OS — refuse or warn if remote is running a normal system
-	readiness := checkRemoteReadiness(sshClient)
-	if !confirmUnsafeRemote(readiness, autoYes) {
+	readiness := checkRemoteReadiness(sshClient, "远程")
+	if !confirmUnsafeRemote(readiness, autoYes, "远程") {
 		fmt.Println("已取消")
 		return
 	}
@@ -635,6 +713,8 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 	}
 	fmt.Printf("远程: %s:%s (%s)\n", ip, source, srcDisk.SizeHuman)
 
+	cliDisk := cli.DiskItem{Path: srcDisk.Path, SizeBytes: srcDisk.SizeBytes, SizeHuman: srcDisk.SizeHuman, Name: srcDisk.Name}
+
 	if saveFile != "" {
 		if saveFile == "auto" {
 			dateStr := time.Now().Format("2006-01-02")
@@ -653,7 +733,6 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		} else {
 			fmt.Printf("文件: %s (gzip)\n", saveFile)
 		}
-		cliDisk := cli.DiskItem{Path: srcDisk.Path, SizeBytes: srcDisk.SizeBytes, SizeHuman: srcDisk.SizeHuman, Name: srcDisk.Name}
 
 		// Direct (command-line) save: use flag values directly instead of
 		// prompting for block size / compression level / compression type.
@@ -685,6 +764,48 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			fmt.Printf("  日志文件: %s\n", logPath)
 		}
 		execSaveToFile(ip, cliDisk, sshClient, saveFile, bs, true, logger)
+		logger.close()
+		return
+	}
+
+	if dst != "" {
+		cfg := *dstCfg
+		dateStr := time.Now().Format("2006-01-02")
+		if cfg.NeedsName() {
+			cfg.AppendName(makeFileName(ip, source, srcDisk.SizeHuman, dateStr, saveExtFor(compressLevel)))
+		}
+		fmt.Printf("目标: %s\n", storage.Describe(cfg))
+
+		logger := newSessionLogger()
+		logger.logf("=== Disk Cloner v%s 命令行模式 (远程存储) ===", version)
+		logger.logf("SSH 连接: %s@%s:%d (认证: %s)", user, ip, port, authMethod(pass))
+		logger.logf("远程环境: OS=%q RootFS=%q Alpine=%v RAM=%v Detected=%v",
+			readiness.OSLine, readiness.RootFS, readiness.IsAlpine, readiness.IsRAM, readiness.Detected)
+		logger.logf("源磁盘: %s (%s)", srcDisk.Path, srcDisk.SizeHuman)
+		logger.logf("存储目标: %s", storage.Describe(cfg))
+		logger.logf("块大小: %s  压缩级别: %d  压缩方式: %s  零填充: 是  重建 initramfs: %v",
+			bs, compressLevel, compressTypeName(compressType), fixInitramfs)
+
+		if !autoYes {
+			fmt.Printf("将读取远程 %s 并流式上传到 %s\n", srcDisk.Path, storage.Describe(cfg))
+			fmt.Print("确认继续? (yes/no): ")
+			var confirm string
+			fmt.Scanln(&confirm)
+			if confirm != "yes" && confirm != "y" {
+				fmt.Println("已取消")
+				return
+			}
+		}
+
+		dateDir := filepath.Join(".", dateStr)
+		os.MkdirAll(dateDir, 0755)
+		logPath := filepath.Join(dateDir, storage.BaseName(cfg)+".log")
+		if err := logger.open(logPath); err != nil {
+			fmt.Printf("  [!] 无法创建日志文件 %s: %v (继续无日志)\n", logPath, err)
+		} else {
+			fmt.Printf("  日志文件: %s\n", logPath)
+		}
+		execSaveToStorage(cliDisk, sshClient, cfg, bs, true, dateDir, logger)
 		logger.close()
 		return
 	}
@@ -1001,7 +1122,7 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 }
 
 // execSaveToFile runs the actual save without prompts.
-func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, fileName string, blockSize string, doZero bool, logger *sessionLogger) {
+func execSaveToFile(ip string, srcDisk cli.DiskItem, runner sshclient.Runner, fileName string, blockSize string, doZero bool, logger *sessionLogger) {
 	fmt.Println()
 	fmt.Println("  开始保存...")
 	fmt.Println()
@@ -1010,7 +1131,7 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client
 	logger.logf("开始保存操作 (dd|%s -> 网络 -> 文件)", compressTypeName(compressType))
 	logger.logf("开始时间: %s", totalStart.Format("2006-01-02 15:04:05"))
 
-	job := clone.New(sshClient, clone.Params{
+	job := clone.New(runner, clone.Params{
 		SourcePath:       srcDisk.Path,
 		TargetPath:       fileName,
 		SourceSize:       srcDisk.SizeBytes,
@@ -1067,6 +1188,430 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client
 	fmt.Println()
 	fmt.Println("  ===============================================")
 	fmt.Printf("  保存完成! 总耗时: %s\n", formatTotalTime(totalTime))
+	fmt.Println("  ===============================================")
+}
+
+// ─── 模式 4: 传输到远程存储 ────────────────────────────────────────────
+
+// runLocalInteractive is interactive mode 4: running directly on the source
+// machine (Alpine RAM OS), the LOCAL disk is dd'd and streamed to a remote
+// storage service (SFTP/FTP/WebDAV/S3) without any SSH connection and
+// without writing the image to a local disk. Only the small
+// .sha256/.size/.log sidecars stay local.
+func runLocalInteractive() {
+	runner := local.NewRunner()
+
+	fmt.Println()
+	fmt.Println("  模式 4 — 本机硬盘 → 远程存储")
+	fmt.Println("  程序运行在源机 RAM OS 上, 直接读本机物理硬盘, 镜像不落本地磁盘")
+
+	for {
+		fmt.Println()
+		fmt.Println("  ─────────────────────────────────────────────")
+		fmt.Print("  正在扫描本机磁盘...")
+		disks, err := disk.GetLocalDisks()
+		if err != nil {
+			fmt.Printf(clearLine+"  本机磁盘扫描失败: %v\n      请确认已安装 lsblk (apk add util-linux)\n", err)
+			return
+		}
+		localList := filterDisks(disks)
+		if len(localList) == 0 {
+			fmt.Println(clearLine + "  未发现本机磁盘设备")
+			return
+		}
+		fmt.Printf(clearLine+"  发现 %d 块本机磁盘\n", len(localList))
+
+		fmt.Println()
+		cli.PrintSection("本机磁盘 (dd 源)")
+		cli.PrintDiskList(localList, "local")
+		idx := cli.SelectDisk("请输入序号", 1, len(localList))
+		if isBack(idx) {
+			return // 返回操作模式菜单
+		}
+		srcDisk := localList[idx-1]
+
+		// The source here IS this machine — it must be in RAM OS too.
+		readiness := checkRemoteReadiness(runner, "本机")
+		logger := newSessionLogger()
+		logger.logf("=== Disk Cloner v%s 本机模式 ===", version)
+		logger.logf("源磁盘: %s (%s)", srcDisk.Path, srcDisk.SizeHuman)
+		logger.logf("本机环境: OS=%q RootFS=%q Alpine=%v RAM=%v Detected=%v",
+			readiness.OSLine, readiness.RootFS, readiness.IsAlpine, readiness.IsRAM, readiness.Detected)
+		if !confirmUnsafeRemote(readiness, false, "本机") {
+			logger.logf("用户取消: 本机不是 Alpine RAM OS")
+			fmt.Println("  已取消,请先将本机重启进入 Alpine RAM OS 后再试")
+			continue
+		}
+
+		cfg, ok := askStorageConn()
+		if !ok {
+			fmt.Println("  已取消")
+			continue
+		}
+		logger.logf("存储类型: %s", cfg.Kind)
+
+		blockSize, doZero := askTransferSettings(logger)
+
+		dateStr := time.Now().Format("2006-01-02")
+		host, _ := os.Hostname()
+		if host == "" {
+			host = "local"
+		}
+		defaultName := makeFileName(host, srcDisk.Name, srcDisk.SizeHuman, dateStr, saveExtFor(compressLevel))
+		if !fillDestPath(&cfg, defaultName) {
+			fmt.Println("  已取消")
+			continue
+		}
+		logger.logf("存储目标: %s", storage.Describe(cfg))
+
+		saveDir := askSaveDirectory()
+		dateDir := filepath.Join(saveDir, dateStr)
+		os.MkdirAll(dateDir, 0755)
+		base := storage.BaseName(cfg)
+		logger.logf("本地校验文件目录: %s", dateDir)
+
+		fmt.Println()
+		fmt.Println("  +--------------------------------------------+")
+		fmt.Printf("  |  源:   本机 %s (%s)\n", srcDisk.Path, srcDisk.SizeHuman)
+		fmt.Printf("  |  目标: %s\n", storage.Describe(cfg))
+		fmt.Println("  |  镜像不落本地磁盘, 直接流式上传")
+		fmt.Printf("  |  本地校验文件: %s.sha256/.size\n", base)
+		fmt.Println("  +--------------------------------------------+")
+		fmt.Printf("  此操作将读取本机 %s 上的所有数据并直接上传!\n", srcDisk.Path)
+		if !cli.Confirm("  确认开始传输? 输入 yes 继续") {
+			logger.logf("用户取消存储传输")
+			fmt.Println("  已取消")
+			continue
+		}
+		logger.logf("用户确认开始存储传输")
+
+		if err := logger.open(filepath.Join(dateDir, base+".log")); err != nil {
+			fmt.Printf("  [!] 无法创建日志文件: %v (继续无日志)\n", err)
+		}
+		execSaveToStorage(srcDisk, runner, cfg, blockSize, doZero, dateDir, logger)
+		logger.close()
+
+		if !cli.Confirm("  继续传输其他磁盘? 输入 yes 继续，其他返回主菜单") {
+			return
+		}
+	}
+}
+
+// runDirectLocal is the CLI equivalent of runLocalInteractive:
+//
+//	disk-cloner -l /dev/sda -dst 'sftp://user:pass@nas.lan/backup/' -y
+//	disk-cloner -l /dev/sda -o /mnt/usb/backup.img.gz -y
+func runDirectLocal(diskPath, bs string, autoYes bool, saveFile, dst string) {
+	if err := clone.ValidateDevicePath(diskPath); err != nil {
+		log.Fatalf("无效的磁盘路径 %q: %v", diskPath, err)
+	}
+	if err := clone.ValidateBlockSize(bs); err != nil {
+		log.Fatalf("无效的块大小 %q: %v (示例: 4M, 1M, 512K)", bs, err)
+	}
+	var dstCfg *storage.Config
+	if dst != "" {
+		cfg, err := storage.ParseURL(dst)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		dstCfg = &cfg
+	}
+
+	runner := local.NewRunner()
+
+	// The machine being imaged is THIS one — it must be in RAM OS.
+	readiness := checkRemoteReadiness(runner, "本机")
+	if !confirmUnsafeRemote(readiness, autoYes, "本机") {
+		fmt.Println("已取消")
+		return
+	}
+
+	// Direct mode defaults: rebuild initramfs for cross-hardware boot.
+	fixInitramfs = true
+
+	disks, err := disk.GetLocalDisks()
+	if err != nil {
+		log.Fatalf("本机磁盘扫描失败: %v", err)
+	}
+	srcDisk := disk.FindDisk(disks, diskPath)
+	if srcDisk == nil {
+		log.Fatalf("本机磁盘未找到: %s", diskPath)
+	}
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "local"
+	}
+	cliDisk := cli.DiskItem{Path: srcDisk.Path, SizeBytes: srcDisk.SizeBytes, SizeHuman: srcDisk.SizeHuman, Name: srcDisk.Name}
+	fmt.Printf("本机: %s (%s)\n", diskPath, srcDisk.SizeHuman)
+
+	dateStr := time.Now().Format("2006-01-02")
+
+	if saveFile != "" {
+		if saveFile == "auto" {
+			dateDir := filepath.Join(".", dateStr)
+			os.MkdirAll(dateDir, 0755)
+			saveFile = filepath.Join(dateDir, makeFileName(host, srcDisk.Name, srcDisk.SizeHuman, dateStr, saveExtFor(compressLevel)))
+		}
+		if compressLevel == 0 && strings.HasSuffix(saveFile, ".img.gz") {
+			saveFile = strings.TrimSuffix(saveFile, ".img.gz") + ".img"
+		}
+		if compressLevel == 0 {
+			fmt.Printf("文件: %s (不压缩)\n", saveFile)
+		} else {
+			fmt.Printf("文件: %s (gzip)\n", saveFile)
+		}
+
+		logger := newSessionLogger()
+		logger.logf("=== Disk Cloner v%s 本机模式 (保存文件) ===", version)
+		logger.logf("源磁盘: %s (%s)", srcDisk.Path, srcDisk.SizeHuman)
+		logger.logf("本机环境: OS=%q RootFS=%q Alpine=%v RAM=%v Detected=%v",
+			readiness.OSLine, readiness.RootFS, readiness.IsAlpine, readiness.IsRAM, readiness.Detected)
+		logger.logf("保存文件: %s", saveFile)
+		logger.logf("块大小: %s  压缩级别: %d  压缩方式: %s  零填充: 是  重建 initramfs: %v",
+			bs, compressLevel, compressTypeName(compressType), fixInitramfs)
+
+		if !autoYes {
+			fmt.Printf("将保存本机 %s 到文件 %s\n", srcDisk.Path, saveFile)
+			fmt.Print("确认继续? (yes/no): ")
+			var confirm string
+			fmt.Scanln(&confirm)
+			if confirm != "yes" && confirm != "y" {
+				fmt.Println("已取消")
+				return
+			}
+		}
+
+		logPath := saveFile + ".log"
+		if err := logger.open(logPath); err != nil {
+			fmt.Printf("  [!] 无法创建日志文件 %s: %v (继续无日志)\n", logPath, err)
+		} else {
+			fmt.Printf("  日志文件: %s\n", logPath)
+		}
+		execSaveToFile("本机", cliDisk, runner, saveFile, bs, true, logger)
+		logger.close()
+		return
+	}
+
+	// dst != ""
+	cfg := *dstCfg
+	if cfg.NeedsName() {
+		cfg.AppendName(makeFileName(host, srcDisk.Name, srcDisk.SizeHuman, dateStr, saveExtFor(compressLevel)))
+	}
+	fmt.Printf("目标: %s\n", storage.Describe(cfg))
+
+	logger := newSessionLogger()
+	logger.logf("=== Disk Cloner v%s 本机模式 (远程存储) ===", version)
+	logger.logf("源磁盘: %s (%s)", srcDisk.Path, srcDisk.SizeHuman)
+	logger.logf("本机环境: OS=%q RootFS=%q Alpine=%v RAM=%v Detected=%v",
+		readiness.OSLine, readiness.RootFS, readiness.IsAlpine, readiness.IsRAM, readiness.Detected)
+	logger.logf("存储目标: %s", storage.Describe(cfg))
+	logger.logf("块大小: %s  压缩级别: %d  压缩方式: %s  零填充: 是  重建 initramfs: %v",
+		bs, compressLevel, compressTypeName(compressType), fixInitramfs)
+
+	if !autoYes {
+		fmt.Printf("将读取本机 %s 并流式上传到 %s\n", srcDisk.Path, storage.Describe(cfg))
+		fmt.Print("确认继续? (yes/no): ")
+		var confirm string
+		fmt.Scanln(&confirm)
+		if confirm != "yes" && confirm != "y" {
+			fmt.Println("已取消")
+			return
+		}
+	}
+
+	dateDir := filepath.Join(".", dateStr)
+	os.MkdirAll(dateDir, 0755)
+	logPath := filepath.Join(dateDir, storage.BaseName(cfg)+".log")
+	if err := logger.open(logPath); err != nil {
+		fmt.Printf("  [!] 无法创建日志文件 %s: %v (继续无日志)\n", logPath, err)
+	} else {
+		fmt.Printf("  日志文件: %s\n", logPath)
+	}
+	execSaveToStorage(cliDisk, runner, cfg, bs, true, dateDir, logger)
+	logger.close()
+}
+
+// askStorageConn prompts for the storage backend and its connection
+// details. Returns ok=false when the user goes back (q).
+func askStorageConn() (storage.Config, bool) {
+	fmt.Println("  存储类型 — 输入序号选择:")
+	fmt.Println("  [1] SFTP (SSH 文件传输, 推荐)")
+	fmt.Println("  [2] FTP")
+	fmt.Println("  [3] WebDAV")
+	fmt.Println("  [4] S3 / 对象存储 (AWS S3, MinIO 等 S3 兼容)")
+	kind := cli.SelectOption("请输入序号", 1, 4)
+	if isBack(kind) {
+		return storage.Config{}, false
+	}
+	cfg := storage.Config{InsecureTLS: true}
+	switch kind {
+	case 1:
+		cfg.Kind = storage.KindSFTP
+		cfg.Host = cli.ReadInput("存储服务器 IP", "")
+		if cfg.Host == "" {
+			return cfg, false
+		}
+		cfg.Host = extractIP(cfg.Host)
+		cfg.Port = cli.ReadInt("SSH 端口", 22)
+		cfg.User = cli.ReadInput("用户名", "root")
+		cfg.Password = cli.ReadPassword("密码 (回车使用密钥)")
+	case 2:
+		cfg.Kind = storage.KindFTP
+		cfg.Host = cli.ReadInput("FTP 服务器 IP", "")
+		if cfg.Host == "" {
+			return cfg, false
+		}
+		cfg.Host = extractIP(cfg.Host)
+		cfg.Port = cli.ReadInt("端口", 21)
+		cfg.User = cli.ReadInput("用户名", "")
+		cfg.Password = cli.ReadPassword("密码")
+	case 3:
+		cfg.Kind = storage.KindWebDAV
+		for {
+			base := cli.ReadInput("WebDAV 地址 (如 https://nas.lan:5006/dav)", "")
+			if base == "" {
+				return cfg, false
+			}
+			if !strings.Contains(base, "://") {
+				fmt.Println("  [!] 地址需包含 http:// 或 https:// 前缀")
+				continue
+			}
+			cfg.URL = strings.TrimRight(base, "/") // file name appended later
+			break
+		}
+		cfg.User = cli.ReadInput("用户名", "")
+		cfg.Password = cli.ReadPassword("密码")
+	case 4:
+		cfg.Kind = storage.KindS3
+		cfg.Endpoint = cli.ReadInput("Endpoint (如 s3.amazonaws.com 或 minio.lan:9000)", "s3.amazonaws.com")
+		tlsInput := strings.ToLower(cli.ReadInput("使用 HTTPS? (回车=是, 输入n=否) [Y/n]", "y"))
+		cfg.UseTLS = tlsInput != "n" && tlsInput != "no"
+		cfg.Region = cli.ReadInput("Region", "us-east-1")
+		cfg.Bucket = cli.ReadInput("Bucket", "")
+		if cfg.Bucket == "" {
+			return cfg, false
+		}
+		cfg.PathStyle = strings.HasPrefix(cli.ReadInput("寻址方式 (1=虚拟主机, 2=path-style, MinIO/自建选 2)", "1"), "2")
+		cfg.AccessKey = cli.ReadInput("Access Key ID", "")
+		cfg.SecretKey = cli.ReadPassword("Secret Access Key")
+	}
+	return cfg, true
+}
+
+// fillDestPath asks for the destination file path/URL/key, pre-filled with
+// an auto-generated name. Returns false when the user enters nothing.
+func fillDestPath(cfg *storage.Config, defaultName string) bool {
+	switch cfg.Kind {
+	case storage.KindSFTP, storage.KindFTP:
+		p := cli.ReadInput("目标路径 (远程文件)", defaultName)
+		if p == "" {
+			return false
+		}
+		cfg.Path = p
+	case storage.KindWebDAV:
+		p := cli.ReadInput("目标 URL (完整文件地址)", cfg.URL+"/"+defaultName)
+		if p == "" {
+			return false
+		}
+		cfg.URL = p
+	case storage.KindS3:
+		k := cli.ReadInput("对象 Key", defaultName)
+		if k == "" {
+			return false
+		}
+		cfg.Key = k
+	}
+	return true
+}
+
+// askTransferSettings prompts for the settings shared by all save modes and
+// stores the compression choices in the package globals. Returns the block
+// size and the zero-fill choice.
+func askTransferSettings(logger *sessionLogger) (string, bool) {
+	blockSize := readBlockSize()
+	compressLevel = cli.AskCompressionLevel()
+	compressType = cli.AskCompressionType()
+	doZero := cli.ConfirmZero()
+	fixInitramfs = cli.AskFixInitramfs()
+	if logger != nil {
+		logger.logf("块大小: %s", blockSize)
+		logger.logf("压缩级别: %d  压缩方式: %s", compressLevel, compressTypeName(compressType))
+		logger.logf("零填充空闲空间: %v", doZero)
+		logger.logf("重建 initramfs: %v", fixInitramfs)
+	}
+	return blockSize, doZero
+}
+
+// execSaveToStorage runs the actual save-to-storage without prompts. The
+// image streams straight into the remote storage writer; only the small
+// .sha256/.size sidecars (and the .log) are written under sidecarDir.
+func execSaveToStorage(srcDisk cli.DiskItem, runner sshclient.Runner,
+	cfg storage.Config, blockSize string, doZero bool, sidecarDir string, logger *sessionLogger) {
+
+	desc := storage.Describe(cfg)
+	fmt.Println()
+	fmt.Printf("  正在连接 %s ...\n", desc)
+	fmt.Println()
+
+	totalStart := time.Now()
+	logger.logf("开始存储传输 (dd|%s -> 网络 -> %s)", compressTypeName(compressType), cfg.Kind)
+	logger.logf("开始时间: %s", totalStart.Format("2006-01-02 15:04:05"))
+
+	// Fail fast: Open validates credentials, path/bucket and permissions
+	// BEFORE the potentially hours-long zero-fill starts.
+	w, err := storage.Open(cfg)
+	if err != nil {
+		logger.logf("存储连接失败: %v", err)
+		fmt.Printf("  [!] 存储连接失败: %v\n", err)
+		return
+	}
+
+	job := clone.New(runner, clone.Params{
+		SourcePath:       srcDisk.Path,
+		TargetPath:       desc, // display only
+		SourceSize:       srcDisk.SizeBytes,
+		BlockSize:        blockSize,
+		ZeroFill:         doZero,
+		CompressionLevel: compressLevel,
+		CompressType:     compressType,
+		FixInitramfs:     fixInitramfs,
+	}, makeProgressFnWithLogger(logger))
+	job.SetLogFunc(func(format string, args ...interface{}) {
+		msg := fmt.Sprintf(format, args...)
+		fmt.Printf(format+"\n", args...)
+		logger.logf("  %s", msg)
+	})
+
+	runErr := job.RunToStream(w)
+	if runErr != nil {
+		logger.logf("传输失败: %v", runErr)
+		fmt.Printf("\n  传输失败: %v\n", runErr)
+		if abErr := w.Abort(); abErr != nil {
+			logger.logf("清理远端残留失败: %v", abErr)
+		} else {
+			fmt.Println("  [!] 远端未完成的上传已清理")
+		}
+		return
+	}
+	if err := w.Close(); err != nil {
+		logger.logf("上传收尾失败: %v", err)
+		fmt.Printf("\n  上传收尾失败: %v\n", err)
+		return
+	}
+	logger.logf("传输完成")
+
+	// Sidecars live next to nothing on the remote — write them locally so
+	// they can accompany the image when it is downloaded again.
+	base := storage.BaseName(cfg)
+	if job.ChecksumHex != "" {
+		writeChecksumFile(filepath.Join(sidecarDir, base), job.ChecksumHex)
+	}
+	clone.WriteSizeFile(filepath.Join(sidecarDir, base), srcDisk.SizeBytes)
+	logger.logf("校验/大小文件已生成(本地): %s.sha256 / %s.size", base, base)
+
+	fmt.Println()
+	fmt.Println("  ===============================================")
+	fmt.Printf("  传输完成! 总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
 	fmt.Println("  ===============================================")
 }
 
@@ -1330,13 +1875,16 @@ func (r RemoteReadiness) IsSafe() bool {
 	return r.Detected && r.IsAlpine && r.IsRAM
 }
 
-func checkRemoteReadiness(sshClient *sshclient.Client) RemoteReadiness {
+// checkRemoteReadiness probes whether the machine whose disk will be dd'd
+// (remote over SSH, or local in 本机模式) runs from RAM. `where` is the
+// display label for that machine ("远程" or "本机").
+func checkRemoteReadiness(runner sshclient.Runner, where string) RemoteReadiness {
 	script := `echo "OS=$(cat /etc/os-release 2>/dev/null | head -1)"
 echo "ROOTFS=$(df -T / 2>/dev/null | tail -1 | awk '{print $2}')"`
 
 	// Even on error, CombinedOutput usually returns partial output -
 	// parse what we can rather than silently giving up.
-	out, err := sshClient.CombinedOutput(script)
+	out, err := runner.CombinedOutput(script)
 
 	r := RemoteReadiness{}
 	for _, line := range strings.Split(out, "\n") {
@@ -1354,34 +1902,35 @@ echo "ROOTFS=$(df -T / 2>/dev/null | tail -1 | awk '{print $2}')"`
 
 	fmt.Println()
 	if !r.Detected {
-		fmt.Println("  [!] 无法检测远程环境 (os-release 或 df 读取失败)")
+		fmt.Printf("  [!] 无法检测%s环境 (os-release 或 df 读取失败)\n", where)
 		if err != nil {
 			fmt.Printf("      错误: %v\n", err)
 		}
-		fmt.Println("      无法确认远程是否处于 Alpine RAM OS,继续可能导致数据不一致")
+		fmt.Printf("      无法确认%s是否处于 Alpine RAM OS,继续可能导致数据不一致\n", where)
 	} else if r.IsAlpine && r.IsRAM {
-		fmt.Printf("  远程状态: Alpine Linux RAM OS (%s 根文件系统)\n", r.RootFS)
+		fmt.Printf("  %s状态: Alpine Linux RAM OS (%s 根文件系统)\n", where, r.RootFS)
 		fmt.Println("  磁盘分区未挂载,可以安全克隆。")
 	} else if r.IsAlpine && !r.IsRAM {
-		fmt.Println("  [!] 远程是 Alpine Linux 但根文件系统不是 tmpfs/overlay")
+		fmt.Printf("  [!] %s是 Alpine Linux 但根文件系统不是 tmpfs/overlay\n", where)
 		fmt.Printf("      当前根文件系统: %s\n", r.RootFS)
 		fmt.Println("      可能是安装到磁盘的 Alpine,继续克隆可能损坏数据!")
 	} else {
-		fmt.Printf("  [!] 远程操作系统: %s\n", r.OSLine)
+		fmt.Printf("  [!] %s操作系统: %s\n", where, r.OSLine)
 		fmt.Printf("  [!] 根文件系统: %s\n", r.RootFS)
-		fmt.Println("  [!] 远程不是 Alpine RAM OS! 如果远程系统在正常运行,")
+		fmt.Printf("  [!] %s不是 Alpine RAM OS! 如果系统在正常运行,\n", where)
 		fmt.Println("      克隆其系统盘可能导致数据不一致。")
 		fmt.Println()
-		fmt.Println("  建议先将远程服务器重启进入 Alpine RAM OS 后再克隆。")
+		fmt.Printf("  建议先将%s重启进入 Alpine RAM OS 后再克隆。\n", where)
 		fmt.Println("  参考 https://github.com/bin456789/reinstall 项目执行 bash reinstall.sh alpine --hold 1")
 	}
 	return r
 }
 
-// confirmUnsafeRemote asks the user to confirm proceeding when the remote
-// is not detected as Alpine RAM OS. Returns true if the user explicitly
-// accepts the risk (or if the remote is safe and no confirmation is needed).
-func confirmUnsafeRemote(r RemoteReadiness, autoYes bool) bool {
+// confirmUnsafeRemote asks the user to confirm proceeding when the machine
+// being imaged is not detected as Alpine RAM OS. Returns true if the user
+// explicitly accepts the risk (or if it is safe and no confirmation is
+// needed).
+func confirmUnsafeRemote(r RemoteReadiness, autoYes bool, where string) bool {
 	if r.IsSafe() {
 		return true
 	}
@@ -1391,7 +1940,7 @@ func confirmUnsafeRemote(r RemoteReadiness, autoYes bool) bool {
 	}
 	fmt.Println()
 	fmt.Println("  ─────────────────────────────────────────────")
-	return cli.Confirm("  远程不是 Alpine RAM OS,继续可能损坏远程数据。输入 yes 继续")
+	return cli.Confirm(fmt.Sprintf("  %s不是 Alpine RAM OS,继续可能损坏数据。输入 yes 继续", where))
 }
 
 func printFstabWarning(targetDisk string) {

@@ -150,7 +150,7 @@ func Connect(cfg Config) (*Client, error) {
 
 // Execute starts a command on the remote server and returns a Session
 // with Stdout and Stderr readers. The caller must call session.Close().
-func (c *Client) Execute(cmd string) (*Session, error) {
+func (c *Client) Execute(cmd string) (Session, error) {
 	session, err := c.conn.NewSession()
 	if err != nil {
 		return nil, fmt.Errorf("new session: %w", err)
@@ -173,17 +173,17 @@ func (c *Client) Execute(cmd string) (*Session, error) {
 		return nil, err
 	}
 
-	return &Session{
+	return &sshSession{
 		session: session,
-		Stdout:  stdout,
-		Stderr:  stderr,
+		stdout:  stdout,
+		stderr:  stderr,
 	}, nil
 }
 
 // ExecuteStdin starts a command on the remote and returns a session
 // with Stdin pipe for sending data to the remote command.
 // The caller must call session.Close() when done.
-func (c *Client) ExecuteStdin(cmd string) (*StdinSession, error) {
+func (c *Client) ExecuteStdin(cmd string) (Session, error) {
 	session, err := c.conn.NewSession()
 	if err != nil {
 		return nil, fmt.Errorf("new session: %w", err)
@@ -212,13 +212,11 @@ func (c *Client) ExecuteStdin(cmd string) (*StdinSession, error) {
 		return nil, err
 	}
 
-	return &StdinSession{
-		Session: &Session{
-			session: session,
-			Stdout:  stdout,
-			Stderr:  stderr,
-		},
-		Stdin: stdin,
+	return &sshSession{
+		session: session,
+		stdout:  stdout,
+		stderr:  stderr,
+		stdin:   stdin,
 	}, nil
 }
 
@@ -249,37 +247,61 @@ func (c *Client) IsConnected() bool {
 	return err == nil
 }
 
-type Session struct {
+// Raw exposes the underlying SSH client for protocols layered on top of SSH
+// (the SFTP storage backend opens its own subsystem session on it).
+func (c *Client) Raw() *ssh.Client {
+	return c.conn
+}
+
+// Runner executes shell commands on a host — either remotely over SSH
+// (Client) or locally via /bin/sh (internal/local, used when the tool
+// itself runs on the source machine in Alpine RAM OS). Both run the same
+// shell command strings, so the clone pipeline is agnostic to where it
+// executes.
+type Runner interface {
+	CombinedOutput(cmd string) (string, error)
+	Execute(cmd string) (Session, error)
+	ExecuteStdin(cmd string) (Session, error)
+	IsConnected() bool
+}
+
+// Session is a started command with accessible streams. Stdin() returns
+// nil for sessions created by Execute (only ExecuteStdin provides one).
+type Session interface {
+	Stdout() io.Reader
+	Stderr() io.Reader
+	Stdin() io.WriteCloser
+	Wait() error
+	Close() error
+	Signal(sig ssh.Signal) error
+}
+
+var (
+	_ Runner  = (*Client)(nil)
+	_ Session = (*sshSession)(nil)
+)
+
+// sshSession implements Session on top of an x/crypto/ssh channel.
+type sshSession struct {
 	session *ssh.Session
-	Stdout  io.Reader
-	Stderr  io.Reader
+	stdout  io.Reader
+	stderr  io.Reader
+	stdin   io.WriteCloser
 }
 
-// StdinSession wraps an SSH session that accepts stdin data.
-// Used for push/restore operations where local data is piped to the remote.
-type StdinSession struct {
-	*Session
-	Stdin io.WriteCloser
-}
+func (s *sshSession) Stdout() io.Reader     { return s.stdout }
+func (s *sshSession) Stderr() io.Reader     { return s.stderr }
+func (s *sshSession) Stdin() io.WriteCloser { return s.stdin }
 
-func (s *StdinSession) Close() {
-	if s.Stdin != nil {
-		s.Stdin.Close()
-	}
-	if s.Session != nil {
-		s.Session.Close()
-	}
-}
-
-func (s *Session) Wait() error {
+func (s *sshSession) Wait() error {
 	return s.session.Wait()
 }
 
-func (s *Session) Close() error {
+func (s *sshSession) Close() error {
 	return s.session.Close()
 }
 
-func (s *Session) Signal(sig ssh.Signal) error {
+func (s *sshSession) Signal(sig ssh.Signal) error {
 	return s.session.Signal(sig)
 }
 

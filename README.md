@@ -12,6 +12,7 @@
 - [模式 1 — 克隆到本地磁盘](#模式-1--克隆到本地磁盘)
 - [模式 2 — 保存为 gzip 文件](#模式-2--保存为-gzip-文件)
 - [模式 3 — 恢复文件到远程磁盘](#模式-3--恢复文件到远程磁盘)
+- [模式 4 — 传输到远程存储](#模式-4--传输到远程存储)
 - [命令行模式](#命令行模式)
 - [引导修复 (GRUB + initramfs)](#引导修复-grub--initramfs)
 - [关键功能详解](#关键功能详解)
@@ -31,6 +32,9 @@
 | 克隆 | 远程磁盘 → 本地磁盘 | 服务器迁移、对拷 |
 | 保存 | 远程磁盘 → 本地 .img.gz 文件（单盘或全部） | 系统备份、镜像存档 |
 | 恢复 | 本地 .img.gz 文件 → 远程磁盘 | 系统还原、批量部署 |
+| 传输 | 磁盘 → SFTP / FTP / WebDAV / S3 | 异地备份，镜像不占本地空间 |
+
+> 传输模式（模式 4）**直接运行在被克隆的服务器上**（Alpine RAM OS），读本机硬盘推送到存储服务，连 SSH 都不需要，镜像不占任何本地磁盘空间。
 
 ---
 
@@ -70,6 +74,9 @@ bash reinstall.sh alpine --hold 1
 | 模式 1 克隆 | ✅ 必须进入 RAM OS | ✅ 必须进入 RAM OS |
 | 模式 2 保存 | ✅ 必须进入 RAM OS | 不需要（本地接收文件） |
 | 模式 3 恢复 | 不需要（本地发送文件） | ✅ 必须进入 RAM OS |
+| 模式 4 传输 | ✅ 必须进入 RAM OS | 不需要（存储服务器正常在线即可） |
+
+> 模式 4 的"本机模式"下（`-l` 参数，或交互模式选 `[4]`），程序就运行在源服务器上，连 SSH 连接都不需要，只要存储服务可达。
 
 > 如果使用 Windows 运行程序做模式 2 或模式 3，Windows 端不需要进入 RAM OS（Windows 不做 dd 操作）。
 
@@ -717,6 +724,67 @@ exit; reboot
 
 ---
 
+## 模式 4 — 传输到远程存储
+
+把本机硬盘的 dd 流直接推到远程存储服务（SFTP / FTP / WebDAV / S3 兼容对象存储），**镜像不占用任何本地磁盘空间**。程序运行在被克隆的服务器上（Alpine RAM OS），本机硬盘只读，数据在内存中压缩后即刻上传。仅 Linux。
+
+### 数据流
+
+```
+本机 = 源服务器 (Alpine RAM OS)                                 远程存储
+┌──────────────────────────────────────────────┐
+│  dd if=/dev/sda | gzip -1                    │  ──▶  SFTP / FTP /
+│  SHA256 同步计算 (程序在内存里运行, 硬盘只读)   │        WebDAV / S3
+└──────────────────────────────────────────────┘
+```
+
+### 操作方式（二选一）
+
+- **交互模式**：启动程序后选操作模式 `[4] 读取本地硬盘传输到远程存储`，选中本机磁盘，再按提示填存储信息即可
+- **命令行模式**：
+
+```bash
+# 在源服务器上直接运行 (已进入 Alpine RAM OS)
+./disk-cloner -l /dev/sda -dst 'sftp://user:pass@nas.lan/backup/' -y
+./disk-cloner -l /dev/sda -dst 's3://AKID:SECRET@minio.lan:9000/bkt/img.gz?path=1' -y
+```
+
+零填充、重建 initramfs、SHA256 校验、失败清理等行为与模式 2 一致。
+
+> 程序必须运行在 Alpine RAM OS：启动后会先检测本机根文件系统，不是 tmpfs/overlay 时会要求确认。
+
+> 高级用法：命令行 `-dst` 也可以搭配 `-H/-s` 在一台中转机上运行（通过 SSH 读取远端磁盘后转发给存储），适合脚本化批量备份：
+> `disk-cloner -H 192.168.1.100 -p password -s /dev/sda -dst 'sftp://user:pass@nas.lan/backup/' -y`
+
+### 支持的存储类型
+
+| 类型 | 说明 |
+|------|------|
+| SFTP | SSH 文件传输（推荐）。密码或本地密钥认证；自动创建缺失的父目录 |
+| FTP | 内置 FTP 客户端（EPSV/PASV 被动模式，自动 MKD 建目录） |
+| WebDAV | HTTP PUT。自动探测服务器是否支持分块（chunked）上传；不支持时（如 nginx dav 模块）自动回退本地暂存后再 PUT |
+| S3 | AWS S3 及所有 S3 兼容存储（MinIO、Ceph 等）。手写 SigV4 签名 + 分片上传（起始 8 MiB，大镜像自动加倍到 256 MiB），支持虚拟主机与 path-style 两种寻址 |
+
+### 传输前自动校验
+
+连接存储服务器在零填充**之前**进行——账号密码错误、路径/桶不可写、权限不足会在几秒内报错返回，不会白白跑完几小时的零填充才发现存不了。
+
+### 传输失败自动清理
+
+传输中断（Ctrl+C）或失败时，程序会清理远端残留：SFTP/FTP 删除半截文件，WebDAV 发送 DELETE，S3 中止（Abort）整个分片上传任务。本地只会留下小的 `.sha256`、`.size`、`.log` 校验文件，与镜像文件分开保存（默认在当前目录的日期子目录里），下载镜像后可以用来校验完整性。
+
+### 操作步骤（交互模式）
+
+1. 启动程序（已运行在源机的 Alpine RAM OS 上），选择操作模式 `[4] 读取本地硬盘传输到远程存储`
+2. 选择本机源磁盘
+3. 选择存储类型并填入连接信息（IP/端口/用户名/密码等）
+4. 设置块大小、压缩级别、压缩方式、零填充、重建 initramfs（与模式 2 相同）
+5. 确认目标路径（SFTP/FTP 为远程路径，WebDAV 为完整 URL，S3 为对象 Key），回车使用自动命名
+6. 选择本地校验文件目录
+7. 确认后开始传输，进度条显示的是解压后的磁盘字节数
+
+---
+
 ## 命令行模式
 
 无需交互，直接通过参数执行操作。
@@ -732,6 +800,18 @@ disk-cloner -H 192.168.1.100 -p password -s /dev/sda -o auto -y
 
 # 恢复文件到远程磁盘
 disk-cloner -H 192.168.1.100 -p password -s /dev/sda -r backup.img.gz -y
+
+# 传输到远程存储（本机模式：在源服务器上直接运行, 需已进入源机 RAM OS）
+disk-cloner -l /dev/sda -dst 'sftp://user:pass@nas.lan/backup/' -y
+
+# 传输到 S3 兼容对象存储（path-style, MinIO）
+disk-cloner -l /dev/sda -dst 's3://AKID:SECRET@minio.lan:9000/bkt/img.gz?path=1' -y
+
+# 高级：在一台中转机上通过 SSH 读取远端磁盘后转发给存储（脚本化批量备份）
+disk-cloner -H 192.168.1.100 -p password -s /dev/sda -dst 'sftp://user:pass@nas.lan/backup/' -y
+
+# 本机模式：在源服务器上直接把本机硬盘传到远程存储（需已在源机 RAM OS 中）
+disk-cloner -l /dev/sda -dst 'sftp://user:pass@nas.lan/backup/' -y
 
 # 最高压缩
 disk-cloner -H 192.168.1.100 -p password -s /dev/sda -o auto -z 9 -y
@@ -752,6 +832,8 @@ disk-cloner -H 192.168.1.100 -p password -s /dev/sda -o auto -z 0 -y
 | `-t` | 目标磁盘路径（本地），如 `/dev/sda` | — |
 | `-o` | 保存为镜像文件，`auto` 自动命名+日期目录（`-z 0` 时为原始 `.img`，否则 gzip `.img.gz`） | — |
 | `-r` | 从 gzip 文件恢复到远程磁盘 | — |
+| `-dst` | 传输到远程存储，镜像不落本地磁盘。URL 格式见 [模式 4](#模式-4--传输到远程存储) | — |
+| `-l` | 本机磁盘作为源（程序直接运行在源机 RAM OS，仅 Linux；搭配 `-dst` 或 `-o`） | — |
 | `-bs` | dd 块大小 | 4M |
 | `-z` | 压缩级别 0-9（0=不压缩，1=最快，9=最小） | 1 |
 | `-y` | 跳过确认提示 | false |
@@ -992,15 +1074,16 @@ reboot
 
 ### Linux
 
-- 程序启动时自动 `apk add util-linux lvm2 e2fsprogs xfsprogs efibootmgr`
-- 三种模式全支持（克隆、保存、恢复）
+- 程序启动时自动 `apk add util-linux lvm2 efibootmgr`
+- 三种模式全支持（克隆、保存、恢复），外加远程存储传输（模式 4）
+- **本机模式**（`-l` 参数，或交互模式选 `[4]`）：程序运行在源机 Alpine RAM OS 上直接读本机硬盘推送到远程存储。模式 1/2/3 的流程不受影响
 - 输入使用 terminal raw 模式，退格/Ctrl+U/Ctrl+W 完整支持
 - 文件路径输入支持 Tab 补全
 - 默认输入值预填充到输入框中，可直接编辑
 
 ### Windows
 
-- **仅支持保存 [2] 和恢复 [3]**（不克隆硬盘，因为 Windows 没有 /dev/sda）
+- **支持保存 [2] 和恢复 [3]**（不克隆硬盘、不支持本机传输 [4]——这两项需要 Linux 块设备）
 - 不需要安装 SSH 或 gzip — Go 程序已内置
 - 恢复时回车弹出文件选择对话框，支持拖拽文件到 cmd 窗口
 - 保存时回车弹出文件夹浏览对话框
@@ -1024,6 +1107,7 @@ reboot
 | 文件校验 | SHA256 | 客户端 |
 | 引导修复（远程） | chroot + dracut / update-initramfs / mkinitcpio + grub2-install + grub2-mkconfig + fstab 清理 | 远程服务器（模式 1/3 自动执行） |
 | 引导修复（本地） | 同上，单独模式 `--fix-boot-disk` | 本地（目标机进 RAM OS 后） |
+| 远程存储（模式 4） | SFTP（pkg/sftp）、FTP（内置客户端）、WebDAV（HTTP PUT + 分块探测）、S3（手写 SigV4 分片上传） | 本地客户端（流式转发，不落盘） |
 | 文件系统一致性检查 | blkid 检测类型 + fsck.ext4 -fn（仅 ext 家族；xfs/btrfs 跳过） | 远程服务器 |
 | LVM 支持 | vgscan + vgchange -ay | 远程服务器 |
 | 进度刷新 | 异步 Sync，窗口最小化不影响 | 客户端 |
