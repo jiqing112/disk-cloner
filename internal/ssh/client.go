@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -14,6 +15,10 @@ import (
 type Client struct {
 	conn   *ssh.Client
 	Config Config
+
+	// probeMu/probePending serialize keepalive probes (see IsConnected).
+	probeMu      sync.Mutex
+	probePending bool
 
 	// ServerKeyFingerprint is the SHA256 fingerprint of the server's host
 	// key. Host keys are intentionally NOT pinned: the remote boots a fresh
@@ -237,14 +242,51 @@ func (c *Client) Close() {
 	}
 }
 
+// keepaliveTimeout bounds how long IsConnected waits for the keepalive
+// reply. Without it a silently dropped connection (no TCP RST — pulled
+// cable, NAT expiry) would block forever, hanging the transfer watchdog
+// that calls this on every stall check.
+const keepaliveTimeout = 10 * time.Second
+
 // IsConnected checks whether the SSH connection is still alive by sending
-// a keepalive request. Returns false if the connection has been dropped.
+// a keepalive request. Returns false if the connection has been dropped or
+// fails to answer within keepaliveTimeout. A probe that is still stuck from
+// an earlier call short-circuits to false: a healthy link answers a
+// keepalive promptly, and this avoids stacking a blocked goroutine per call.
 func (c *Client) IsConnected() bool {
 	if c.conn == nil {
 		return false
 	}
-	_, _, err := c.conn.SendRequest("keepalive@openssh.com", true, nil)
-	return err == nil
+	c.probeMu.Lock()
+	if c.probePending {
+		c.probeMu.Unlock()
+		return false
+	}
+	c.probePending = true
+	c.probeMu.Unlock()
+
+	ch := make(chan error, 1)
+	go func() {
+		_, _, err := c.conn.SendRequest("keepalive@openssh.com", true, nil)
+		ch <- err
+	}()
+	select {
+	case err := <-ch:
+		c.probeMu.Lock()
+		c.probePending = false
+		c.probeMu.Unlock()
+		return err == nil
+	case <-time.After(keepaliveTimeout):
+		// Report unhealthy now; clear the flag once the stuck probe
+		// eventually returns so a merely slow link recovers on its own.
+		go func() {
+			<-ch
+			c.probeMu.Lock()
+			c.probePending = false
+			c.probeMu.Unlock()
+		}()
+		return false
+	}
 }
 
 // Raw exposes the underlying SSH client for protocols layered on top of SSH

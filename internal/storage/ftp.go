@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -71,7 +72,11 @@ func (c *ftpClient) readResp() (int, string, error) {
 }
 
 func (c *ftpClient) cmd(format string, args ...interface{}) (int, string, error) {
-	fmt.Fprintf(c.w, format+"\r\n", args...)
+	command := fmt.Sprintf(format, args...)
+	if hasCtl(command) {
+		return 0, "", fmt.Errorf("ftp: command contains control characters")
+	}
+	fmt.Fprint(c.w, command+"\r\n")
 	if err := wFlush(c.w); err != nil {
 		return 0, "", err
 	}
@@ -280,17 +285,29 @@ type ftpWriter struct {
 	accepted chan struct{}
 	path     string
 
+	written atomic.Int64 // bytes handed to Write; compared against SIZE on finalize
+
 	mu       sync.Mutex
 	finished bool
 }
 
 func (w *ftpWriter) Write(p []byte) (int, error) {
-	return w.pw.Write(p)
+	n, err := w.pw.Write(p)
+	w.written.Add(int64(n))
+	return n, err
 }
 
-// Close finalizes the upload (server writes the file once it sees EOF). On
-// error the partial remote file is deleted before the control connection
-// goes away.
+// finalizeWait bounds how long Close waits for the server's final 226 after
+// EOF. Large images can take well over a few seconds to flush to the
+// server's disk, so this is deliberately generous.
+const finalizeWait = 60 * time.Second
+
+// Close finalizes the upload (server writes the file once it sees EOF). A
+// failed/stalled transfer deletes the partial remote file — unless the
+// outcome is unknown (final reply never arrived but the server may still
+// have completed the file), in which case the file is kept and the error
+// tells the user how to check, rather than risking deleting a complete
+// backup.
 func (w *ftpWriter) Close() error {
 	return w.finish(false)
 }
@@ -299,6 +316,19 @@ func (w *ftpWriter) Close() error {
 func (w *ftpWriter) Abort() error {
 	w.finish(true)
 	return nil
+}
+
+// remoteSize queries the uploaded file's size via SIZE (TYPE I active).
+func (c *ftpClient) remoteSize(path string) (int64, bool) {
+	code, msg, err := c.cmd("SIZE %s", path)
+	if err != nil || code != 213 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(msg), 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 func (w *ftpWriter) finish(abandon bool) error {
@@ -314,13 +344,37 @@ func (w *ftpWriter) finish(abandon bool) error {
 		w.pw.Close() // EOF → server finalizes
 	}
 	var err error
+	timedOut := false
 	select {
 	case err = <-w.done:
-	case <-time.After(3 * time.Second):
-		err = fmt.Errorf("ftp: transfer did not finish")
+	case <-time.After(finalizeWait):
+		timedOut = true
+		err = fmt.Errorf("ftp: no final reply from server within %s", finalizeWait)
 	}
-	if abandon || err != nil {
+	if abandon {
+		// Wait for the stor goroutine so the control connection is not used
+		// concurrently, then remove the partial file.
+		select {
+		case <-w.done:
+		case <-time.After(5 * time.Second):
+		}
 		w.c.cmd("DELE %s", w.path) // remove partial, ignore errors
+		w.c.quit()
+		return nil
+	}
+	if err != nil {
+		// Server kept working past EOF: verify via SIZE whether the file is
+		// complete before declaring failure. Only delete when the server
+		// itself reported a transfer error — never on an unknown outcome.
+		if timedOut {
+			if n, ok := w.c.remoteSize(w.path); ok && n == w.written.Load() {
+				w.c.quit()
+				return nil
+			}
+			w.c.quit()
+			return fmt.Errorf("%w (file kept on server — verify its size with SIZE/ls before trusting it)", err)
+		}
+		w.c.cmd("DELE %s", w.path) // server rejected the transfer: remove partial, ignore errors
 	}
 	w.c.quit()
 	return err

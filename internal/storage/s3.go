@@ -128,25 +128,21 @@ func (w *s3Writer) uploadPart() error {
 	}
 	body := w.buf
 	partNumber := w.partNum + 1
-	req, err := w.s3req(http.MethodPut, w.objectPath(), s3Query([2]string{"partNumber", fmt.Sprint(partNumber)}, [2]string{"uploadId", w.uploadID}), body)
-	if err != nil {
-		w.err = err
+	// The body is a fully buffered slice, so the request is replayable —
+	// retry transient transport/server failures instead of aborting hours
+	// of transfer on one hiccup.
+	var etag string
+	err := retry(3, func() error {
+		var err error
+		etag, err = w.doUploadPart(partNumber, body)
 		return err
-	}
-	resp, err := w.client.Do(req)
+	})
 	if err != nil {
-		w.err = fmt.Errorf("s3: upload part %d: %w", partNumber, err)
-		return w.err
-	}
-	etag := resp.Header.Get("ETag")
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		w.err = fmt.Errorf("s3: upload part %d: %s %s", partNumber, resp.Status, s3ErrorMessage(resp))
-		return w.err
-	}
-	if etag == "" {
-		w.err = fmt.Errorf("s3: upload part %d: no ETag in response", partNumber)
+		if serr, ok := err.(*httpOpError); ok {
+			w.err = fmt.Errorf("s3: upload part %d: %s %s", partNumber, serr.status, serr.detail)
+		} else {
+			w.err = fmt.Errorf("s3: upload part %d: %w", partNumber, err)
+		}
 		return w.err
 	}
 	w.etags = append(w.etags, etag)
@@ -160,6 +156,42 @@ func (w *s3Writer) uploadPart() error {
 	return nil
 }
 
+// httpOpError carries the HTTP status and server message for a failed
+// request so the retry wrapper can decide and the caller can format.
+type httpOpError struct {
+	status    string
+	detail    string
+	retryable bool
+}
+
+func (e *httpOpError) Error() string { return e.status + " " + e.detail }
+
+func (w *s3Writer) doUploadPart(partNumber int, body []byte) (string, error) {
+	req, err := w.s3req(http.MethodPut, w.objectPath(), s3Query([2]string{"partNumber", fmt.Sprint(partNumber)}, [2]string{"uploadId", w.uploadID}), body)
+	if err != nil {
+		return "", err
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return "", &httpOpError{status: "transport error", detail: err.Error(), retryable: true}
+	}
+	// Read the body (bounded) before closing so error details survive.
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return "", &httpOpError{
+			status:    resp.Status,
+			detail:    s3ErrorMessageBytes(respBody),
+			retryable: resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout,
+		}
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		return "", &httpOpError{status: "response", detail: "no ETag in response", retryable: true}
+	}
+	return etag, nil
+}
+
 func (w *s3Writer) complete() error {
 	var b bytes.Buffer
 	b.WriteString("<CompleteMultipartUpload>")
@@ -169,24 +201,45 @@ func (w *s3Writer) complete() error {
 	b.WriteString("</CompleteMultipartUpload>")
 	body := b.Bytes()
 
-	req, err := w.s3req(http.MethodPost, w.objectPath(), s3Query([2]string{"uploadId", w.uploadID}), body)
-	if err != nil {
-		return err
-	}
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("s3: complete upload: %w", err)
-	}
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	resp.Body.Close()
-	// A 200 can still carry an XML error body (S3 quirk) — check both.
-	if resp.StatusCode/100 != 2 || bytes.Contains(respBody, []byte("<Error>")) {
-		return fmt.Errorf("s3: complete upload: %s %s", resp.Status, s3ErrorMessageBytes(respBody))
-	}
-	return nil
+	// Complete is idempotent per upload ID and the body is buffered — safe
+	// to retry on transient failures (S3 may 500 while assembling parts).
+	return retry(3, func() error {
+		req, err := w.s3req(http.MethodPost, w.objectPath(), s3Query([2]string{"uploadId", w.uploadID}), body)
+		if err != nil {
+			return err
+		}
+		resp, err := w.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("s3: complete upload: %w", err)
+		}
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		// A 200 can still carry an XML error body (S3 quirk) — check both.
+		if resp.StatusCode/100 != 2 || bytes.Contains(respBody, []byte("<Error>")) {
+			return &httpOpError{
+				status:    resp.Status,
+				detail:    s3ErrorMessageBytes(respBody),
+				retryable: resp.StatusCode >= 500,
+			}
+		}
+		return nil
+	})
 }
 
 func (w *s3Writer) createMultipart() (string, error) {
+	var uploadID string
+	err := retry(3, func() error {
+		id, err := w.doCreateMultipart()
+		if err != nil {
+			return err
+		}
+		uploadID = id
+		return nil
+	})
+	return uploadID, err
+}
+
+func (w *s3Writer) doCreateMultipart() (string, error) {
 	req, err := w.s3req(http.MethodPost, w.objectPath(), s3Query([2]string{"uploads", ""}), nil)
 	if err != nil {
 		return "", err
@@ -198,7 +251,11 @@ func (w *s3Writer) createMultipart() (string, error) {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return "", fmt.Errorf("s3: create multipart upload: %s %s", resp.Status, s3ErrorMessageBytes(body))
+		return "", &httpOpError{
+			status:    resp.Status,
+			detail:    s3ErrorMessageBytes(body),
+			retryable: resp.StatusCode >= 500,
+		}
 	}
 	var parsed struct {
 		UploadID string `xml:"UploadId"`
@@ -391,8 +448,10 @@ func signS3(req *http.Request, access, secret, region, payloadHash string, now t
 }
 
 // canonicalQueryOf normalizes a raw query string into canonical form
-// (sorted by key, AWS-encoded values). Only used with queries built by
-// s3Query, but kept strict in case of future extras.
+// (sorted by key, AWS-encoded values). Query keys keep their original case:
+// SigV4 requires the canonical query to match the request byte-for-byte
+// (lowercasing breaks partNumber/uploadId on AWS and MinIO). Only used with
+// queries built by s3Query, but kept strict in case of future extras.
 func canonicalQueryOf(rawQuery string) string {
 	if rawQuery == "" {
 		return ""
@@ -404,7 +463,7 @@ func canonicalQueryOf(rawQuery string) string {
 		if err != nil {
 			decodedV = v
 		}
-		pairs = append(pairs, [2]string{strings.ToLower(k), decodedV})
+		pairs = append(pairs, [2]string{k, decodedV})
 	}
 	sort.Slice(pairs, func(i, j int) bool { return pairs[i][0] < pairs[j][0] })
 	var b strings.Builder
@@ -417,11 +476,6 @@ func canonicalQueryOf(rawQuery string) string {
 		b.WriteString(awsURIEncode(kv[1], true))
 	}
 	return b.String()
-}
-
-func s3ErrorMessage(resp *http.Response) string {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	return s3ErrorMessageBytes(body)
 }
 
 func s3ErrorMessageBytes(body []byte) string {

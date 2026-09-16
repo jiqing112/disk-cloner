@@ -26,12 +26,20 @@ func PrintHeader() {
 }
 
 func ReadInt(prompt string, def int) int {
-	str := ReadInput(prompt, strconv.Itoa(def))
-	val, err := strconv.Atoi(str)
-	if err != nil || val <= 0 {
-		return def
+	for {
+		str := ReadInput(prompt, strconv.Itoa(def))
+		if str == "" {
+			return def
+		}
+		val, err := strconv.Atoi(str)
+		if err == nil && val > 0 {
+			return val
+		}
+		fmt.Printf("  请输入一个正整数 (回车 = %d)\n", def)
+		if stdinClosed() {
+			return def
+		}
 	}
-	return val
 }
 
 func PrintSection(title string) {
@@ -65,6 +73,11 @@ func stdinClosed() bool {
 	}
 	return false
 }
+
+// StdinClosed is the exported form of stdinClosed: callers outside this
+// package (main's custom input loops) use it to bail out of their loops
+// when piped/redirected input is exhausted instead of spinning forever.
+func StdinClosed() bool { return stdinClosed() }
 
 func SelectDisk(prompt string, minIdx, maxIdx int) int {
 	for {
@@ -130,6 +143,7 @@ func ConfirmZero() bool {
 }
 
 // AskCompressionLevel prompts the user to choose gzip compression level.
+// Invalid input re-prompts instead of silently falling back to the default.
 func AskCompressionLevel() int {
 	fmt.Println("  压缩级别:")
 	fmt.Println("    0 = 不压缩 (局域网快速, 节省远程 CPU)")
@@ -137,25 +151,40 @@ func AskCompressionLevel() int {
 	fmt.Println("    6 = 均衡 (中等压缩率)")
 	fmt.Println("    9 = 最小 (最高压缩, 费 CPU)")
 	fmt.Println("    回车使用默认值 1")
-	input := ReadInput("  压缩级别", "1")
-	val, err := strconv.Atoi(input)
-	if err != nil || val < 0 || val > 9 {
-		return 1
+	for {
+		input := ReadInput("  压缩级别", "1")
+		val, err := strconv.Atoi(input)
+		if err == nil && val >= 0 && val <= 9 {
+			return val
+		}
+		fmt.Println("  请输入 0-9 之间的数字 (回车 = 1)")
+		if stdinClosed() {
+			return 1
+		}
 	}
-	return val
 }
 
 // AskCompressionType prompts the user to choose compression algorithm.
-// Returns 0 = gzip, 1 = pigz (multi-threaded).
+// Returns 0 = gzip, 1 = pigz (multi-threaded). Invalid input re-prompts.
 func AskCompressionType() int {
 	fmt.Println("  压缩方式:")
 	fmt.Println("    1 = gzip (单核压缩, 兼容性最广)")
 	fmt.Println("    2 = pigz (多核压缩, 速度更快, 需远程安装)")
-	input := ReadInput("  压缩方式", "1")
-	if input == "2" {
-		return 1
+	for {
+		input := ReadInput("  压缩方式", "1")
+		switch input {
+		case "":
+			return 0
+		case "1":
+			return 0
+		case "2":
+			return 1
+		}
+		fmt.Println("  请输入 1 或 2 (回车 = 1)")
+		if stdinClosed() {
+			return 0
+		}
 	}
-	return 0
 }
 
 // AskFixInitramfs asks whether to rebuild initramfs for cross-hardware boot.

@@ -2,6 +2,7 @@ package disk
 
 import (
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -27,18 +28,23 @@ type DiskInfo struct {
 }
 
 type LsblkDevice struct {
-	Name       string        `json:"name"`
-	Size       json.Number   `json:"size"`
-	Type       string        `json:"type"`
-	Mountpoint *string       `json:"mountpoint"`
-	Model      *string       `json:"model"`
-	Serial     *string       `json:"serial"`
-	Tran       *string       `json:"tran"`
-	Rota       *bool         `json:"rota"`
-	Rm         *bool         `json:"rm"`
-	Fstype     *string       `json:"fstype"`
-	Label      *string       `json:"label"`
-	Children   []LsblkDevice `json:"children"`
+	Name string      `json:"name"`
+	Size json.Number `json:"size"`
+	Type string      `json:"type"`
+	// Mountpoint is the legacy singular field: on util-linux ≥ 2.37 it can
+	// be null when a device has multiple mountpoints (bind mounts, btrfs
+	// subvolumes) — mountpoints below is the authoritative array then.
+	// Pointers throughout because lsblk emits null for absent values.
+	Mountpoint  *string       `json:"mountpoint"`
+	Mountpoints []*string     `json:"mountpoints"`
+	Model       *string       `json:"model"`
+	Serial      *string       `json:"serial"`
+	Tran        *string       `json:"tran"`
+	Rota        *bool         `json:"rota"`
+	Rm          *bool         `json:"rm"`
+	Fstype      *string       `json:"fstype"`
+	Label       *string       `json:"label"`
+	Children    []LsblkDevice `json:"children"`
 }
 
 type LsblkOutput struct {
@@ -50,104 +56,176 @@ var systemMountPoints = map[string]bool{
 }
 
 func GetLocalDisks() ([]DiskInfo, error) {
-	cmd := exec.Command("lsblk", "-Jb", "-o", "NAME,SIZE,TYPE,MOUNTPOINT,MODEL,SERIAL,TRAN,ROTA,RM,FSTYPE,LABEL")
-	out, err := cmd.Output()
+	// MOUNTPOINTS (plural) carries every mount of a device; older lsblk
+	// builds reject the unknown column, so fall back to the classic set.
+	out, err := exec.Command("lsblk", "-Jb", "-o",
+		"NAME,SIZE,TYPE,MOUNTPOINTS,MOUNTPOINT,MODEL,SERIAL,TRAN,ROTA,RM,FSTYPE,LABEL").Output()
 	if err != nil {
-		return nil, err
+		out, err = exec.Command("lsblk", "-Jb", "-o",
+			"NAME,SIZE,TYPE,MOUNTPOINT,MODEL,SERIAL,TRAN,ROTA,RM,FSTYPE,LABEL").Output()
+	}
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			return nil, fmt.Errorf("lsblk: %v: %s", err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("lsblk: %w", err)
 	}
 	return ParseJSON(string(out))
 }
 
+// ParseJSON parses lsblk -J output into DiskInfo records.
 func ParseJSON(raw string) ([]DiskInfo, error) {
 	var output LsblkOutput
 	if err := json.Unmarshal([]byte(raw), &output); err != nil {
 		return nil, err
 	}
-	return processDevices(output.Blockdevices), nil
+	var result []DiskInfo
+	for _, dev := range output.Blockdevices {
+		// ram/zram/loop devices have no business being dd sources or
+		// targets (loop already reports its own type; ram0 reports "disk").
+		if isVirtualDevice(dev.Name) {
+			continue
+		}
+		info := processDevice(dev, nil)
+		if info != nil {
+			result = append(result, *info)
+		}
+	}
+	return result, nil
 }
 
-func processDevices(devices []LsblkDevice) []DiskInfo {
-	var result []DiskInfo
+func isVirtualDevice(name string) bool {
+	for _, p := range []string{"loop", "ram", "zram"} {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
 
-	for _, dev := range devices {
-		sizeBytes, _ := dev.Size.Int64()
-		mp := ""
-		if dev.Mountpoint != nil {
-			mp = *dev.Mountpoint
-		}
-		model := ""
-		if dev.Model != nil {
-			model = *dev.Model
-		}
-		serial := ""
-		if dev.Serial != nil {
-			serial = *dev.Serial
-		}
-		tran := ""
-		if dev.Tran != nil {
-			tran = *dev.Tran
-		}
-		fstype := ""
-		if dev.Fstype != nil {
-			fstype = *dev.Fstype
-		}
-		label := ""
-		if dev.Label != nil {
-			label = *dev.Label
-		}
-
-		rota := false
-		if dev.Rota != nil {
-			rota = *dev.Rota
-		}
-		removable := false
-		if dev.Rm != nil {
-			removable = *dev.Rm
-		}
-
-		path := "/dev/" + dev.Name
-
-		disk := DiskInfo{
-			Name:       dev.Name,
-			Path:       path,
-			SizeBytes:  sizeBytes,
-			SizeHuman:  FormatBytes(sizeBytes),
-			Type:       dev.Type,
-			Mountpoint: mp,
-			Model:      model,
-			Serial:     serial,
-			Tran:       tran,
-			Rota:       rota,
-			Removable:  removable,
-			Fstype:     fstype,
-			Label:      label,
-			IsMounted:  mp != "",
-			IsSystem:   false,
-			Children:   []DiskInfo{},
-		}
-
-		if mp != "" {
-			if systemMountPoints[mp] || strings.HasPrefix(mp, "/boot") {
-				disk.IsSystem = true
-			}
-		}
-
-		if len(dev.Children) > 0 {
-			disk.Children = processDevices(dev.Children)
-			for _, child := range disk.Children {
-				if child.IsSystem {
-					disk.IsSystem = true
-				}
-				if child.IsMounted {
-					disk.IsMounted = true
-				}
-			}
-		}
-
-		result = append(result, disk)
+func processDevice(dev LsblkDevice, parentRemovable *bool) *DiskInfo {
+	sizeBytes, err := dev.Size.Int64()
+	if err != nil {
+		// lsblk -b always emits byte counts; a non-numeric size means
+		// malformed output — drop the device instead of offering a
+		// silent "0 B" disk.
+		return nil
+	}
+	mps := allMountpoints(dev)
+	model := ""
+	if dev.Model != nil {
+		model = *dev.Model
+	}
+	serial := ""
+	if dev.Serial != nil {
+		serial = *dev.Serial
+	}
+	tran := ""
+	if dev.Tran != nil {
+		tran = *dev.Tran
+	}
+	fstype := ""
+	if dev.Fstype != nil {
+		fstype = *dev.Fstype
+	}
+	label := ""
+	if dev.Label != nil {
+		label = *dev.Label
 	}
 
-	return result
+	rota := false
+	if dev.Rota != nil {
+		rota = *dev.Rota
+	}
+	// Partitions normally carry the same rm flag as their disk; inherit it
+	// when the row lacks one so removable-disk logic works per-partition.
+	removable := false
+	switch {
+	case dev.Rm != nil:
+		removable = *dev.Rm
+	case parentRemovable != nil:
+		removable = *parentRemovable
+	}
+
+	path := "/dev/" + dev.Name
+
+	mp := ""
+	if len(mps) > 0 {
+		mp = mps[0]
+	}
+
+	disk := DiskInfo{
+		Name:       dev.Name,
+		Path:       path,
+		SizeBytes:  sizeBytes,
+		SizeHuman:  FormatBytes(sizeBytes),
+		Type:       dev.Type,
+		Mountpoint: mp,
+		Model:      model,
+		Serial:     serial,
+		Tran:       tran,
+		Rota:       rota,
+		Removable:  removable,
+		Fstype:     fstype,
+		Label:      label,
+		IsMounted:  len(mps) > 0,
+		IsSystem:   false,
+		Children:   []DiskInfo{},
+	}
+
+	for _, m := range mps {
+		if systemMountPoints[m] || strings.HasPrefix(m, "/boot") {
+			disk.IsSystem = true
+			break
+		}
+	}
+
+	for _, childDev := range dev.Children {
+		child := processDevice(childDev, &removable)
+		if child == nil {
+			continue
+		}
+		disk.Children = append(disk.Children, *child)
+		if child.IsSystem {
+			disk.IsSystem = true
+		}
+		if child.IsMounted {
+			disk.IsMounted = true
+		}
+	}
+
+	// Conservative safety net for the dd-target listing: a mounted
+	// partition on a non-removable disk almost always means a running
+	// system — flag it as such even when the mountpoint is somewhere
+	// unexpected (/var/lib/docker, /home, ...).
+	if !disk.IsSystem && disk.IsMounted && !removable {
+		disk.IsSystem = true
+	}
+
+	return &disk
+}
+
+// allMountpoints merges the legacy singular mountpoint with the plural
+// mountpoints array, dropping nulls and duplicates.
+func allMountpoints(dev LsblkDevice) []string {
+	seen := map[string]bool{}
+	var mps []string
+	add := func(s string) {
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		mps = append(mps, s)
+	}
+	if dev.Mountpoint != nil {
+		add(*dev.Mountpoint)
+	}
+	for _, m := range dev.Mountpoints {
+		if m != nil {
+			add(*m)
+		}
+	}
+	return mps
 }
 
 func FindDisk(disks []DiskInfo, path string) *DiskInfo {

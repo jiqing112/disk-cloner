@@ -6,6 +6,7 @@ package storage
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Supported storage backends.
@@ -51,8 +53,13 @@ type Config struct {
 
 	// InsecureTLS skips certificate verification for https (webdav/s3).
 	// The tool's SSH layer likewise does not pin host keys; these transfers
-	// are meant for trusted networks.
+	// are meant for trusted networks. Set via the tlsverify=1 URL param or
+	// the -tls-verify CLI flag.
 	InsecureTLS bool
+
+	// Logf, when set, receives backend warnings (e.g. the WebDAV spool
+	// fallback) during Open. Optional.
+	Logf func(format string, args ...interface{})
 }
 
 // Writer streams bytes to the destination. Close finalizes the upload
@@ -177,6 +184,16 @@ func ParseURL(raw string) (Config, error) {
 		cfg.User = u.User.Username()
 		cfg.Password, _ = u.User.Password()
 	}
+	// tlsverify=1 opts into certificate verification for https endpoints
+	// (davs/s3). Default remains insecure — see the InsecureTLS docs.
+	q := u.Query()
+	if q.Get("tlsverify") == "1" {
+		cfg.InsecureTLS = false
+	}
+	if u.User != nil {
+		cfg.User = u.User.Username()
+		cfg.Password, _ = u.User.Password()
+	}
 	switch strings.ToLower(u.Scheme) {
 	case "sftp":
 		cfg.Kind = KindSFTP
@@ -210,6 +227,10 @@ func ParseURL(raw string) (Config, error) {
 		if cfg.Endpoint == "" {
 			return cfg, fmt.Errorf("s3 URL needs an endpoint host")
 		}
+		// s3://access:secret@endpoint/... — userinfo carries the object
+		// storage credentials.
+		cfg.AccessKey = cfg.User
+		cfg.SecretKey = cfg.Password
 		q := u.Query()
 		cfg.Region = q.Get("region")
 		cfg.PathStyle = q.Get("path") == "1"
@@ -234,6 +255,14 @@ func ParseURL(raw string) (Config, error) {
 	default:
 		return cfg, fmt.Errorf("unsupported storage scheme %q (use sftp:// ftp:// dav:// davs:// s3://)", u.Scheme)
 	}
+	// Percent-decoded credentials/paths can carry CR/LF/NUL that would allow
+	// control-channel or header injection on the wire — reject them here.
+	for _, s := range []string{cfg.User, cfg.Password, cfg.Path, cfg.URL,
+		cfg.Endpoint, cfg.Bucket, cfg.Key, cfg.AccessKey, cfg.SecretKey} {
+		if hasCtl(s) {
+			return cfg, fmt.Errorf("storage URL components must not contain control characters")
+		}
+	}
 	return cfg, nil
 }
 
@@ -256,4 +285,39 @@ func httpClient(insecure bool) *http.Client {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
 		},
 	}
+}
+
+// retry runs fn up to n times with linear backoff, retrying only transient
+// failures (transport errors, HTTP 5xx / 408 signalled via *s3PartError).
+// Non-retryable errors return immediately. Used for buffered, replayable
+// requests — never for the live image stream itself.
+func retry(n int, fn func() error) error {
+	var err error
+	for attempt := 0; attempt < n; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		var oe *httpOpError
+		if !errors.As(err, &oe) || !oe.retryable {
+			return err
+		}
+	}
+	return err
+}
+
+// hasCtl reports whether s contains characters that would break line- or
+// header-oriented protocols (FTP control commands, HTTP headers): C0 controls,
+// DEL. Percent-decoding can smuggle these past url.Parse, so every decoded
+// config component is checked before use.
+func hasCtl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
 }

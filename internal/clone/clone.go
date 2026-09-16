@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"regexp"
@@ -111,12 +112,34 @@ func validateBS(bs string) error {
 	if !safeBSRe.MatchString(bs) {
 		return fmt.Errorf("invalid block size: %q", bs)
 	}
+	numStr := strings.TrimRight(bs, "KMGkmg")
+	n, err := strconv.ParseInt(numStr, 10, 64)
+	if err != nil || n <= 0 {
+		return fmt.Errorf("invalid block size: %q (must be > 0)", bs)
+	}
+	mult := int64(1)
+	switch unicode.ToUpper(rune(bs[len(bs)-1])) {
+	case 'K':
+		mult = 1024
+	case 'M':
+		mult = 1024 * 1024
+	case 'G':
+		mult = 1024 * 1024 * 1024
+	}
+	if n > math.MaxInt64/mult {
+		return fmt.Errorf("invalid block size: %q overflows the byte counter", bs)
+	}
 	return nil
 }
 
 // bsToBytes converts human-readable block size to bytes string.
 // Busybox dd does NOT support suffixes like "4M" — only plain byte counts.
+// Callers must validateBS first; this function assumes a validated input
+// and falls back to the 4 MiB default on anything unexpected.
 func bsToBytes(bs string) string {
+	if err := validateBS(bs); err != nil {
+		return "4194304"
+	}
 	if bs == "" {
 		return "4194304"
 	}
@@ -146,14 +169,30 @@ func bsToBytes(bs string) string {
 }
 
 // GzipUncompressedSize reads the uncompressed size from a .gz file.
-// Returns 0 if unknown (file > 4 GB or not a valid gzip).
+// Returns 0 if unknown (image ≥ 4 GiB without a .size sidecar — the gzip
+// ISIZE footer wraps modulo 2^32 above 4 GiB and cannot be disambiguated
+// from the compressed file alone). Prefer ReadSizeFile when a sidecar
+// exists.
 func GzipUncompressedSize(path string) int64 {
 	return readGzipISize(path)
 }
 
+// gzipMaxCompressRatio is deflate's worst-case expansion ratio (~1032:1
+// for long zero runs). If even a maximally-compressible image of 4 GiB
+// would produce a compressed file larger than the one we are reading, the
+// true uncompressed size is provably below 4 GiB and the footer is exact.
+const gzipMaxCompressRatio = 1032
+
 // readGzipISize reads the last 4 bytes of a gzip file to get the
 // uncompressed data size (ISIZE, stored as uint32 LE modulo 2^32).
-// For files <= 4 GB this is exact; for larger files it wraps around.
+//
+// The footer is only exact for images < 4 GiB; above that it wraps modulo
+// 2^32 and the compressed file alone carries no way to recover the true
+// size (a zero-filled 6 GiB disk and a 2 GiB disk can produce byte-identical
+// footers vs. sizes). Guessing here made restore show wrong progress and
+// report false "truncated restore" errors, so this returns 0 ("unknown")
+// whenever wraparound is possible. Callers should prefer the exact .size
+// sidecar written at save time (ReadSizeFile).
 func readGzipISize(path string) int64 {
 	f, err := os.Open(path)
 	if err != nil {
@@ -174,19 +213,16 @@ func readGzipISize(path string) int64 {
 	// ISIZE is stored little-endian, uint32
 	size := int64(uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24)
 
-	// If the uncompressed size is larger than 4 GB, ISIZE wraps around.
-	// Heuristic to detect ISIZE wrap (uncompressed size > 4 GB):
-	// If the claimed ISIZE is less than 2x the compressed file size,
-	// the actual uncompressed data probably exceeded 4 GB and ISIZE wrapped.
-	// gzip cannot normally achieve >50% compression on disk images, so
-	// ISIZE < compressedSize * 2 is a reliable indicator of wrapping.
-	info, _ := f.Stat()
-	compressedSize := info.Size()
-	if compressedSize > 512*1024*1024 && size < compressedSize*2 {
-		return 0 // likely wrapped
+	info, err := f.Stat()
+	if err != nil || info.Size() <= 0 {
+		return 0
 	}
-
-	return size
+	// true size ≤ gzipMaxCompressRatio × compressed; when even that upper
+	// bound stays under 4 GiB the footer cannot have wrapped.
+	if info.Size() < (4<<30)/gzipMaxCompressRatio {
+		return size
+	}
+	return 0 // likely (or possibly) wrapped — unknown
 }
 
 // IsGzipFile reports whether the file starts with the gzip magic bytes (1f 8b).
@@ -293,6 +329,54 @@ func parseDdBytesRead(stderr string) int64 {
 	return -1
 }
 
+// mountedSourcePartitions lists the mount points of all partitions (and
+// dm/LV devices) belonging to the source disk, parsed locally from
+// /proc/mounts so the matching logic is testable and injection-safe.
+func (j *CloneJob) mountedSourcePartitions(src string) []string {
+	diskBase := src
+	if i := strings.LastIndex(src, "/"); i >= 0 {
+		diskBase = src[i+1:]
+	}
+	out, _ := j.runner.CombinedOutput("cat /proc/mounts 2>/dev/null")
+	var mounted []string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if devMatchesSourceDisk(fields[0], diskBase) {
+			mounted = append(mounted, fields[1])
+		}
+	}
+	return mounted
+}
+
+// devMatchesSourceDisk reports whether a /proc/mounts device field is a
+// partition of (or an LVM logical volume on) the disk named diskBase.
+// The mapper check requires the disk name at an LV-name word boundary so
+// an unrelated volume merely containing it as a substring (disk "sda",
+// LV "vg-mysda2") does not match.
+func devMatchesSourceDisk(dev, diskBase string) bool {
+	if dev == "" || diskBase == "" {
+		return false
+	}
+	if ok, _ := regexp.MatchString(`^/dev/`+regexp.QuoteMeta(diskBase)+`(p[0-9]+|[0-9]+)$`, dev); ok {
+		return true
+	}
+	if strings.HasPrefix(dev, "/dev/mapper/") {
+		segs := strings.Split(strings.TrimPrefix(dev, "/dev/mapper/"), "-")
+		lv := segs[len(segs)-1]
+		if lv == diskBase {
+			return true
+		}
+		if strings.HasPrefix(lv, diskBase) && len(lv) > len(diskBase) {
+			suffix := lv[len(diskBase)]
+			return suffix == 'p' || (suffix >= '0' && suffix <= '9')
+		}
+	}
+	return false
+}
+
 // preReadWarnIfMounted flushes pending writes on the source and warns loudly
 // if any partition of the source disk is still mounted (i.e. the OS is live
 // and writing concurrently with our dd read — produces a torn image).
@@ -301,33 +385,12 @@ func parseDdBytesRead(stderr string) int64 {
 // "Journal has aborted" corruption seen after restoring a backup that was
 // taken while the source system was live.
 func (j *CloneJob) preReadWarnIfMounted() {
-	src := j.params.SourcePath
-
 	// Flush all pending writes on the remote so whatever is in the page
 	// cache hits the disk before we start reading. Cheap insurance.
 	j.logFn("  Flushing remote filesystem buffers (sync)...")
 	j.runner.CombinedOutput("sync")
 
-	// Detect partitions of the source disk that are still mounted.
-	// Partition suffix is (p?[0-9]+) to cover both sda1 and nvme0n1p1 styles.
-	diskBase := src
-	if i := strings.LastIndex(src, "/"); i >= 0 {
-		diskBase = src[i+1:]
-	}
-	out, _ := j.runner.CombinedOutput(fmt.Sprintf(
-		`for mp in $(grep -oE '/dev/(mapper/)?%s(p[0-9]+|[0-9]+)' /proc/mounts 2>/dev/null | sort -u); do echo "MOUNTED $mp"; done; `+
-			`grep -E '(/dev/%s(p[0-9]+|[0-9]+)|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print "MOUNT "$2}'`,
-		diskBase, diskBase, diskBase))
-	mounted := []string{}
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "MOUNT") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				mounted = append(mounted, fields[1])
-			}
-		}
-	}
+	mounted := j.mountedSourcePartitions(j.params.SourcePath)
 	if len(mounted) > 0 {
 		j.logFn("  [!] 警告: 源磁盘的以下分区仍处于挂载状态:")
 		for _, mp := range mounted {
@@ -335,7 +398,7 @@ func (j *CloneJob) preReadWarnIfMounted() {
 		}
 		j.logFn("  [!] 远程系统可能仍在运行,备份的镜像可能不一致!")
 		j.logFn("  [!] 强烈建议先重启进入 Alpine RAM OS 再备份")
-		j.logFn("  [!] 将继续备份,但恢复后可能出现 ext4 journal/损坏错误")
+		j.logFn("  [!] 若克隆前仍无法卸载这些分区,任务将在 dd 开始前中止")
 	}
 }
 
@@ -360,36 +423,14 @@ func (j *CloneJob) preReadSyncAndVerify(src string) error {
 	// Give the kernel a moment to finish flushing.
 	time.Sleep(2 * time.Second)
 
-	diskBase := src
-	if i := strings.LastIndex(src, "/"); i >= 0 {
-		diskBase = src[i+1:]
-	}
-	out, _ := j.runner.CombinedOutput(fmt.Sprintf(
-		`grep -E '(/dev/%s(p[0-9]+|[0-9]+)|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print $2}'`,
-		diskBase, diskBase))
-	stillMounted := []string{}
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			stillMounted = append(stillMounted, line)
-		}
-	}
+	stillMounted := j.mountedSourcePartitions(src)
 	if len(stillMounted) > 0 {
 		// Try one more regular umount (NOT lazy). If it fails we must abort.
 		for _, mp := range stillMounted {
-			j.runner.CombinedOutput(fmt.Sprintf("umount %s 2>/dev/null", mp))
+			j.runner.CombinedOutput("umount " + shellQuote(mp) + " 2>/dev/null")
 		}
 		// Re-check.
-		out2, _ := j.runner.CombinedOutput(fmt.Sprintf(
-			`grep -E '(/dev/%s(p[0-9]+|[0-9]+)|/dev/mapper/.*%s)' /proc/mounts 2>/dev/null | awk '{print $2}'`,
-			diskBase, diskBase))
-		stillMounted = stillMounted[:0]
-		for _, line := range strings.Split(out2, "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" {
-				stillMounted = append(stillMounted, line)
-			}
-		}
+		stillMounted = j.mountedSourcePartitions(src)
 	}
 	if len(stillMounted) > 0 {
 		j.logFn("  [!] 严重: 源盘的以下分区无法卸载,dd 读到的镜像将不一致:")
@@ -479,6 +520,47 @@ func (j *CloneJob) compressToolName() string {
 		return "pigz"
 	}
 	return "gzip"
+}
+
+// CompressToolName exposes compressToolName so callers can log which
+// compressor actually ran (pigz silently falls back to gzip when the
+// remote has no pigz).
+func (j *CloneJob) CompressToolName() string { return j.compressToolName() }
+
+// watchInterrupt handles Ctrl+C during a transfer. First press signals the
+// remote process and marks cancelled; second press force-exits. os.Exit
+// skips deferred cleanups, so onForceExit (source-disk unfreeze for
+// save/clone paths) runs first with a hard deadline — a remote disk left
+// in blockdev --freeze state hangs all later I/O until it reboots.
+func (j *CloneJob) watchInterrupt(session sshclient.Session, done <-chan struct{}, cancelled *atomic.Bool, onForceExit func()) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	for {
+		select {
+		case <-sigCh:
+			if !cancelled.Load() {
+				cancelled.Store(true)
+				_ = session.Signal(ssh.SIGTERM)
+				j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
+			} else {
+				if onForceExit != nil {
+					fin := make(chan struct{})
+					go func() {
+						defer close(fin)
+						onForceExit()
+					}()
+					select {
+					case <-fin:
+					case <-time.After(5 * time.Second):
+					}
+				}
+				os.Exit(130)
+			}
+		case <-done:
+			return
+		}
+	}
 }
 
 // Run clones remote disk to a local block device.
@@ -741,26 +823,10 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 
 	done := make(chan struct{})
 	defer close(done)
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
-	defer signal.Stop(sigCh)
 	var cancelled atomic.Bool
-	go func() {
-		for {
-			select {
-			case <-sigCh:
-				if !cancelled.Load() {
-					cancelled.Store(true)
-					_ = session.Signal(ssh.SIGTERM)
-					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
-				} else {
-					os.Exit(130)
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
+	// Restore writes a remote disk but never freezes a source; no cleanup
+	// needed on force-exit.
+	go j.watchInterrupt(session, done, &cancelled, nil)
 
 	// Copy decompressed data to remote dd via SSH stdin
 	written, copyErr := j.copyWithProgress(session.Stdin(), src, &cancelled, session)
@@ -927,6 +993,8 @@ for dev in $all_devices; do
       sleep 5
     done
     wait $PID
+    fill_rc=$?
+    if [ $fill_rc -ne 0 ]; then echo "DDFAIL $dev rc=$fill_rc"; fi
     rm -f "$mp/.zero_fill"
     sync
     # CRITICAL: must fully unmount before dd reads the source disk.
@@ -966,6 +1034,7 @@ echo "DONE"
 	scanner := bufio.NewScanner(session.Stdout())
 	filled := 0
 	skipped := 0
+	var fillFailures []string
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if strings.HasPrefix(line, "FILL ") {
@@ -983,7 +1052,13 @@ echo "DONE"
 			j.logFn("    Skipped: %s", strings.TrimPrefix(line, "SKIP "))
 			skipped++
 		} else if strings.HasPrefix(line, "UMOUNTFAIL ") {
-			j.logFn("  [!] Warning: could not unmount %s after zero-fill", strings.TrimPrefix(line, "UMOUNTFAIL "))
+			dev := strings.TrimPrefix(line, "UMOUNTFAIL ")
+			fillFailures = append(fillFailures, "unmount "+dev)
+			j.logFn("  [!] Warning: could not unmount %s after zero-fill", dev)
+		} else if strings.HasPrefix(line, "DDFAIL ") {
+			dev := strings.TrimPrefix(line, "DDFAIL ")
+			fillFailures = append(fillFailures, "fill "+dev)
+			j.logFn("  [!] Warning: zero-fill dd failed on %s", dev)
 		} else if line == "NO_PARTS" {
 			j.logFn("    No partitions found (raw disk)")
 		} else if line == "DONE" {
@@ -993,6 +1068,15 @@ echo "DONE"
 
 	if err := scanner.Err(); err != nil {
 		j.logFn("  Warning: output stream ended early: %v", err)
+	}
+
+	// Surface remote failures instead of printing a false "Zero-fill done":
+	// a dead connection or OOM-killed script used to be reported as success.
+	if err := session.Wait(); err != nil {
+		return fmt.Errorf("zero-fill script failed: %w", err)
+	}
+	if len(fillFailures) > 0 {
+		return fmt.Errorf("zero-fill incomplete: %s", strings.Join(fillFailures, "; "))
 	}
 
 	if filled > 0 || skipped > 0 {
@@ -1053,8 +1137,9 @@ func (j *CloneJob) FixBoot(targetDisk string) error {
 			continue
 		}
 
-		// Check device exists before attempting mount
-		check, _ := j.runner.CombinedOutput(fmt.Sprintf("test -b %s && echo OK", dev))
+		// Check device exists before attempting mount (device names come
+		// from remote lsblk output — always quote before embedding).
+		check, _ := j.runner.CombinedOutput("test -b " + shellQuote(dev) + " && echo OK")
 		if !strings.Contains(check, "OK") {
 			continue
 		}
@@ -1062,7 +1147,7 @@ func (j *CloneJob) FixBoot(targetDisk string) error {
 		// Try mounting to see if it's root
 		_, rcErr := j.runner.CombinedOutput(fmt.Sprintf(
 			`mp=$(mktemp -d) && mount %s "$mp" 2>/dev/null && { [ -f "$mp/etc/os-release" ] || [ -f "$mp/etc/fstab" ]; rc=$?; umount "$mp" 2>/dev/null; rmdir "$mp" >/dev/null 2>&1; exit $rc; } && rmdir "$mp" 2>/dev/null; exit 1`,
-			dev,
+			shellQuote(dev),
 		))
 		if rcErr == nil {
 			rootDev = dev
@@ -1175,19 +1260,27 @@ if [ -n "$TARGETDISK" ]; then
         # Resolve the device to a real /dev node. UUID=/LABEL= must be
         # resolved via command output (getline), NOT by pasting the blkid
         # command into [ -b ] -- that would always be false and comment out
-        # every valid entry.
+        # every valid entry. Values coming from the restored fstab are
+        # validated against a strict charset before being embedded in any
+        # shell command (a crafted fstab must not gain code execution here).
         actual=""
         if (dev ~ /^UUID=/) {
-          cmd="blkid -U " substr(dev,6) " 2>/dev/null"
-          cmd | getline actual
-          close(cmd)
+          val=substr(dev,6)
+          if (val ~ /^[A-Za-z0-9._:-]+$/) {
+            cmd="blkid -U " val " 2>/dev/null"
+            cmd | getline actual
+            close(cmd)
+          }
         } else if (dev ~ /^LABEL=/) {
-          cmd="blkid -L " substr(dev,7) " 2>/dev/null"
-          cmd | getline actual
-          close(cmd)
-        } else if (dev ~ /^\/dev\//) actual=dev
+          val=substr(dev,7)
+          if (val ~ /^[A-Za-z0-9._:-]+$/) {
+            cmd="blkid -L " val " 2>/dev/null"
+            cmd | getline actual
+            close(cmd)
+          }
+        } else if (dev ~ /^\/dev\/[A-Za-z0-9\/._-]+$/) actual=dev
         gsub(/[[:space:]]/, "", actual)
-        if (actual != "" && system("[ -b " actual " ] 2>/dev/null") == 0) {
+        if (actual != "" && actual ~ /^\/dev\/[A-Za-z0-9\/._-]+$/ && system("[ -b " actual " ] 2>/dev/null") == 0) {
           print
         } else {
           print "# " $0 "   # disabled by disk-cloner (device missing after restore)"
@@ -1223,27 +1316,31 @@ exit $RC
 	// Classify by output markers FIRST: the script exits non-zero (RC=1)
 	// both for mount failures and for GRUB-install failure, so checking
 	// err2 before the markers would hide the specific GRUB_INSTALL_FAILED
-	// message behind the generic one.
+	// message behind the generic one. Failures are now returned so callers
+	// (and the process exit code) can react instead of only log lines.
 	switch {
 	case strings.Contains(out2, "NO_INITRAMFS_TOOL"):
-		j.logFn("  [!] No initramfs tool found (dracut/update-initramfs/mkinitcpio), skipping")
+		j.logFn("  [!] No initramfs tool found (dracut/update-initramfs/mkinitcpio)")
+		return fmt.Errorf("boot repair: no initramfs tool in the restored system (dracut/update-initramfs/mkinitcpio)")
 	case strings.Contains(out2, "FAIL mount"):
 		j.logFn("  [!] Failed to mount root partition")
+		return fmt.Errorf("boot repair: failed to mount root partition %s", rootDev)
 	case strings.Contains(out2, "FAIL noroot"):
 		j.logFn("  [!] Mounted partition does not look like a root filesystem")
+		return fmt.Errorf("boot repair: mounted partition does not look like a root filesystem")
 	case strings.Contains(out2, "GRUB_INSTALL_FAILED"):
 		j.logFn("  [!] Initramfs rebuilt, but GRUB reinstall failed — you may need to run grub2-install manually")
+		return fmt.Errorf("boot repair: GRUB reinstall failed (initramfs was rebuilt); run grub-install --recheck manually")
 	case err2 != nil:
-		// Non-fatal: backup/restore still succeeded; user can fix boot manually.
 		j.logFn("  [!] Boot repair failed — you may need to fix boot manually")
-	default:
-		if strings.Contains(out2, "NO_GRUB_TOOL") {
-			j.logFn("  ✓ Initramfs rebuilt (no GRUB install tool found; skipped GRUB reinstall)")
-		} else if targetDisk != "" {
-			j.logFn("  ✓ GRUB reinstalled and initramfs rebuilt")
-		} else {
-			j.logFn("  ✓ Initramfs rebuilt")
-		}
+		return fmt.Errorf("boot repair script failed: %v", err2)
+	}
+	if strings.Contains(out2, "NO_GRUB_TOOL") {
+		j.logFn("  ✓ Initramfs rebuilt (no GRUB install tool found; skipped GRUB reinstall)")
+	} else if targetDisk != "" {
+		j.logFn("  ✓ GRUB reinstalled and initramfs rebuilt")
+	} else {
+		j.logFn("  ✓ Initramfs rebuilt")
 	}
 	return nil
 }
@@ -1282,28 +1379,11 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 	}()
 
 	// Handle Ctrl+C: first press sends SIGTERM to remote, second force-exits
+	// (unfreezing the source first — see watchInterrupt).
 	done := make(chan struct{})
 	defer close(done)
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
-	defer signal.Stop(sigCh)
 	var cancelled atomic.Bool
-	go func() {
-		for {
-			select {
-			case <-sigCh:
-				if !cancelled.Load() {
-					cancelled.Store(true)
-					_ = session.Signal(ssh.SIGTERM)
-					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
-				} else {
-					os.Exit(130)
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
+	go j.watchInterrupt(session, done, &cancelled, j.unfreezeSource)
 
 	// Decompress on-the-fly and write to target
 	gzr, err := gzip.NewReader(session.Stdout())
@@ -1345,6 +1425,13 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 			errMsg += "\n  stderr: " + strings.TrimSpace(stderrOut)
 		}
 		finalErr = fmt.Errorf("%s", errMsg)
+	} else {
+		// Verify dd actually read the full source disk (GNU dd reports bytes
+		// read on stderr; BusyBox dd does not, so the check is skipped there).
+		if ddRead := parseDdBytesRead(stderrOut); ddRead > 0 && j.params.SourceSize > 0 && ddRead < j.params.SourceSize {
+			finalErr = fmt.Errorf("clone truncated: dd read %d bytes but source disk is %d bytes (%.1f%% of expected) — target disk content is incomplete",
+				ddRead, j.params.SourceSize, float64(ddRead)/float64(j.params.SourceSize)*100)
+		}
 	}
 
 	j.progressFn(Progress{Done: true, Error: finalErr})
@@ -1387,26 +1474,8 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 
 	done := make(chan struct{})
 	defer close(done)
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
-	defer signal.Stop(sigCh)
 	var cancelled atomic.Bool
-	go func() {
-		for {
-			select {
-			case <-sigCh:
-				if !cancelled.Load() {
-					cancelled.Store(true)
-					_ = session.Signal(ssh.SIGTERM)
-					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
-				} else {
-					os.Exit(130)
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
+	go j.watchInterrupt(session, done, &cancelled, j.unfreezeSource)
 
 	// Tee the compressed stream into dst while decompressing a copy to count
 	// real disk bytes for the progress bar (see function doc above).
@@ -1498,26 +1567,8 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 
 	done := make(chan struct{})
 	defer close(done)
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
-	defer signal.Stop(sigCh)
 	var cancelled atomic.Bool
-	go func() {
-		for {
-			select {
-			case <-sigCh:
-				if !cancelled.Load() {
-					cancelled.Store(true)
-					_ = session.Signal(ssh.SIGTERM)
-					j.logFn("  [!] 正在取消... (再按一次 Ctrl+C 强制退出)")
-				} else {
-					os.Exit(130)
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
+	go j.watchInterrupt(session, done, &cancelled, j.unfreezeSource)
 
 	written, copyErr := j.copyWithProgress(dst, session.Stdout(), &cancelled, session)
 	if copyErr != nil {
@@ -1550,6 +1601,13 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 			errMsg += "\n  stderr: " + strings.TrimSpace(stderrOut)
 		}
 		finalErr = fmt.Errorf("%s", errMsg)
+	} else {
+		// Same truncation check as streamCompressedRaw: a dd that exits
+		// early must not yield a silently-short raw .img with a valid hash.
+		if ddRead := parseDdBytesRead(stderrOut); ddRead > 0 && j.params.SourceSize > 0 && ddRead < j.params.SourceSize {
+			finalErr = fmt.Errorf("backup truncated: dd read %d bytes but source disk is %d bytes (%.1f%% of expected) — backup is corrupt, do not restore it",
+				ddRead, j.params.SourceSize, float64(ddRead)/float64(j.params.SourceSize)*100)
+		}
 	}
 
 	j.progressFn(Progress{Done: true, Error: finalErr})

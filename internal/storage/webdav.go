@@ -29,6 +29,9 @@ func openWebDAV(cfg Config) (Writer, error) {
 	if webdavProbeChunked(client, cfg.URL, cfg.User, cfg.Password) {
 		return webdavStreamWriter(client, cfg)
 	}
+	if cfg.Logf != nil {
+		cfg.Logf("[!] WebDAV 服务器不支持分块上传,镜像将先写入本地临时文件再上传 — 请确保本地有足够的空闲空间(内存系统上即内存)")
+	}
 	return webdavSpoolWriter(client, cfg)
 }
 
@@ -112,13 +115,23 @@ func webdavStreamWriter(client *http.Client, cfg Config) (Writer, error) {
 		}
 		req.SetBasicAuth(cfg.User, cfg.Password)
 		req.Header.Set("Content-Type", "application/octet-stream")
-		w.done <- webdavDo(client, req, cfg.URL)
+		doErr := webdavDo(client, req, cfg.URL)
+		if doErr != nil {
+			doErr = fmt.Errorf("webdav: PUT %s: %w", cfg.URL, doErr)
+		}
+		w.done <- doErr
 		pw.Close()
 	}()
 	// Fail fast on an early rejection from the server.
 	select {
 	case err := <-w.done:
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
+		// done delivered a nil error inside the probe window: the transfer
+		// somehow completed already — treat as unusable rather than handing
+		// back a dead writer that would panic on first Write.
+		return nil, fmt.Errorf("webdav: upload finished before any data was written")
 	case <-time.After(3 * time.Second):
 	}
 	return w, nil
@@ -137,12 +150,15 @@ func webdavSpoolWriter(client *http.Client, cfg Config) (Writer, error) {
 func webdavDo(client *http.Client, req *http.Request, what string) error {
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("webdav: PUT %s: %w", what, err)
+		return &httpOpError{status: "transport error", detail: err.Error(), retryable: true}
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("webdav: PUT %s: %s", what, resp.Status)
+		return &httpOpError{
+			status:    resp.Status,
+			retryable: resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout,
+		}
 	}
 	return nil
 }
@@ -193,28 +209,18 @@ func (w *webdavWriter) finish(abandon bool) error {
 	w.finished = true
 
 	var err error
+	outcomeUnknown := false
 	if w.spool != nil {
 		spoolPath := w.spool.Name()
 		spoolSize := w.size
 		w.spool.Close()
 		w.spool = nil
 		if !abandon {
-			f, openErr := os.Open(spoolPath)
-			if openErr != nil {
-				err = fmt.Errorf("webdav: reopen spool file: %w", openErr)
-			} else {
-				req, reqErr := http.NewRequest(http.MethodPut, w.cfg.URL, f)
-				if reqErr != nil {
-					f.Close()
-					err = reqErr
-				} else {
-					req.ContentLength = spoolSize
-					req.SetBasicAuth(w.cfg.User, w.cfg.Password)
-					req.Header.Set("Content-Type", "application/octet-stream")
-					err = webdavDo(w.client, req, w.cfg.URL)
-					f.Close()
-				}
-			}
+			// The body is a local file — reopen per attempt so the request
+			// is replayable on transient failures.
+			err = retry(3, func() error {
+				return w.putSpoolFile(spoolPath, spoolSize)
+			})
 		}
 		os.Remove(spoolPath)
 	} else {
@@ -225,20 +231,51 @@ func (w *webdavWriter) finish(abandon bool) error {
 		}
 		select {
 		case err = <-w.done:
-		case <-time.After(3 * time.Second):
-			err = fmt.Errorf("webdav: transfer did not finish")
+		case <-time.After(finalizeWait):
+			outcomeUnknown = true
+			err = fmt.Errorf("webdav: no response from server within %s", finalizeWait)
 		}
 	}
 
-	if (abandon || err != nil) && w.cfg.URL != "" {
-		// Remove the partial remote file (best effort).
-		if dreq, derr := http.NewRequest(http.MethodDelete, w.cfg.URL, nil); derr == nil {
-			dreq.SetBasicAuth(w.cfg.User, w.cfg.Password)
-			if dresp, derr := w.client.Do(dreq); derr == nil {
-				io.Copy(io.Discard, io.LimitReader(dresp.Body, 4096))
-				dresp.Body.Close()
-			}
-		}
+	// Delete the partial remote file only when its partial-ness is certain:
+	// an explicit abort or a transfer rejected by the server. An unknown
+	// outcome (server still ingesting after the stream ended) must NOT be
+	// deleted — the file may already be complete.
+	if (abandon || (err != nil && !outcomeUnknown)) && w.cfg.URL != "" {
+		w.webdavDeleteRemote()
+	}
+	if err != nil && outcomeUnknown {
+		err = fmt.Errorf("%w (file kept on server — verify it before trusting it)", err)
 	}
 	return err
+}
+
+func (w *webdavWriter) putSpoolFile(spoolPath string, size int64) error {
+	f, openErr := os.Open(spoolPath)
+	if openErr != nil {
+		return fmt.Errorf("webdav: reopen spool file: %w", openErr)
+	}
+	defer f.Close()
+	req, reqErr := http.NewRequest(http.MethodPut, w.cfg.URL, f)
+	if reqErr != nil {
+		return reqErr
+	}
+	req.ContentLength = size
+	req.SetBasicAuth(w.cfg.User, w.cfg.Password)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	err := webdavDo(w.client, req, w.cfg.URL)
+	if err != nil {
+		return fmt.Errorf("webdav: PUT %s: %w", w.cfg.URL, err)
+	}
+	return nil
+}
+
+func (w *webdavWriter) webdavDeleteRemote() {
+	if dreq, derr := http.NewRequest(http.MethodDelete, w.cfg.URL, nil); derr == nil {
+		dreq.SetBasicAuth(w.cfg.User, w.cfg.Password)
+		if dresp, derr := w.client.Do(dreq); derr == nil {
+			io.Copy(io.Discard, io.LimitReader(dresp.Body, 4096))
+			dresp.Body.Close()
+		}
+	}
 }

@@ -27,13 +27,43 @@ import (
 
 const (
 	remoteLsblkCmd = "lsblk -Jb -o NAME,SIZE,TYPE,MOUNTPOINT,MODEL,SERIAL,TRAN,ROTA,RM,FSTYPE,LABEL"
-	clearLine      = "\r                                                                                \r"
-	version        = "3.2.0"
+	// Newer util-linux prefers the MOUNTPOINTS array; the legacy singular
+	// mountpoint can be null when a device has several mounts. The plural
+	// column is tried first and the classic set is the fallback for older
+	// lsblk builds that reject the unknown column.
+	remoteLsblkCmdNew = "lsblk -Jb -o NAME,SIZE,TYPE,MOUNTPOINTS,MOUNTPOINT,MODEL,SERIAL,TRAN,ROTA,RM,FSTYPE,LABEL"
+	clearLine         = "\r                                                                                \r"
+	version           = "3.2.0"
 )
+
+// scanRemoteDisks lists disks on a Runner (remote SSH or local), preferring
+// the modern lsblk column set with MOUNTPOINTS and falling back to the
+// classic one.
+func scanRemoteDisks(r sshclient.Runner) ([]disk.DiskInfo, error) {
+	var lastErr error
+	for _, cmd := range []string{remoteLsblkCmdNew, remoteLsblkCmd} {
+		out, err := r.CombinedOutput(cmd)
+		if err != nil || strings.TrimSpace(out) == "" {
+			if err != nil {
+				lastErr = err
+			} else {
+				lastErr = fmt.Errorf("lsblk 输出为空")
+			}
+			continue
+		}
+		disks, perr := disk.ParseJSON(out)
+		if perr == nil {
+			return disks, nil
+		}
+		lastErr = perr
+	}
+	return nil, lastErr
+}
 
 var compressLevel = 1 // default gzip compression level 1-9, 0 = no compression
 var compressType = 0  // 0=gzip, 1=pigz (multi-threaded)
 var fixInitramfs = false
+var tlsVerifyEnabled = false // -tls-verify: enable certificate verification for WebDAV/S3 https
 
 func main() {
 	var (
@@ -47,11 +77,12 @@ func main() {
 		compressLv  = flag.Int("z", 1, "压缩级别 0-9 (0=不压缩, 1=最快, 9=最小)")
 		autoYes     = flag.Bool("y", false, "跳过确认")
 		saveFile    = flag.String("o", "", "保存为 gzip 文件")
-		noFixBoot   = flag.Bool("no-fix-boot", false, "跳过引导修复")
+		noFixBoot   = flag.Bool("no-fix-boot", false, "跳过引导修复 (克隆和恢复模式均生效)")
 		fixBootDev  = flag.String("fix-boot-disk", "", "独立修复引导")
 		restoreFile = flag.String("r", "", "恢复 gzip 文件到远程磁盘")
 		dst         = flag.String("dst", "", "传输到远程存储 (sftp:// ftp:// dav:// davs:// s3://)")
 		localDisk   = flag.String("l", "", "本机磁盘作为源 (程序直接运行在源机 RAM OS, 需 Linux; 搭配 -dst 或 -o)")
+		tlsVerify   = flag.Bool("tls-verify", false, "对 WebDAV/S3 的 HTTPS 启用证书校验 (默认关闭; URL 中也可加 tlsverify=1)")
 		showVer     = flag.Bool("V", false, "显示版本号")
 	)
 	flag.Usage = func() {
@@ -93,6 +124,7 @@ func main() {
 	if compressLevel < 0 || compressLevel > 9 {
 		compressLevel = 1
 	}
+	tlsVerifyEnabled = *tlsVerify
 
 	if *showVer {
 		fmt.Println("Disk Cloner v" + version)
@@ -109,12 +141,20 @@ func main() {
 		}
 	}
 	if ops > 1 {
-		fmt.Fprintln(os.Stderr, "错误: 参数 -t / -o / -r 只能同时指定一个")
+		fmt.Fprintln(os.Stderr, "错误: 参数 -t / -o / -r / -dst 只能同时指定一个")
 		os.Exit(1)
 	}
 
-	// Local-source mode (-l): the tool itself runs on the machine being
-	// imaged (Alpine RAM OS) and pushes its own disk to storage.
+	// --fix-boot-disk is a standalone mode; combining it with operation
+	// flags would silently ignore those flags.
+	if *fixBootDev != "" {
+		if *remoteIP != "" || *source != "" || *target != "" || *saveFile != "" || *restoreFile != "" || *dst != "" || *localDisk != "" {
+			fmt.Fprintln(os.Stderr, "错误: -fix-boot-disk 是独立模式, 不能与其他操作参数同时使用")
+			os.Exit(1)
+		}
+	}
+
+	// -l has its own constraints.
 	if *localDisk != "" {
 		if runtime.GOOS != "linux" {
 			fmt.Fprintln(os.Stderr, "错误: -l (本机模式) 仅支持在 Linux (Alpine RAM OS) 上运行")
@@ -128,6 +168,21 @@ func main() {
 			fmt.Fprintln(os.Stderr, "错误: -l 需要且只能搭配 -dst 或 -o 之一")
 			os.Exit(1)
 		}
+	}
+
+	// Fail fast on incomplete/mismatched flag combinations instead of
+	// silently dropping into interactive mode (or failing after a remote scan).
+	if (*remoteIP != "") != (*source != "") {
+		fmt.Fprintln(os.Stderr, "错误: -H 与 -s 必须同时指定")
+		os.Exit(1)
+	}
+	if *remoteIP != "" && *target == "" && *saveFile == "" && *restoreFile == "" && *dst == "" {
+		fmt.Fprintln(os.Stderr, "错误: 指定了 -H/-s 但未指定操作 (-t / -o / -r / -dst), 运行时不带参数可进入交互模式")
+		os.Exit(1)
+	}
+	if *target != "" && runtime.GOOS == "windows" {
+		fmt.Fprintln(os.Stderr, "错误: Windows 不支持克隆到本地磁盘 (-t), 请使用 -o 保存为文件")
+		os.Exit(1)
 	}
 
 	cli.SetupConsole()
@@ -414,24 +469,13 @@ connectLoop:
 		fmt.Println()
 		fmt.Println("  ─────────────────────────────────────────────")
 		fmt.Print("  正在扫描远程磁盘...")
-		remoteRaw, err := sshClient.CombinedOutput(remoteLsblkCmd)
-		if err != nil || remoteRaw == "" {
-			msg := ""
-			if err != nil {
-				msg = err.Error()
-			}
-			if remoteRaw != "" {
-				msg = remoteRaw
-			}
+		remoteDisks, err := scanRemoteDisks(sshClient)
+		if err != nil {
+			msg := err.Error()
 			logger.logf("远程磁盘扫描失败: %s", msg)
 			fmt.Printf(clearLine+"  远程扫描失败: %s\n", msg)
 			fmt.Println("    请确认远程已安装 lsblk (apk add util-linux)")
 			fmt.Println()
-			continue
-		}
-		remoteDisks, err := disk.ParseJSON(remoteRaw)
-		if err != nil {
-			fmt.Printf(clearLine+"  解析远程磁盘失败: %v\n", err)
 			continue
 		}
 		fmt.Printf(clearLine+"  发现 %d 块远程磁盘\n", countType(remoteDisks, "disk"))
@@ -665,6 +709,9 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		if err != nil {
 			log.Fatalf("%v", err)
 		}
+		if tlsVerifyEnabled {
+			cfg.InsecureTLS = false
+		}
 		dstCfg = &cfg
 	}
 
@@ -692,20 +739,9 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 	// compatibility (applies to both save and clone paths; restore ignores it).
 	fixInitramfs = true
 
-	remoteRaw, err := sshClient.CombinedOutput(remoteLsblkCmd)
-	if err != nil || remoteRaw == "" {
-		msg := ""
-		if err != nil {
-			msg = err.Error()
-		}
-		if remoteRaw != "" {
-			msg = remoteRaw
-		}
-		log.Fatalf("远程扫描失败: %s\n  请确认远程已安装 lsblk (apk add util-linux)", msg)
-	}
-	remoteDisks, err := disk.ParseJSON(remoteRaw)
+	remoteDisks, err := scanRemoteDisks(sshClient)
 	if err != nil {
-		log.Fatalf("解析远程磁盘失败: %v", err)
+		log.Fatalf("远程扫描失败: %v\n  请确认远程已安装 lsblk (apk add util-linux)", err)
 	}
 	srcDisk := disk.FindDisk(remoteDisks, source)
 	if srcDisk == nil {
@@ -719,7 +755,9 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		if saveFile == "auto" {
 			dateStr := time.Now().Format("2006-01-02")
 			dateDir := filepath.Join(".", dateStr)
-			os.MkdirAll(dateDir, 0755)
+			if err := os.MkdirAll(dateDir, 0755); err != nil {
+				log.Fatalf("无法创建保存目录 %s: %v", dateDir, err)
+			}
 			saveFile = filepath.Join(dateDir, makeFileName(ip, source, srcDisk.SizeHuman, dateStr, saveExtFor(compressLevel)))
 		}
 		// Level 0 writes raw bytes — don't leave a user-supplied .img.gz
@@ -748,10 +786,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 		if !autoYes {
 			fmt.Printf("将保存远程 %s 到文件 %s\n", srcDisk.Path, saveFile)
-			fmt.Print("确认继续? (yes/no): ")
-			var confirm string
-			fmt.Scanln(&confirm)
-			if confirm != "yes" && confirm != "y" {
+			if !cli.Confirm("确认继续? 输入 yes") {
 				fmt.Println("已取消")
 				return
 			}
@@ -788,17 +823,16 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 		if !autoYes {
 			fmt.Printf("将读取远程 %s 并流式上传到 %s\n", srcDisk.Path, storage.Describe(cfg))
-			fmt.Print("确认继续? (yes/no): ")
-			var confirm string
-			fmt.Scanln(&confirm)
-			if confirm != "yes" && confirm != "y" {
+			if !cli.Confirm("确认继续? 输入 yes") {
 				fmt.Println("已取消")
 				return
 			}
 		}
 
 		dateDir := filepath.Join(".", dateStr)
-		os.MkdirAll(dateDir, 0755)
+		if err := os.MkdirAll(dateDir, 0755); err != nil {
+			log.Fatalf("无法创建日志目录 %s: %v", dateDir, err)
+		}
 		logPath := filepath.Join(dateDir, storage.BaseName(cfg)+".log")
 		if err := logger.open(logPath); err != nil {
 			fmt.Printf("  [!] 无法创建日志文件 %s: %v (继续无日志)\n", logPath, err)
@@ -819,10 +853,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		// Verify file integrity if a .sha256 checksum file exists
 		if !verifyChecksum(restoreFile) {
 			if !autoYes {
-				fmt.Print("  校验失败，是否继续恢复? (yes/no): ")
-				var confirm string
-				fmt.Scanln(&confirm)
-				if confirm != "yes" && confirm != "y" {
+				if !cli.Confirm("  校验失败，是否继续恢复? 输入 yes 强制恢复") {
 					fmt.Println("已取消")
 					return
 				}
@@ -839,10 +870,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 				fmt.Printf("  [!] 目标盘 (%s) 小于解压后镜像 (%s)，只能写入约 %.1f%%\n",
 					disk.FormatBytes(targetSize), disk.FormatBytes(uncompSize), pct)
 				if !autoYes {
-					fmt.Print("  继续恢复? (yes/no): ")
-					var confirm string
-					fmt.Scanln(&confirm)
-					if confirm != "yes" && confirm != "y" {
+					if !cli.Confirm("  继续恢复? 输入 yes") {
 						fmt.Println("已取消")
 						return
 					}
@@ -853,12 +881,12 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		}
 
 		totalStart := time.Now()
+		// Restore consumes no compression/zero-fill/initramfs params — only
+		// TargetPath/BlockSize/SourceSize matter here, so leave the rest at
+		// zero values rather than passing stale globals.
 		job := clone.New(sshClient, clone.Params{
-			TargetPath:       source,
-			BlockSize:        bs,
-			CompressionLevel: compressLevel,
-			CompressType:     compressType,
-			FixInitramfs:     fixInitramfs,
+			TargetPath: source,
+			BlockSize:  bs,
 		}, makeProgressFn())
 		job.SetLogFunc(func(format string, args ...interface{}) {
 			fmt.Printf(format+"\n", args...)
@@ -870,9 +898,14 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 		// Reinstall GRUB + rebuild initramfs on the restored disk so it boots
 		// on this target hardware. See FixBoot docs for why this is mandatory.
-		fmt.Println("  正在修复引导（GRUB + initramfs）...")
-		if err := job.FixBoot(source); err != nil {
-			fmt.Printf("  [!] 引导修复失败: %v（恢复已成功，请手动修复引导）\n", err)
+		// Honored -no-fix-boot here as well as in the clone path.
+		if !noFixBoot {
+			fmt.Println("  正在修复引导（GRUB + initramfs）...")
+			if err := job.FixBoot(source); err != nil {
+				fmt.Printf("  [!] 引导修复失败: %v（恢复已成功，请手动修复引导）\n", err)
+			}
+		} else {
+			fmt.Println("  [!] 已按 -no-fix-boot 跳过引导修复 — 若克隆自不同硬件, 目标盘可能无法启动")
 		}
 
 		fmt.Printf("恢复完成! 总耗时: %s\n", formatTotalTime(time.Since(totalStart)))
@@ -913,10 +946,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 	if !autoYes {
 		fmt.Printf("此操作将覆盖 %s 上的所有数据!\n", target)
-		fmt.Print("确认继续? (yes/no): ")
-		var confirm string
-		fmt.Scanln(&confirm)
-		if confirm != "yes" && confirm != "y" {
+		if !cli.Confirm("确认继续? 输入 yes") {
 			fmt.Println("已取消")
 			return
 		}
@@ -953,10 +983,10 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		fmt.Println("  正在修复引导（GRUB + initramfs）...")
 		if err := fixboot.Run(fixboot.Config{TargetDisk: target}); err != nil {
 			fmt.Printf("  [!] 引导修复失败: %v（克隆已成功，请手动修复引导）\n", err)
-			printFstabWarning(target)
+			printFstabWarning(target, autoYes)
 		}
 	} else {
-		printFstabWarning(target)
+		printFstabWarning(target, autoYes)
 	}
 }
 
@@ -964,7 +994,10 @@ func runSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client,
 	saveDir := askSaveDirectory()
 	dateStr := time.Now().Format("2006-01-02")
 	dateDir := filepath.Join(saveDir, dateStr)
-	os.MkdirAll(dateDir, 0755)
+	if err := os.MkdirAll(dateDir, 0755); err != nil {
+		fmt.Printf("  [!] 无法创建保存目录 %s: %v\n", dateDir, err)
+		return
+	}
 	fmt.Printf("  保存目录: %s\n", dateDir)
 	logger.logf("保存目录: %s", dateDir)
 
@@ -980,7 +1013,10 @@ func batchSaveToFile(ip string, disks []cli.DiskItem, sshClient *sshclient.Clien
 	saveDir := askSaveDirectory()
 	dateStr := time.Now().Format("2006-01-02")
 	dateDir := filepath.Join(saveDir, dateStr)
-	os.MkdirAll(dateDir, 0755)
+	if err := os.MkdirAll(dateDir, 0755); err != nil {
+		fmt.Printf("  [!] 无法创建保存目录 %s: %v\n", dateDir, err)
+		return
+	}
 	fmt.Printf("  保存目录: %s\n", dateDir)
 	logger.logf("批量备份保存目录: %s", dateDir)
 	logger.logf("待备份磁盘数: %d", len(disks))
@@ -1070,10 +1106,9 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 	fmt.Println("  +--------------------------------------------+")
 	fmt.Printf("  |  源:   %s:%s (%s)\n", ip, srcDisk.Path, srcDisk.SizeHuman)
 	fmt.Printf("  |  文件: %s\n", fileName)
-	fmt.Println("  |  格式: gzip 压缩")
 	fmt.Println("  +--------------------------------------------+")
 	logger.logf("源: %s:%s (%s)", ip, srcDisk.Path, srcDisk.SizeHuman)
-	logger.logf("保存文件: %s (gzip 压缩)", fileName)
+	logger.logf("保存文件: %s", fileName)
 	if runtime.GOOS != "windows" {
 		fmt.Println()
 		fmt.Println("  注意: 如果在 RAM OS 中运行,")
@@ -1085,7 +1120,6 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 
 	compressLevel = cli.AskCompressionLevel()
 	compressType = cli.AskCompressionType()
-	logger.logf("压缩级别: %d  压缩方式: %s", compressLevel, compressTypeName(compressType))
 
 	// Level 0 saves an uncompressed raw image — adjust the extension so the
 	// file isn't named .img.gz while containing raw bytes.
@@ -1093,6 +1127,15 @@ func doSaveToFile(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Client, 
 		fileName = strings.TrimSuffix(fileName, ".img.gz") + ".img"
 		fmt.Printf("  不压缩: 保存为原始镜像 %s\n", fileName)
 		logger.logf("不压缩模式: 文件名调整为 %s", fileName)
+	}
+	// Print the format only now that it is actually decided (the summary box
+	// above used to claim gzip before the user chose level 0).
+	if compressLevel == 0 {
+		fmt.Printf("  格式: 不压缩 (原始镜像)\n")
+		logger.logf("格式: 不压缩 (原始镜像)")
+	} else {
+		fmt.Printf("  格式: %s 压缩 (级别 %d)\n", compressTypeName(compressType), compressLevel)
+		logger.logf("格式: %s 压缩 (级别 %d)", compressTypeName(compressType), compressLevel)
 	}
 
 	doZero := cli.ConfirmZero()
@@ -1128,7 +1171,7 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, runner sshclient.Runner, fi
 	fmt.Println()
 
 	totalStart := time.Now()
-	logger.logf("开始保存操作 (dd|%s -> 网络 -> 文件)", compressTypeName(compressType))
+	logger.logf("开始保存操作 (dd -> 网络 -> 文件, 请求压缩: %s)", compressTypeName(compressType))
 	logger.logf("开始时间: %s", totalStart.Format("2006-01-02 15:04:05"))
 
 	job := clone.New(runner, clone.Params{
@@ -1161,6 +1204,7 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, runner sshclient.Runner, fi
 		return
 	}
 	logger.logf("传输完成")
+	logger.logf("实际使用压缩器: %s", job.CompressToolName())
 
 	// The checksum was computed while streaming; only recompute (slow second
 	// pass) if the job didn't provide one.
@@ -1266,7 +1310,10 @@ func runLocalInteractive() {
 
 		saveDir := askSaveDirectory()
 		dateDir := filepath.Join(saveDir, dateStr)
-		os.MkdirAll(dateDir, 0755)
+		if err := os.MkdirAll(dateDir, 0755); err != nil {
+			fmt.Printf("  [!] 无法创建校验文件目录 %s: %v\n", dateDir, err)
+			continue
+		}
 		base := storage.BaseName(cfg)
 		logger.logf("本地校验文件目录: %s", dateDir)
 
@@ -1349,7 +1396,9 @@ func runDirectLocal(diskPath, bs string, autoYes bool, saveFile, dst string) {
 	if saveFile != "" {
 		if saveFile == "auto" {
 			dateDir := filepath.Join(".", dateStr)
-			os.MkdirAll(dateDir, 0755)
+			if err := os.MkdirAll(dateDir, 0755); err != nil {
+				log.Fatalf("无法创建保存目录 %s: %v", dateDir, err)
+			}
 			saveFile = filepath.Join(dateDir, makeFileName(host, srcDisk.Name, srcDisk.SizeHuman, dateStr, saveExtFor(compressLevel)))
 		}
 		if compressLevel == 0 && strings.HasSuffix(saveFile, ".img.gz") {
@@ -1372,10 +1421,7 @@ func runDirectLocal(diskPath, bs string, autoYes bool, saveFile, dst string) {
 
 		if !autoYes {
 			fmt.Printf("将保存本机 %s 到文件 %s\n", srcDisk.Path, saveFile)
-			fmt.Print("确认继续? (yes/no): ")
-			var confirm string
-			fmt.Scanln(&confirm)
-			if confirm != "yes" && confirm != "y" {
+			if !cli.Confirm("确认继续? 输入 yes") {
 				fmt.Println("已取消")
 				return
 			}
@@ -1410,17 +1456,16 @@ func runDirectLocal(diskPath, bs string, autoYes bool, saveFile, dst string) {
 
 	if !autoYes {
 		fmt.Printf("将读取本机 %s 并流式上传到 %s\n", srcDisk.Path, storage.Describe(cfg))
-		fmt.Print("确认继续? (yes/no): ")
-		var confirm string
-		fmt.Scanln(&confirm)
-		if confirm != "yes" && confirm != "y" {
+		if !cli.Confirm("确认继续? 输入 yes") {
 			fmt.Println("已取消")
 			return
 		}
 	}
 
 	dateDir := filepath.Join(".", dateStr)
-	os.MkdirAll(dateDir, 0755)
+	if err := os.MkdirAll(dateDir, 0755); err != nil {
+		log.Fatalf("无法创建日志目录 %s: %v", dateDir, err)
+	}
 	logPath := filepath.Join(dateDir, storage.BaseName(cfg)+".log")
 	if err := logger.open(logPath); err != nil {
 		fmt.Printf("  [!] 无法创建日志文件 %s: %v (继续无日志)\n", logPath, err)
@@ -1443,7 +1488,7 @@ func askStorageConn() (storage.Config, bool) {
 	if isBack(kind) {
 		return storage.Config{}, false
 	}
-	cfg := storage.Config{InsecureTLS: true}
+	cfg := storage.Config{InsecureTLS: !tlsVerifyEnabled}
 	switch kind {
 	case 1:
 		cfg.Kind = storage.KindSFTP
@@ -1554,8 +1599,15 @@ func execSaveToStorage(srcDisk cli.DiskItem, runner sshclient.Runner,
 	fmt.Println()
 
 	totalStart := time.Now()
-	logger.logf("开始存储传输 (dd|%s -> 网络 -> %s)", compressTypeName(compressType), cfg.Kind)
+	logger.logf("开始存储传输 (dd -> 网络 -> %s, 请求压缩: %s)", cfg.Kind, compressTypeName(compressType))
 	logger.logf("开始时间: %s", totalStart.Format("2006-01-02 15:04:05"))
+
+	// Surface backend warnings (e.g. the WebDAV spool fallback that buffers
+	// the whole image locally) on screen and in the log.
+	cfg.Logf = func(format string, args ...interface{}) {
+		fmt.Printf("  "+format+"\n", args...)
+		logger.logf("  "+format, args...)
+	}
 
 	// Fail fast: Open validates credentials, path/bucket and permissions
 	// BEFORE the potentially hours-long zero-fill starts.
@@ -1619,6 +1671,12 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	var fileName string
 	for {
 		input := cli.ReadInputPath("本地文件路径 (Tab=补全, 回车=浏览, q=返回)", "")
+		if input == "" && cli.StdinClosed() {
+			// Piped/redirected input exhausted — leave the loop instead of
+			// spinning forever between EOF and the empty file list.
+			fmt.Println("\n  [!] 标准输入已结束, 返回菜单")
+			return
+		}
 		lower := strings.ToLower(input)
 		if lower == "q" || lower == "quit" {
 			return
@@ -1698,12 +1756,12 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	fmt.Println()
 
 	totalStart := time.Now()
+	// Restore consumes no compression/zero-fill/initramfs params — only
+	// TargetPath/BlockSize/SourceSize matter here, so leave the rest at
+	// zero values rather than passing stale globals.
 	job := clone.New(sshClient, clone.Params{
-		TargetPath:       remoteDisk,
-		BlockSize:        "4M",
-		CompressionLevel: compressLevel,
-		CompressType:     compressType,
-		FixInitramfs:     fixInitramfs,
+		TargetPath: remoteDisk,
+		BlockSize:  "4M",
 	}, makeProgressFn())
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
@@ -1746,17 +1804,28 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 }
 
 // getRemoteDiskSize returns the size of a disk on the remote server via lsblk.
-func getRemoteDiskSize(sshClient *sshclient.Client, disk string) (int64, error) {
-	out, err := sshClient.CombinedOutput(fmt.Sprintf("lsblk -b -n -o SIZE %s 2>/dev/null | head -1", disk))
+// stdout is read separately from stderr: merging them (CombinedOutput) lets
+// udev/kernel warnings pollute the first line and break the size parse,
+// silently disabling the target-too-small safety check.
+func getRemoteDiskSize(sshClient *sshclient.Client, dev string) (int64, error) {
+	session, err := sshClient.Execute("lsblk -b -n -o SIZE " + shellQuote(dev) + " 2>/dev/null")
 	if err != nil {
 		return 0, err
 	}
-	out = strings.TrimSpace(out)
-	if out == "" {
+	defer session.Close()
+	out, _ := io.ReadAll(session.Stdout())
+	if err := session.Wait(); err != nil {
+		return 0, err
+	}
+	line := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+	if line == "" {
 		return 0, fmt.Errorf("no size returned")
 	}
-	size, err := strconv.ParseInt(out, 10, 64)
-	return size, err
+	size, err := strconv.ParseInt(line, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("unexpected lsblk output %q: %w", line, err)
+	}
+	return size, nil
 }
 
 // windowsFileDialog opens the native Windows file picker and returns the
@@ -1943,7 +2012,7 @@ func confirmUnsafeRemote(r RemoteReadiness, autoYes bool, where string) bool {
 	return cli.Confirm(fmt.Sprintf("  %s不是 Alpine RAM OS,继续可能损坏数据。输入 yes 继续", where))
 }
 
-func printFstabWarning(targetDisk string) {
+func printFstabWarning(targetDisk string, autoYes bool) {
 	warn := func() {
 		fmt.Println()
 		fmt.Println("  +==============================================")
@@ -1958,8 +2027,10 @@ func printFstabWarning(targetDisk string) {
 		fmt.Println("  |  1. 创建分区设备节点:                       ")
 		fmt.Println("  |     mdev -s                                  ")
 		fmt.Println("  |")
-		fmt.Println("  |  2. 用 lsblk 查看分区号, 挂载根分区:        ")
-		fmt.Printf("  |     mount %s4 /mnt                        \n", targetDisk)
+		fmt.Println("  |  2. 用 lsblk 查看分区号, 挂载根分区        ")
+		fmt.Println("  |     (通常是最大的 ext4/xfs 分区):           ")
+		fmt.Printf("  |     lsblk %s\n", targetDisk)
+		fmt.Println("  |     mount /dev/<根分区> /mnt                 ")
 		fmt.Println("  |")
 		fmt.Println("  |  3. 编辑 fstab, 删除或注释掉不存在的设备:   ")
 		fmt.Println("  |     vi /mnt/etc/fstab                        ")
@@ -1974,6 +2045,11 @@ func printFstabWarning(targetDisk string) {
 		fmt.Println()
 	}
 	warn()
+	if autoYes {
+		// -y means unattended: don't stall the run with the repeated
+		// 10-second reminders.
+		return
+	}
 	fmt.Println("  -- 以上提醒将在 10 秒后重复 --")
 	time.Sleep(10 * time.Second)
 	warn()
@@ -2017,6 +2093,9 @@ func saveExtFor(level int) string {
 
 // extractIP attempts to extract an IPv4 address from user input.
 // Handles copied text like "IP: 192.168.1.100" or "192.168.1.100:22".
+// Octets are range-checked so garbage like 999.999.999.999 isn't extracted
+// as if it were an address; non-matching input (e.g. a hostname) is
+// returned as-is and validated at dial time.
 var ipRe = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
 
 func extractIP(input string) string {
@@ -2025,11 +2104,28 @@ func extractIP(input string) string {
 		return ""
 	}
 	// Try to extract IP from any surrounding text
-	match := ipRe.FindString(input)
-	if match != "" {
+	if match := ipRe.FindString(input); match != "" && validIPv4(match) {
 		return match
 	}
 	return input
+}
+
+// validIPv4 reports whether s is four dot-separated octets in 0-255.
+func validIPv4(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) == 0 || len(p) > 3 {
+			return false
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil || n > 255 {
+			return false
+		}
+	}
+	return true
 }
 
 // sessionLogger buffers timestamped log entries until a target file is opened.
@@ -2245,29 +2341,39 @@ func saveChecksum(filePath string) {
 }
 
 // verifyChecksum checks .sha256 file against the actual file. Returns true if valid.
+// A missing .sha256 file returns true (nothing to verify against); a present
+// but empty/corrupt checksum file, or an unreadable image, returns false —
+// "cannot verify" must not be reported as "verified".
 func verifyChecksum(filePath string) bool {
 	data, err := os.ReadFile(filePath + ".sha256")
 	if err != nil {
 		return true // no checksum file to verify against
 	}
 
+	expected := strings.Fields(string(data))
+	if len(expected) == 0 {
+		fmt.Println("  [!] .sha256 校验文件为空,无法校验 (按校验失败处理)")
+		return false
+	}
+	if len(expected[0]) != 64 {
+		fmt.Printf("  [!] .sha256 校验文件格式无效 (%q),按校验失败处理\n", expected[0])
+		return false
+	}
+
 	f, err := os.Open(filePath)
 	if err != nil {
-		return true
+		fmt.Printf("  [!] 无法读取镜像文件进行校验: %v (按校验失败处理)\n", err)
+		return false
 	}
 	defer f.Close()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return true
+		fmt.Printf("  [!] 读取镜像文件失败: %v (按校验失败处理)\n", err)
+		return false
 	}
 
 	actual := fmt.Sprintf("%x", h.Sum(nil))
-	expected := strings.Fields(string(data))
-	if len(expected) == 0 {
-		return true
-	}
-
 	if actual != expected[0] {
 		fmt.Printf("  [!] SHA256 不匹配! 文件可能已损坏\n")
 		fmt.Printf("  期望: %s\n", expected[0])

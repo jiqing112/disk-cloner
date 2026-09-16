@@ -75,7 +75,7 @@ func Run(cfg Config) error {
 	if err := mountWithType(rootDev, mountRoot, rootFstype); err != nil {
 		// Fallback to auto-detect
 		if err2 := mount(rootDev, mountRoot); err2 != nil {
-			return fmt.Errorf("挂载根分区 %s: %w", rootDev, err)
+			return fmt.Errorf("挂载根分区 %s (fstype=%s): %v; 自动探测同样失败: %v", rootDev, rootFstype, err, err2)
 		}
 	}
 	defer umountAll()
@@ -155,8 +155,11 @@ func Run(cfg Config) error {
 
 	// ── 8. Reinstall GRUB ──────────────────────────────────────────
 	log("修复 GRUB 引导...")
+	// UEFI when the ESP is known from fstab (authoritative even when the
+	// ESP was never mounted here) or the EFI directory is present.
+	_, efiInFstab := fstabMounts["/boot/efi"]
 	efiDir := filepath.Join(mountRoot, "boot/efi/EFI")
-	isEFI := dirExists(efiDir)
+	isEFI := efiInFstab || dirExists(efiDir)
 
 	// Track a failed install so Run can report it instead of printing a
 	// misleading success line.
@@ -425,9 +428,11 @@ func detectDistro(mountpoint string) string {
 		{"centos", "centos"},
 		{"rocky", "rocky"},
 		{"alma", "alma"},
-		{"debian", "debian"},
+		// ubuntu/mint must be checked before debian: their os-release
+		// contains ID_LIKE=debian, which would otherwise match first.
 		{"ubuntu", "ubuntu"},
 		{"mint", "linuxmint"},
+		{"debian", "debian"},
 		{"arch", "arch"},
 		{"manjaro", "manjaro"},
 		{"opensuse", "opensuse"},
@@ -671,7 +676,7 @@ func umountAll() {
 			continue
 		}
 		mp := fields[1]
-		if strings.HasPrefix(mp, mountRoot) {
+		if mp == mountRoot || strings.HasPrefix(mp, mountRoot+"/") {
 			mounts = append(mounts, mp)
 		}
 	}
@@ -840,7 +845,9 @@ func fixFstab(rootMount string) error {
 				fields[3] = opts + ",nofail,x-systemd.device-timeout=10s"
 			}
 		} else if len(fields) == 2 {
-			fields = append(fields, "defaults", "nofail,x-systemd.device-timeout=10s", "0", "0")
+			// Malformed short line: fstype column must exist, otherwise
+			// mount fails with "unknown filesystem type defaults".
+			fields = append(fields, "auto", "defaults,nofail,x-systemd.device-timeout=10s", "0", "0")
 		} else if len(fields) == 3 {
 			fields = append(fields, "nofail,x-systemd.device-timeout=10s", "0", "0")
 		}

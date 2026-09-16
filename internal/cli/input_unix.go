@@ -116,43 +116,43 @@ func ReadInput(prompt, def string) string {
 	return input
 }
 
+// pipedBuf holds stdin data read ahead of the current line when input is a
+// pipe/redirect. A single Read can return several lines at once; without
+// this buffer everything after the first newline was silently dropped, so
+// `printf '1\n2\n' | tool` never saw the second line.
+var pipedBuf []byte
+
 // readLineSimple is a fallback for non-terminal stdin (pipes, redirects).
 // Data that arrives without a trailing newline (EOF) is still returned.
 func readLineSimple(def string) string {
-	var buf [4096]byte
-	total := 0
 	for {
-		n, err := os.Stdin.Read(buf[total:])
-		total += n
-		for i := 0; i < total; i++ {
-			if buf[i] == '\n' || buf[i] == '\r' {
-				input := strings.TrimSpace(string(buf[:i]))
+		for i := 0; i < len(pipedBuf); i++ {
+			if pipedBuf[i] == '\n' || pipedBuf[i] == '\r' {
+				input := strings.TrimSpace(string(pipedBuf[:i]))
+				pipedBuf = pipedBuf[i+1:]
 				if input == "" {
 					return def
 				}
 				return input
 			}
 		}
+		var chunk [4096]byte
+		n, err := os.Stdin.Read(chunk[:])
+		pipedBuf = append(pipedBuf, chunk[:n]...)
 		if err != nil {
-			// EOF (or error) before a newline: use what we got.
-			if total == 0 {
+			if n == 0 && len(pipedBuf) == 0 {
 				stdinEOF = true
+				return def
 			}
-			input := strings.TrimSpace(string(buf[:total]))
+			// EOF (or error) before a newline: use what we got.
+			input := strings.TrimSpace(string(pipedBuf))
+			pipedBuf = nil
 			if input == "" {
 				return def
 			}
 			return input
 		}
-		if total >= len(buf) {
-			break
-		}
 	}
-	input := strings.TrimSpace(string(buf[:total]))
-	if input == "" {
-		return def
-	}
-	return input
 }
 
 // ReadPassword reads a password without echoing to the terminal.

@@ -839,7 +839,8 @@ disk-cloner -H 192.168.1.100 -p password -s /dev/sda -o auto -z 0 -y
 | `-y` | 跳过确认提示 | false |
 | `-V` | 显示版本号 | — |
 | `--fix-boot-disk <磁盘>` | 独立修复引导：chroot 进系统重装 GRUB + 重建 initramfs + 修 fstab（详见 [引导修复](#引导修复-grub--initramfs)） | — |
-| `--no-fix-boot` | 模式 1 命令行（`-t`）时跳过自动引导修复 | — |
+| `--no-fix-boot` | 命令行克隆（`-t`）和恢复（`-r`）时跳过自动引导修复（交互模式不受影响） | — |
+| `-tls-verify` | 对 WebDAV/S3 的 HTTPS 启用证书校验（默认关闭；`-dst` URL 中也可加 `tlsverify=1` 参数） | false |
 
 ### 独立修复引导
 
@@ -1213,6 +1214,10 @@ A: 1) 确认 IP 和端口正确。2) 确认远程服务器已进入 Alpine RAM O
 ### Q: 主机密钥安全吗？
 
 A: 程序不保存/校验主机密钥——远程每次重启进入 Alpine RAM OS 都会重新生成主机密钥，固定指纹会导致每次连接都报错。作为补偿，连接成功后会显示服务器主机密钥的 SHA256 指纹，可在可信网络中与服务器上的 `/etc/ssh/ssh_host_*_key.pub` 核对。请勿在不可信网络（公共 Wi-Fi 等）中使用本工具传输。
+
+### Q: WebDAV / S3 的 HTTPS 证书校验是关闭的吗？
+
+A: 默认关闭（自建 NAS / MinIO 普遍使用自签名证书，开启会导致全部连接失败）。需要在不可信网络中启用时，加 `-tls-verify` 参数，或在 `-dst` URL 后附加 `tlsverify=1`（如 `davs://user:pass@nas.lan:5006/dav/img.img.gz?tlsverify=1`）。无论哪种方式，都建议配合 HTTPS 使用，避免 Basic Auth 凭据明文暴露。
 
 ### Q: 远程服务器磁盘名不是 sda？
 
