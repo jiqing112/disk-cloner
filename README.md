@@ -734,7 +734,7 @@ exit; reboot
 本机 = 源服务器 (Alpine RAM OS)                                 远程存储
 ┌──────────────────────────────────────────────┐
 │  dd if=/dev/sda | gzip -1                    │  ──▶  SFTP / FTP /
-│  SHA256 同步计算 (程序在内存里运行, 硬盘只读)   │        WebDAV / S3
+│  SHA256 同步计算 (程序在内存里运行, 硬盘只读)   │   WebDAV / S3 / Pixeldrain
 └──────────────────────────────────────────────┘
 ```
 
@@ -747,9 +747,12 @@ exit; reboot
 # 在源服务器上直接运行 (已进入 Alpine RAM OS)
 ./disk-cloner -l /dev/sda -dst 'sftp://user:pass@nas.lan/backup/' -y
 ./disk-cloner -l /dev/sda -dst 's3://AKID:SECRET@minio.lan:9000/bkt/img.gz?path=1' -y
+./disk-cloner -l /dev/sda -dst 'pixeldrain://:APIKEY@pixeldrain.com/backup.img.gz' -y
 ```
 
 零填充、重建 initramfs、SHA256 校验、失败清理等行为与模式 2 一致。
+
+> Pixeldrain URL 里的密码位就是 API Key（用户名位留空），`pd://` 是 `pixeldrain://` 的别名；上传成功后会打印 `https://pixeldrain.com/u/<id>` 分享链接和直链下载地址。
 
 > 程序必须运行在 Alpine RAM OS：启动后会先检测本机根文件系统，不是 tmpfs/overlay 时会要求确认。
 
@@ -764,6 +767,7 @@ exit; reboot
 | FTP | 内置 FTP 客户端（EPSV/PASV 被动模式，自动 MKD 建目录） |
 | WebDAV | HTTP PUT。自动探测服务器是否支持分块（chunked）上传；不支持时（如 nginx dav 模块）自动回退本地暂存后再 PUT |
 | S3 | AWS S3 及所有 S3 兼容存储（MinIO、Ceph 等）。手写 SigV4 签名 + 分片上传（起始 8 MiB，大镜像自动加倍到 256 MiB），支持虚拟主机与 path-style 两种寻址 |
+| Pixeldrain | 网盘直传（pixeldrain.com）。上传成功后直接给出分享链接，适合没有自己的存储服务器、想把镜像发给别人或存到云端的场景。需要 API Key（账户设置页生成），不支持匿名上传 |
 
 ### 传输前自动校验
 
@@ -1108,7 +1112,7 @@ reboot
 | 文件校验 | SHA256 | 客户端 |
 | 引导修复（远程） | chroot + dracut / update-initramfs / mkinitcpio + grub2-install + grub2-mkconfig + fstab 清理 | 远程服务器（模式 1/3 自动执行） |
 | 引导修复（本地） | 同上，单独模式 `--fix-boot-disk` | 本地（目标机进 RAM OS 后） |
-| 远程存储（模式 4） | SFTP（pkg/sftp）、FTP（内置客户端）、WebDAV（HTTP PUT + 分块探测）、S3（手写 SigV4 分片上传） | 本地客户端（流式转发，不落盘） |
+| 远程存储（模式 4） | SFTP（pkg/sftp）、FTP（内置客户端）、WebDAV（HTTP PUT + 分块探测）、S3（手写 SigV4 分片上传）、Pixeldrain（流式 PUT + API Key 预检） | 本地客户端（流式转发，不落盘） |
 | 文件系统一致性检查 | blkid 检测类型 + fsck.ext4 -fn（仅 ext 家族；xfs/btrfs 跳过） | 远程服务器 |
 | LVM 支持 | vgscan + vgchange -ay | 远程服务器 |
 | 进度刷新 | 异步 Sync，窗口最小化不影响 | 客户端 |

@@ -80,7 +80,7 @@ func main() {
 		noFixBoot   = flag.Bool("no-fix-boot", false, "跳过引导修复 (克隆和恢复模式均生效)")
 		fixBootDev  = flag.String("fix-boot-disk", "", "独立修复引导")
 		restoreFile = flag.String("r", "", "恢复 gzip 文件到远程磁盘")
-		dst         = flag.String("dst", "", "传输到远程存储 (sftp:// ftp:// dav:// davs:// s3://)")
+		dst         = flag.String("dst", "", "传输到远程存储 (sftp:// ftp:// dav:// davs:// s3:// pixeldrain://)")
 		localDisk   = flag.String("l", "", "本机磁盘作为源 (程序直接运行在源机 RAM OS, 需 Linux; 搭配 -dst 或 -o)")
 		tlsVerify   = flag.Bool("tls-verify", false, "对 WebDAV/S3 的 HTTPS 启用证书校验 (默认关闭; URL 中也可加 tlsverify=1)")
 		showVer     = flag.Bool("V", false, "显示版本号")
@@ -1484,7 +1484,8 @@ func askStorageConn() (storage.Config, bool) {
 	fmt.Println("  [2] FTP")
 	fmt.Println("  [3] WebDAV")
 	fmt.Println("  [4] S3 / 对象存储 (AWS S3, MinIO 等 S3 兼容)")
-	kind := cli.SelectOption("请输入序号", 1, 4)
+	fmt.Println("  [5] Pixeldrain (网盘直传, 需要 API Key)")
+	kind := cli.SelectOption("请输入序号", 1, 5)
 	if isBack(kind) {
 		return storage.Config{}, false
 	}
@@ -1539,6 +1540,17 @@ func askStorageConn() (storage.Config, bool) {
 		cfg.PathStyle = strings.HasPrefix(cli.ReadInput("寻址方式 (1=虚拟主机, 2=path-style, MinIO/自建选 2)", "1"), "2")
 		cfg.AccessKey = cli.ReadInput("Access Key ID", "")
 		cfg.SecretKey = cli.ReadPassword("Secret Access Key")
+	case 5:
+		cfg.Kind = storage.KindPixelDrain
+		cfg.Host = "pixeldrain.com"
+		cfg.Port = 443
+		cfg.UseTLS = true
+		fmt.Println("  API Key 在 pixeldrain.com 账户设置 (Account Settings) 页面获取")
+		cfg.Password = cli.ReadPassword("Pixeldrain API Key")
+		if cfg.Password == "" {
+			fmt.Println("  [!] Pixeldrain 不支持匿名上传,必须提供 API Key")
+			return cfg, false
+		}
 	}
 	return cfg, true
 }
@@ -1565,6 +1577,12 @@ func fillDestPath(cfg *storage.Config, defaultName string) bool {
 			return false
 		}
 		cfg.Key = k
+	case storage.KindPixelDrain:
+		p := cli.ReadInput("文件名 (在 pixeldrain 上显示的名称)", defaultName)
+		if p == "" {
+			return false
+		}
+		cfg.Path = p
 	}
 	return true
 }
@@ -1649,6 +1667,14 @@ func execSaveToStorage(srcDisk cli.DiskItem, runner sshclient.Runner,
 		logger.logf("上传收尾失败: %v", err)
 		fmt.Printf("\n  上传收尾失败: %v\n", err)
 		return
+	}
+	// Pixeldrain 等后端会上报可分享的链接
+	if linker, ok := w.(interface{ ShareURL() string }); ok {
+		if u := linker.ShareURL(); u != "" {
+			logger.logf("分享链接: %s", u)
+			fmt.Printf("  分享链接: %s\n", u)
+			fmt.Printf("  直链下载: %s?download\n", u)
+		}
 	}
 	logger.logf("传输完成")
 

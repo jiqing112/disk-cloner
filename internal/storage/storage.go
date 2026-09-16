@@ -19,10 +19,11 @@ import (
 
 // Supported storage backends.
 const (
-	KindSFTP   = "sftp"
-	KindFTP    = "ftp"
-	KindWebDAV = "webdav"
-	KindS3     = "s3"
+	KindSFTP       = "sftp"
+	KindFTP        = "ftp"
+	KindWebDAV     = "webdav"
+	KindS3         = "s3"
+	KindPixelDrain = "pixeldrain"
 )
 
 // Config describes one remote storage destination.
@@ -85,6 +86,8 @@ func Open(cfg Config) (Writer, error) {
 		return openWebDAV(cfg)
 	case KindS3:
 		return openS3(cfg)
+	case KindPixelDrain:
+		return openPixelDrain(cfg)
 	default:
 		return nil, fmt.Errorf("storage: unknown kind %q", cfg.Kind)
 	}
@@ -110,6 +113,12 @@ func Describe(cfg Config) string {
 			style = "path-style"
 		}
 		return fmt.Sprintf("s3://%s/%s @ %s (%s, %s)", cfg.Bucket, cfg.Key, cfg.Endpoint, scheme, style)
+	case KindPixelDrain:
+		scheme := "https"
+		if !cfg.UseTLS {
+			scheme = "http"
+		}
+		return fmt.Sprintf("pixeldrain://%s @ %s:%d (%s)", cfg.Path, cfg.Host, cfg.Port, scheme)
 	}
 	return cfg.Kind
 }
@@ -118,7 +127,7 @@ func Describe(cfg Config) string {
 // the local .sha256/.size/.log sidecar files.
 func BaseName(cfg Config) string {
 	switch cfg.Kind {
-	case KindSFTP, KindFTP:
+	case KindSFTP, KindFTP, KindPixelDrain:
 		return path.Base(cfg.Path)
 	case KindWebDAV:
 		if u, err := url.Parse(cfg.URL); err == nil {
@@ -134,8 +143,8 @@ func BaseName(cfg Config) string {
 // separator (CLI auto naming).
 func (c *Config) AppendName(name string) {
 	switch c.Kind {
-	case KindSFTP, KindFTP:
-		if strings.HasSuffix(c.Path, "/") {
+	case KindSFTP, KindFTP, KindPixelDrain:
+		if c.Path == "" || strings.HasSuffix(c.Path, "/") {
 			c.Path += name
 		}
 	case KindWebDAV:
@@ -150,11 +159,13 @@ func (c *Config) AppendName(name string) {
 }
 
 // NeedsName reports whether the destination ends with a directory separator
-// (or is empty for s3) and still needs a file name appended.
+// (or is empty for s3/pixeldrain) and still needs a file name appended.
 func (c *Config) NeedsName() bool {
 	switch c.Kind {
 	case KindSFTP, KindFTP:
 		return strings.HasSuffix(c.Path, "/")
+	case KindPixelDrain:
+		return c.Path == "" || strings.HasSuffix(c.Path, "/")
 	case KindWebDAV:
 		return strings.HasSuffix(c.URL, "/")
 	case KindS3:
@@ -170,10 +181,14 @@ func (c *Config) NeedsName() bool {
 //	dav://user:pass@host:port/dir/file.img.gz    (WebDAV over HTTP)
 //	davs://user:pass@host:port/dir/file.img.gz   (WebDAV over HTTPS)
 //	s3://access:secret@endpoint[:port]/bucket/key?region=xx&path=1&tls=0
+//	pixeldrain://:APIKEY@pixeldrain.com/file.img.gz   (别名 pd://)
 //
 // Percent-encode special characters in user/password (e.g. %40 for '@').
 // For s3, query params: region (default us-east-1), path=1 (path-style),
 // tls=0 (plain HTTP). webdav:// / webdavs:// are accepted as aliases.
+// For pixeldrain the password IS the API key (the username is ignored, an
+// empty username keeps the URL readable); tls=0 targets a plain-HTTP mirror
+// (handy for local testing).
 func ParseURL(raw string) (Config, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
@@ -252,8 +267,26 @@ func ParseURL(raw string) (Config, error) {
 		if cfg.Region == "" {
 			cfg.Region = "us-east-1"
 		}
+	case "pixeldrain", "pd":
+		cfg.Kind = KindPixelDrain
+		cfg.Host = u.Hostname()
+		if cfg.Host == "" {
+			cfg.Host = "pixeldrain.com"
+		}
+		cfg.Port = portOr(u.Port(), 443)
+		cfg.Path = strings.TrimPrefix(u.Path, "/")
+		cfg.UseTLS = q.Get("tls") != "0"
+		// The API key goes in the password position; also accept
+		// pd://KEY@host/... for readability.
+		if cfg.Password == "" && cfg.User != "" {
+			cfg.Password = cfg.User
+			cfg.User = ""
+		}
+		if cfg.Password == "" {
+			return cfg, fmt.Errorf("pixeldrain URL needs an API key (pixeldrain://:APIKEY@pixeldrain.com/file.img.gz)")
+		}
 	default:
-		return cfg, fmt.Errorf("unsupported storage scheme %q (use sftp:// ftp:// dav:// davs:// s3://)", u.Scheme)
+		return cfg, fmt.Errorf("unsupported storage scheme %q (use sftp:// ftp:// dav:// davs:// s3:// pixeldrain://)", u.Scheme)
 	}
 	// Percent-decoded credentials/paths can carry CR/LF/NUL that would allow
 	// control-channel or header injection on the wire — reject them here.
