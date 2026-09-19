@@ -74,9 +74,11 @@ bash reinstall.sh alpine --hold 1
 | 模式 1 克隆 | ✅ 必须进入 RAM OS | ✅ 必须进入 RAM OS |
 | 模式 2 保存 | ✅ 必须进入 RAM OS | 不需要（本地接收文件） |
 | 模式 3 恢复 | 不需要（本地发送文件） | ✅ 必须进入 RAM OS |
-| 模式 4 传输 | ✅ 必须进入 RAM OS | 不需要（存储服务器正常在线即可） |
+| 模式 4 传输 | ✅ 推荐（备份本机系统盘时必须） | 不需要（存储服务器正常在线即可） |
 
 > 模式 4 的"本机模式"下（`-l` 参数，或交互模式选 `[4]`），程序就运行在源服务器上，连 SSH 连接都不需要，只要存储服务可达。
+
+> 模式 4 的"推荐"指备份本机系统盘时必须先进 RAM OS（运行中的根分区卸不掉，dd 前会中止）；备份本机数据盘（分区已卸载）时，在普通 Linux 上确认风险后即可传输。
 
 > 如果使用 Windows 运行程序做模式 2 或模式 3，Windows 端不需要进入 RAM OS（Windows 不做 dd 操作）。
 
@@ -737,7 +739,7 @@ exit; reboot
 
 ## 模式 4 — 传输到远程存储
 
-把本机硬盘的 dd 流直接推到远程存储服务（SFTP / FTP / WebDAV / S3 兼容对象存储 / Pixeldrain 网盘），**镜像不占用任何本地磁盘空间**。程序运行在被克隆的服务器上（Alpine RAM OS），本机硬盘只读，数据在内存中压缩后即刻上传。仅 Linux。
+把本机硬盘的 dd 流直接推到远程存储服务（SFTP / FTP / WebDAV / S3 兼容对象存储 / Pixeldrain 网盘），**镜像不占用任何本地磁盘空间**。程序运行在被克隆的服务器上，本机硬盘只读，数据在内存中压缩后即刻上传。仅支持 Linux：推荐在 Alpine RAM OS 中运行（物理盘完全未挂载，整盘镜像才一致）；在其他 Linux 上运行时程序会检测环境并要求确认，且源盘所有分区必须已卸载，否则会在 dd 开始前中止。
 
 ### 数据流
 
@@ -765,7 +767,7 @@ exit; reboot
 
 > Pixeldrain URL 里的密码位就是 API Key（用户名位留空），`pd://` 是 `pixeldrain://` 的别名；上传成功后会打印 `https://pixeldrain.com/u/<id>` 分享链接和直链下载地址。大小限制、保留策略、隐私注意事项见下方 [Pixeldrain 详解](#pixeldrain-详解)。
 
-> 程序必须运行在 Alpine RAM OS：启动后会先检测本机根文件系统，不是 tmpfs/overlay 时会要求确认。
+> 推荐运行在 Alpine RAM OS：启动后会先检测本机根文件系统，检测通过（Alpine + tmpfs/overlay）直接继续，否则要求确认风险后才能继续（命令行模式用 `-y` 跳过确认）。
 
 > 高级用法：命令行 `-dst` 也可以搭配 `-H/-s` 在一台中转机上运行（通过 SSH 读取远端磁盘后转发给存储），适合脚本化批量备份：
 > `disk-cloner -H 192.168.1.100 -p password -s /dev/sda -dst 'sftp://user:pass@nas.lan/backup/' -y`
