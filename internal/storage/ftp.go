@@ -21,6 +21,11 @@ type ftpClient struct {
 	conn net.Conn
 	r    *bufio.Reader
 	w    *bufio.Writer
+	// mu serializes all use of the control channel (command write + reply
+	// read). The stor goroutine holds it while awaiting the final reply;
+	// teardown paths acquire it (bounded) before sending DELE/QUIT so the
+	// two sides never interleave reads on the same bufio.Reader.
+	mu sync.Mutex
 }
 
 func ftpDial(host string, port int, timeout time.Duration) (*ftpClient, error) {
@@ -29,7 +34,7 @@ func ftpDial(host string, port int, timeout time.Duration) (*ftpClient, error) {
 		return nil, err
 	}
 	c := &ftpClient{host: host, conn: conn, r: bufio.NewReader(conn), w: bufio.NewWriter(conn)}
-	code, _, err := c.readResp()
+	code, _, err := c.readRespLocked()
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("ftp: no greeting: %w", err)
@@ -41,11 +46,13 @@ func ftpDial(host string, port int, timeout time.Duration) (*ftpClient, error) {
 	return c, nil
 }
 
-// readResp reads one (possibly multi-line) FTP reply, e.g.
+// readRespLocked reads one (possibly multi-line) FTP reply, e.g.
 //
 //	230-Go ahead
 //	230 logged in
-func (c *ftpClient) readResp() (int, string, error) {
+//
+// The caller must hold c.mu.
+func (c *ftpClient) readRespLocked() (int, string, error) {
 	var lines []string
 	code := 0
 	for {
@@ -71,23 +78,70 @@ func (c *ftpClient) readResp() (int, string, error) {
 	return code, strings.Join(lines, "\n"), nil
 }
 
-func (c *ftpClient) cmd(format string, args ...interface{}) (int, string, error) {
-	command := fmt.Sprintf(format, args...)
+// sendLocked writes one command line. The caller must hold c.mu.
+func (c *ftpClient) sendLocked(command string) error {
 	if hasCtl(command) {
-		return 0, "", fmt.Errorf("ftp: command contains control characters")
+		return fmt.Errorf("ftp: command contains control characters")
 	}
 	fmt.Fprint(c.w, command+"\r\n")
-	if err := wFlush(c.w); err != nil {
+	return wFlush(c.w)
+}
+
+func (c *ftpClient) cmd(format string, args ...interface{}) (int, string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.sendLocked(fmt.Sprintf(format, args...)); err != nil {
 		return 0, "", err
 	}
-	return c.readResp()
+	return c.readRespLocked()
 }
 
 func wFlush(w *bufio.Writer) error { return w.Flush() }
 
-func (c *ftpClient) quit() {
-	c.cmd("QUIT")
+// quitLocked sends QUIT and closes the connection. The caller must hold
+// c.mu; the reply drain is bounded so a mute server cannot block teardown.
+func (c *ftpClient) quitLocked() {
+	c.sendLocked("QUIT")
+	c.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	c.readRespLocked()
 	c.conn.Close()
+}
+
+func (c *ftpClient) quit() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.quitLocked()
+}
+
+// tryLock acquires the control-channel lock, giving up after d. Returns
+// false when the stor goroutine still holds it (blocked reading a reply).
+func (c *ftpClient) tryLock(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		if c.mu.TryLock() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// teardown deletes the partial file (when asked) and closes the control
+// connection. It runs only when the control channel is idle; when the stor
+// goroutine still holds it, the connection is dropped instead so its
+// blocked read errors out rather than stealing teardown's replies.
+func (c *ftpClient) teardown(path string, delete bool) {
+	if !c.tryLock(3 * time.Second) {
+		c.conn.Close()
+		return
+	}
+	defer c.mu.Unlock()
+	if delete {
+		c.sendLocked("DELE " + path)
+	}
+	c.quitLocked()
 }
 
 // login performs USER/PASS and fails on 5xx replies.
@@ -160,12 +214,25 @@ func ftpParsePASV(msg string) int {
 	if open < 0 {
 		return 0
 	}
-	f := strings.Split(strings.Trim(msg[open:], "()"), ",")
+	rest := msg[open+1:]
+	// Replies often carry text after the closing paren —
+	// "227 Entering passive mode (127,0,0,1,195,80)." (pyftpdlib, vsftpd).
+	// Take exactly the parenthesized body; parsing failures are errors
+	// (port 0), never silently-zeroed fields — a zeroed low byte dialed a
+	// port 256 below the negotiated one.
+	closing := strings.Index(rest, ")")
+	if closing < 0 {
+		return 0
+	}
+	f := strings.Split(rest[:closing], ",")
 	if len(f) != 6 {
 		return 0
 	}
-	p1, _ := strconv.Atoi(strings.TrimSpace(f[4]))
-	p2, _ := strconv.Atoi(strings.TrimSpace(f[5]))
+	p1, err1 := strconv.Atoi(strings.TrimSpace(f[4]))
+	p2, err2 := strconv.Atoi(strings.TrimSpace(f[5]))
+	if err1 != nil || err2 != nil || p1 < 0 || p2 < 0 {
+		return 0
+	}
 	return p1*256 + p2
 }
 
@@ -190,7 +257,12 @@ func (c *ftpClient) stor(path string, r io.Reader, accepted chan<- struct{}) err
 	close(accepted)
 	_, copyErr := io.Copy(data, r)
 	data.Close()
-	code2, msg2, respErr := c.readResp()
+	// Hold the control-channel lock while reading the final reply so the
+	// teardown path in finish() cannot interleave a DELE/SIZE on the same
+	// bufio.Reader.
+	c.mu.Lock()
+	code2, msg2, respErr := c.readRespLocked()
+	c.mu.Unlock()
 	if copyErr != nil {
 		return copyErr
 	}
@@ -318,17 +390,37 @@ func (w *ftpWriter) Abort() error {
 	return nil
 }
 
-// remoteSize queries the uploaded file's size via SIZE (TYPE I active).
-func (c *ftpClient) remoteSize(path string) (int64, bool) {
-	code, msg, err := c.cmd("SIZE %s", path)
+// remoteSizeLocked queries the uploaded file's size via SIZE (TYPE I
+// active). The caller must hold the control-channel lock.
+func (c *ftpClient) remoteSizeLocked(path string) (int64, bool) {
+	if err := c.sendLocked("SIZE " + path); err != nil {
+		return 0, false
+	}
+	code, msg, err := c.readRespLocked()
 	if err != nil || code != 213 {
 		return 0, false
 	}
-	n, err := strconv.ParseInt(strings.TrimSpace(msg), 10, 64)
+	// readResp returns the reply WITH its numeric prefix ("213 4096") —
+	// strip it or ParseInt always failed and this verification never
+	// matched anything.
+	n, err := strconv.ParseInt(strings.TrimSpace(ftpStripCode(msg)), 10, 64)
 	if err != nil || n < 0 {
 		return 0, false
 	}
 	return n, true
+}
+
+// ftpStripCode removes the leading 3-digit reply code (and separator) from
+// a single-line FTP reply: "213 4096" → "4096". Anything that doesn't start
+// with digits followed by a separator is returned unchanged.
+func ftpStripCode(msg string) string {
+	s := strings.TrimSpace(msg)
+	if len(s) >= 4 {
+		if _, err := strconv.Atoi(s[:3]); err == nil && (s[3] == ' ' || s[3] == '-') {
+			return strings.TrimSpace(s[4:])
+		}
+	}
+	return s
 }
 
 func (w *ftpWriter) finish(abandon bool) error {
@@ -352,14 +444,11 @@ func (w *ftpWriter) finish(abandon bool) error {
 		err = fmt.Errorf("ftp: no final reply from server within %s", finalizeWait)
 	}
 	if abandon {
-		// Wait for the stor goroutine so the control connection is not used
-		// concurrently, then remove the partial file.
-		select {
-		case <-w.done:
-		case <-time.After(5 * time.Second):
-		}
-		w.c.cmd("DELE %s", w.path) // remove partial, ignore errors
-		w.c.quit()
+		// The stor goroutine has exited (done received) or is stuck holding
+		// the control channel (timed out) — teardown sends DELE only when
+		// the channel is idle, otherwise it drops the connection and the
+		// goroutine's blocked read errors out.
+		w.c.teardown(w.path, true)
 		return nil
 	}
 	if err != nil {
@@ -367,14 +456,24 @@ func (w *ftpWriter) finish(abandon bool) error {
 		// complete before declaring failure. Only delete when the server
 		// itself reported a transfer error — never on an unknown outcome.
 		if timedOut {
-			if n, ok := w.c.remoteSize(w.path); ok && n == w.written.Load() {
-				w.c.quit()
-				return nil
+			if w.c.tryLock(3 * time.Second) {
+				complete := false
+				if n, ok := w.c.remoteSizeLocked(w.path); ok && n == w.written.Load() {
+					complete = true
+				}
+				w.c.quitLocked()
+				if complete {
+					return nil
+				}
+			} else {
+				w.c.conn.Close()
 			}
-			w.c.quit()
 			return fmt.Errorf("%w (file kept on server — verify its size with SIZE/ls before trusting it)", err)
 		}
-		w.c.cmd("DELE %s", w.path) // server rejected the transfer: remove partial, ignore errors
+		// The server itself reported a transfer error — the partial file is
+		// definitely partial, remove it.
+		w.c.teardown(w.path, true)
+		return err
 	}
 	w.c.quit()
 	return err

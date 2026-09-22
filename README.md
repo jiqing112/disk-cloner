@@ -729,9 +729,9 @@ exit; reboot
 
 ### BIOS vs UEFI
 
-修复时程序会自动检测 `/boot/efi/EFI` 目录是否存在：
-- **存在** = UEFI 模式 → `grub2-install --target=x86_64-efi --efi-directory=/boot/efi` + 用 `efibootmgr` 添加 UEFI 启动项
-- **不存在** = BIOS / Legacy 模式 → `grub2-install --recheck <磁盘>`
+修复时程序按以下优先级判断启动模式：**本机固件**（`/sys/firmware/efi` 目录存在 = UEFI，程序本来就运行在目标机的 RAM OS 里，固件即最终启动环境）→ fstab 中的 `/boot/efi` 条目 → ESP 目录探测（含 `/boot` 直接作为 ESP 的布局），UEFI 模式下还会扫描目标盘的 vfat 分区自动定位 ESP：
+- **UEFI 模式** = `grub2-install --target=x86_64-efi --efi-directory=/boot/efi` + 用 `efibootmgr` 添加 UEFI 启动项
+- **BIOS / Legacy 模式** = `grub2-install --recheck <磁盘>`
 
 **前提**：源机器和目标机的启动模式要一致。CentOS 7 / 旧版云服务器多数是 BIOS；现代 UEFI 服务器恢复到 BIOS 虚拟机（或反过来）即使修复了 GRUB 也不能启动。可用 `ls /sys/firmware/efi` 检查：存在目录 = UEFI，不存在 = BIOS。
 
@@ -813,7 +813,7 @@ disk-cloner -l /dev/sda -dst 'pd://APIKEY@pixeldrain.com/myserver-sda.img.gz' -y
 
 ### 传输前自动校验
 
-连接存储服务器在零填充**之前**进行——账号密码错误、路径/桶不可写、权限不足会在几秒内报错返回，不会白白跑完几小时的零填充才发现存不了。
+连接存储服务器在零填充**之前**进行——账号密码错误、路径/桶不可写、权限不足会在几秒内报错返回，不会白白跑完几小时的零填充才发现存不了。WebDAV 会先探测服务器是否接受分块上传：仅当服务器明确表示不支持分块（411/501，如 nginx dav 模块）时才回退本地暂存后再 PUT；认证失败、路径不存在、服务器 5xx 等错误会在探测阶段直接报错，不会默默切到暂存模式。
 
 ### 传输失败自动清理
 

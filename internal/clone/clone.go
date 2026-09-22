@@ -338,17 +338,56 @@ func (j *CloneJob) mountedSourcePartitions(src string) []string {
 		diskBase = src[i+1:]
 	}
 	out, _ := j.runner.CombinedOutput("cat /proc/mounts 2>/dev/null")
+	// LVM logical volumes appear in /proc/mounts as /dev/mapper/<vg>-<lv>
+	// or /dev/dm-N — names that bear no relation to the source disk name,
+	// so they can only be attributed via the kernel's slave topology.
+	lvmDevs := j.lvmDevicesOnDisk(src)
 	var mounted []string
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
 		}
-		if devMatchesSourceDisk(fields[0], diskBase) {
+		if devMatchesSourceDisk(fields[0], diskBase) || lvmDevs[fields[0]] {
 			mounted = append(mounted, fields[1])
 		}
 	}
 	return mounted
+}
+
+// lvmDevicesOnDisk returns the set of device paths of device-mapper volumes
+// that physically live on the source disk — a dm device counts when any of
+// its /sys/block/dm-N/slaves is the disk or one of its partitions. Without
+// this, a still-mounted LVM root (/dev/mapper/vg-root) was invisible to the
+// pre-dd "must abort" check and dd produced a torn image of a live FS.
+func (j *CloneJob) lvmDevicesOnDisk(src string) map[string]bool {
+	set := map[string]bool{}
+	diskBase := src
+	if i := strings.LastIndex(src, "/"); i >= 0 {
+		diskBase = src[i+1:]
+	}
+	script := fmt.Sprintf(`diskbase=%s
+for d in /sys/block/dm-*; do
+  [ -d "$d/slaves" ] || continue
+  owned=0
+  for s in "$d"/slaves/*; do
+    sname=${s##*/}
+    case "$sname" in
+      "$diskbase"|"$diskbase"p[0-9]*|"$diskbase"[0-9]*) owned=1 ;;
+    esac
+  done
+  [ "$owned" = "1" ] || continue
+  name=$(cat "$d/dm/name" 2>/dev/null)
+  [ -n "$name" ] && echo "/dev/mapper/$name"
+  echo "/dev/${d##*/}"
+done`, shellQuote(diskBase))
+	out, _ := j.runner.CombinedOutput(script)
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			set[line] = true
+		}
+	}
+	return set
 }
 
 // devMatchesSourceDisk reports whether a /proc/mounts device field is a
@@ -1115,6 +1154,11 @@ func (j *CloneJob) FixBoot(targetDisk string) error {
 	if j.runner == nil {
 		return fmt.Errorf("SSH client is nil")
 	}
+	if targetDisk != "" {
+		if err := validateDevicePath(targetDisk); err != nil {
+			return fmt.Errorf("invalid target disk: %w", err)
+		}
+	}
 
 	if targetDisk != "" {
 		j.logFn("  重建引导 (GRUB + initramfs) 以兼容不同硬件...")
@@ -1126,9 +1170,17 @@ func (j *CloneJob) FixBoot(targetDisk string) error {
 	j.runner.CombinedOutput("apk add --quiet lvm2 2>/dev/null")
 	j.runner.CombinedOutput("lvm vgscan --mknodes 2>/dev/null; lvm vgchange -ay 2>/dev/null")
 
+	// Root-partition candidates must come from the disk being repaired —
+	// the target disk in restore mode, the source disk in save mode.
+	// Scanning every partition on the machine could pick another disk's
+	// root and rebuild the wrong system.
+	scanDisk := targetDisk
+	if scanDisk == "" {
+		scanDisk = j.params.SourcePath
+	}
 	out, _ := j.runner.CombinedOutput(fmt.Sprintf(
-		`lsblk -ln -o NAME,TYPE,FSTYPE 2>/dev/null | awk '$2=="part"&&$3!=""&&$3!="swap"{print "/dev/"$1}'; lsblk -ln -o NAME,TYPE,FSTYPE 2>/dev/null | awk '$2=="lvm"&&$3!=""&&$3!="swap"{print "/dev/mapper/"$1}'`,
-	))
+		`lsblk -ln -o NAME,TYPE,FSTYPE %s 2>/dev/null | awk '$2=="part"&&$3!=""&&$3!="swap"{print "/dev/"$1}'; lsblk -ln -o NAME,TYPE,FSTYPE %s 2>/dev/null | awk '$2=="lvm"&&$3!=""&&$3!="swap"{print "/dev/mapper/"$1}'`,
+		shellQuote(scanDisk), shellQuote(scanDisk)))
 
 	rootDev := ""
 	for _, dev := range strings.Split(out, "\n") {
@@ -1187,7 +1239,15 @@ BOOTENT=$(awk '!/^[[:space:]]*#/ && $2=="/boot" {print $1; exit}' /mnt/etc/fstab
 if [ -n "$BOOTENT" ]; then
   BOOTDEV=$(parse_fstab_dev "$BOOTENT")
   if [ -n "$BOOTDEV" ] && [ -b "$BOOTDEV" ]; then
-    mount "$BOOTDEV" /mnt/boot 2>/dev/null && echo "  mounted /boot <- $BOOTDEV"
+    if mount "$BOOTDEV" /mnt/boot 2>/dev/null; then
+      echo "  mounted /boot <- $BOOTDEV"
+    else
+      # A separate /boot that cannot be mounted means initramfs/GRUB work
+      # would write into a shadowed directory on the root partition and
+      # silently vanish when the real /boot comes back — abort instead.
+      echo "BOOT_MOUNT_FAILED"
+      exit 1
+    fi
   fi
 fi
 EFIENT=$(awk '!/^[[:space:]]*#/ && $2=="/boot/efi" {print $1; exit}' /mnt/etc/fstab 2>/dev/null)
@@ -1195,7 +1255,11 @@ if [ -n "$EFIENT" ]; then
   EFIDEV=$(parse_fstab_dev "$EFIENT")
   if [ -n "$EFIDEV" ] && [ -b "$EFIDEV" ]; then
     mkdir -p /mnt/boot/efi 2>/dev/null
-    mount "$EFIDEV" /mnt/boot/efi 2>/dev/null && echo "  mounted /boot/efi <- $EFIDEV"
+    if mount "$EFIDEV" /mnt/boot/efi 2>/dev/null; then
+      echo "  mounted /boot/efi <- $EFIDEV"
+    else
+      echo "  warn: could not mount /boot/efi (UEFI GRUB install may fail)"
+    fi
   fi
 fi
 
@@ -1230,23 +1294,50 @@ if [ -n "$TARGETDISK" ]; then
   # Ensure /etc/mtab exists inside chroot (some minimal images lack it)
   [ -e /mnt/etc/mtab ] || ln -sf /proc/self/mounts /mnt/etc/mtab
 
+  # Boot mode follows the machine's own firmware: this tool runs on the box
+  # that will boot the disk, and /sys/firmware/efi exists only on UEFI
+  # boots. Guessing from directory layout alone misdetected UEFI systems
+  # (ESP at /boot or /efi) as BIOS and wrote a broken legacy install.
+  FWEFI=0
+  [ -d /sys/firmware/efi ] && FWEFI=1
+
   GRUB_RC=1
+  MKCFG_RC=0
+  GRUBNAME=""
+  CFGNAME=""
+  CFGFILE=""
   if [ -x /mnt/usr/sbin/grub2-install ]; then
-    echo "  -> grub2-install --recheck $TARGETDISK"
-    chroot /mnt /usr/sbin/grub2-install --recheck "$TARGETDISK" 2>&1 && GRUB_RC=0
-    if [ $GRUB_RC -eq 0 ] && [ -x /mnt/usr/sbin/grub2-mkconfig ]; then
-      chroot /mnt /usr/sbin/grub2-mkconfig -o /boot/grub2/grub.cfg 2>&1
-    fi
+    GRUBNAME=grub2-install
+    [ -x /mnt/usr/sbin/grub2-mkconfig ] && CFGNAME=grub2-mkconfig && CFGFILE=/boot/grub2/grub.cfg
   elif [ -x /mnt/usr/sbin/grub-install ]; then
-    echo "  -> grub-install --recheck $TARGETDISK"
-    chroot /mnt /usr/sbin/grub-install --recheck "$TARGETDISK" 2>&1 && GRUB_RC=0
-    if [ $GRUB_RC -eq 0 ] && [ -x /mnt/usr/sbin/grub-mkconfig ]; then
-      chroot /mnt /usr/sbin/grub-mkconfig -o /boot/grub/grub.cfg 2>&1
-    fi
+    GRUBNAME=grub-install
+    [ -x /mnt/usr/sbin/grub-mkconfig ] && CFGNAME=grub-mkconfig && CFGFILE=/boot/grub/grub.cfg
   else
     echo "NO_GRUB_TOOL"
   fi
-  [ $GRUB_RC -ne 0 ] && echo "GRUB_INSTALL_FAILED" && RC=1
+
+  if [ -n "$GRUBNAME" ]; then
+    if [ "$FWEFI" = "1" ]; then
+      echo "  -> $GRUBNAME --target=x86_64-efi --efi-directory=/boot/efi (UEFI firmware)"
+      chroot /mnt /usr/sbin/$GRUBNAME --target=x86_64-efi --efi-directory=/boot/efi --recheck 2>&1
+      GRUB_RC=$?
+    else
+      echo "  -> $GRUBNAME --recheck $TARGETDISK (BIOS/Legacy firmware)"
+      chroot /mnt /usr/sbin/$GRUBNAME --recheck "$TARGETDISK" 2>&1
+      GRUB_RC=$?
+    fi
+    # grub.cfg regeneration is tracked separately: a stale grub.cfg (old
+    # UUIDs) boots as badly as a failed install, so its failure must be
+    # reported, not swallowed.
+    if [ $GRUB_RC -eq 0 ] && [ -n "$CFGNAME" ]; then
+      echo "  -> $CFGNAME -o $CFGFILE"
+      chroot /mnt /usr/sbin/$CFGNAME -o "$CFGFILE" 2>&1
+      MKCFG_RC=$?
+    fi
+  fi
+  [ "$GRUBNAME" = "" ] && echo "GRUB_INSTALL_FAILED" && RC=1
+  [ "$GRUBNAME" != "" ] && [ $GRUB_RC -ne 0 ] && echo "GRUB_INSTALL_FAILED" && RC=1
+  [ $MKCFG_RC -ne 0 ] && echo "GRUB_MKCONFIG_FAILED" && RC=1
 
   # --- Fix fstab: comment out mounts for devices that no longer exist ---
   if [ -f /mnt/etc/fstab ]; then
@@ -1328,9 +1419,15 @@ exit $RC
 	case strings.Contains(out2, "FAIL noroot"):
 		j.logFn("  [!] Mounted partition does not look like a root filesystem")
 		return fmt.Errorf("boot repair: mounted partition does not look like a root filesystem")
+	case strings.Contains(out2, "BOOT_MOUNT_FAILED"):
+		j.logFn("  [!] Failed to mount the separate /boot partition — aborted")
+		return fmt.Errorf("boot repair: failed to mount the separate /boot partition (rebuilding initramfs into a shadowed /boot would silently be lost)")
 	case strings.Contains(out2, "GRUB_INSTALL_FAILED"):
 		j.logFn("  [!] Initramfs rebuilt, but GRUB reinstall failed — you may need to run grub2-install manually")
 		return fmt.Errorf("boot repair: GRUB reinstall failed (initramfs was rebuilt); run grub-install --recheck manually")
+	case strings.Contains(out2, "GRUB_MKCONFIG_FAILED"):
+		j.logFn("  [!] GRUB reinstalled but grub.cfg generation failed — run grub-mkconfig manually")
+		return fmt.Errorf("boot repair: GRUB config regeneration failed (GRUB was reinstalled); run grub-mkconfig manually")
 	case err2 != nil:
 		j.logFn("  [!] Boot repair failed — you may need to fix boot manually")
 		return fmt.Errorf("boot repair script failed: %v", err2)

@@ -77,11 +77,14 @@ func ReadPassword(prompt string) string {
 		if err != nil {
 			return ""
 		}
-		return strings.TrimSpace(string(pass))
+		// Only the line terminator is stripped: leading/trailing spaces
+		// are legal password characters and silently trimming them
+		// produces auth failures that are nearly impossible to diagnose.
+		return strings.TrimRight(string(pass), "\r\n")
 	}
 	// Not a console (piped input) — fall back to a plain line read.
 	line, _ := readLine()
-	return strings.TrimSpace(line)
+	return strings.TrimRight(line, "\r\n")
 }
 
 // ReadInputPath reads a file path. The Windows console driver handles line

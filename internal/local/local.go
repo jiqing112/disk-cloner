@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"sync"
 	"syscall"
 
 	"golang.org/x/crypto/ssh"
@@ -67,22 +68,31 @@ type proc struct {
 	stdout io.Reader
 	stderr io.Reader
 	stdin  io.WriteCloser
+
+	waitOnce sync.Once
+	waitErr  error
 }
 
 func (p *proc) Stdout() io.Reader     { return p.stdout }
 func (p *proc) Stderr() io.Reader     { return p.stderr }
 func (p *proc) Stdin() io.WriteCloser { return p.stdin }
 
+// Wait blocks for the process and is idempotent — repeat calls return the
+// same result, so Close-then-Wait orderings never error with
+// "Wait was already called".
 func (p *proc) Wait() error {
-	return p.cmd.Wait()
+	p.waitOnce.Do(func() { p.waitErr = p.cmd.Wait() })
+	return p.waitErr
 }
 
-// Close tears the process down (used on abort/error paths). After a
+// Close tears the process down (used on abort/error paths) AND reaps it,
+// so a caller that only Close never leaves a zombie behind. After a
 // completed Wait the kill errors harmlessly.
 func (p *proc) Close() error {
 	if p.cmd.Process != nil {
 		_ = p.cmd.Process.Kill()
 	}
+	p.Wait()
 	return nil
 }
 

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,12 @@ import (
 	"sync"
 	"time"
 )
+
+// errWebDAVClosed is returned by Write after Close/Abort — every other
+// backend returns an error for this misuse, and the spool writer used to
+// nil-panic instead (finish() clears the spool file but Write fell through
+// to the unset pipe writer).
+var errWebDAVClosed = errors.New("webdav: writer already closed")
 
 // openWebDAV uploads via HTTP PUT. Most WebDAV servers accept chunked
 // uploads (which allow true streaming), but some (e.g. nginx dav_module)
@@ -26,7 +33,11 @@ func openWebDAV(cfg Config) (Writer, error) {
 	client := httpClient(cfg.InsecureTLS)
 	webdavMkcolParents(client, cfg.URL, cfg.User, cfg.Password)
 
-	if webdavProbeChunked(client, cfg.URL, cfg.User, cfg.Password) {
+	chunked, err := webdavProbeChunked(client, cfg.URL, cfg.User, cfg.Password)
+	if err != nil {
+		return nil, err
+	}
+	if chunked {
 		return webdavStreamWriter(client, cfg)
 	}
 	if cfg.Logf != nil {
@@ -36,26 +47,42 @@ func openWebDAV(cfg Config) (Writer, error) {
 }
 
 // webdavProbeChunked checks whether the server accepts a chunked PUT by
-// writing (and deleting) a tiny probe file. Returns false when the server
-// rejects chunked bodies (411/501) or drops the connection.
-func webdavProbeChunked(client *http.Client, fileURL, user, pass string) bool {
+// writing (and deleting) a tiny probe file. chunked=false is returned ONLY
+// for the statuses that genuinely mean "chunked bodies not supported"
+// (411 Length Required / 501), which trigger the Content-Length spool
+// fallback. Any other failure — bad credentials (401), forbidden (403),
+// missing parent (409), server error (5xx), unreachable host — is returned
+// as an error so Open fails fast: silently falling back to spool mode here
+// used to buffer the entire image into a local temp file (RAM on tmpfs
+// systems) only to die hours later with the same error.
+func webdavProbeChunked(client *http.Client, fileURL, user, pass string) (bool, error) {
 	probe := fileURL + ".diskcloner-probe"
 	// io.NopCloser hides the concrete reader type from http.NewRequest, so
 	// ContentLength stays 0 and the request goes out with chunked encoding.
 	body := io.NopCloser(strings.NewReader("ok"))
 	req, err := http.NewRequest(http.MethodPut, probe, body)
 	if err != nil {
-		return false
+		return false, err
 	}
 	req.SetBasicAuth(user, pass)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return false, fmt.Errorf("webdav: 探测失败 (无法连接 %s): %w", fileURL, err)
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
-	ok := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		// chunked upload accepted
+	case resp.StatusCode == http.StatusLengthRequired || resp.StatusCode == http.StatusNotImplemented:
+		// Server requires a known length (nginx dav_module and friends) —
+		// the spool fallback exists for exactly this case.
+		return false, nil
+	default:
+		return false, fmt.Errorf("webdav: 服务器拒绝了上传探测: %s (请检查认证信息/路径/服务器状态)", resp.Status)
+	}
 
 	if dreq, err := http.NewRequest(http.MethodDelete, probe, nil); err == nil {
 		dreq.SetBasicAuth(user, pass)
@@ -64,7 +91,7 @@ func webdavProbeChunked(client *http.Client, fileURL, user, pass string) bool {
 			dresp.Body.Close()
 		}
 	}
-	return ok
+	return true, nil
 }
 
 // webdavMkcolParents creates parent collections of fileURL one level at a
@@ -180,6 +207,11 @@ type webdavWriter struct {
 }
 
 func (w *webdavWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.finished {
+		return 0, errWebDAVClosed
+	}
 	if w.spool != nil {
 		n, err := w.spool.Write(p)
 		w.size += int64(n)

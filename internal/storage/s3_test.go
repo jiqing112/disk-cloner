@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -47,11 +48,13 @@ type fakeS3 struct {
 	completeXML string
 	failParts   bool
 	authSeen    bool
+	lastPath    string
 }
 
 func (s *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lastPath = r.URL.Path
 	s.authSeen = strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 Credential=") &&
 		r.Header.Get("x-amz-content-sha256") != ""
 	if !s.authSeen {
@@ -188,5 +191,86 @@ func TestS3CreateMultipartFailureFailsFast(t *testing.T) {
 	}
 	if _, err := Open(cfg); err == nil || !strings.Contains(err.Error(), "bad creds") {
 		t.Fatalf("Open = %v, want AccessDenied message", err)
+	}
+}
+
+// TestS3KeyEncodedOnceOnTheWire: the object key must be percent-encoded
+// exactly once. It used to be encoded twice (pre-encoded into w.key, then
+// the whole path again into RawPath), so keys with spaces or non-ASCII
+// characters were stored under mojibake names like "%E5%A4%87%E4%BB%BD".
+func TestS3KeyEncodedOnceOnTheWire(t *testing.T) {
+	srv := &fakeS3{}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	const key = "备份 dir/my file.img.gz"
+	cfg := Config{
+		Kind: KindS3, Endpoint: ts.Listener.Addr().String(),
+		UseTLS: false, Region: "us-east-1", Bucket: "bkt", Key: key,
+		AccessKey: "AKID", SecretKey: "SECRET", PathStyle: true, InsecureTLS: true,
+	}
+	w, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := w.Write([]byte("payload")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	// The server's decoded path must be exactly the original key — any
+	// double encoding leaves literal %XX sequences behind after one decode.
+	if want := "/bkt/" + key; srv.lastPath != want {
+		t.Fatalf("server saw path %q, want %q", srv.lastPath, want)
+	}
+}
+
+// TestS3CompleteRetriesTransportError: one dropped connection during
+// CompleteMultipartUpload must be retried, not abort the whole multipart
+// upload and destroy hours of transfer.
+func TestS3CompleteRetriesTransportError(t *testing.T) {
+	var completes int32
+	srv := &fakeS3{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Get("uploadId") != "" {
+			if atomic.AddInt32(&completes, 1) == 1 {
+				// Drop the connection without a reply — a transient network
+				// hiccup at finalize time.
+				if hj, ok := w.(http.Hijacker); ok {
+					conn, _, _ := hj.Hijack()
+					conn.Close()
+					return
+				}
+			}
+		}
+		srv.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	cfg := Config{
+		Kind: KindS3, Endpoint: ts.Listener.Addr().String(),
+		UseTLS: false, Region: "us-east-1", Bucket: "bkt", Key: "x.img.gz",
+		AccessKey: "AKID", SecretKey: "SECRET", PathStyle: true, InsecureTLS: true,
+	}
+	w, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := w.Write([]byte("payload")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close after transport hiccup = %v, want retry to succeed", err)
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if atomic.LoadInt32(&completes) < 2 {
+		t.Fatalf("complete attempts = %d, want ≥ 2 (retry)", completes)
+	}
+	if !srv.completed || srv.aborted {
+		t.Fatalf("completed=%v aborted=%v — retry must complete, never abort", srv.completed, srv.aborted)
 	}
 }

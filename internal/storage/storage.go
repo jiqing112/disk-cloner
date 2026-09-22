@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -205,10 +206,6 @@ func ParseURL(raw string) (Config, error) {
 	if q.Get("tlsverify") == "1" {
 		cfg.InsecureTLS = false
 	}
-	if u.User != nil {
-		cfg.User = u.User.Username()
-		cfg.Password, _ = u.User.Password()
-	}
 	switch strings.ToLower(u.Scheme) {
 	case "sftp":
 		cfg.Kind = KindSFTP
@@ -311,11 +308,21 @@ func portOr(p string, def int) int {
 }
 
 // httpClient returns a client suitable for long streaming uploads: no
-// overall timeout (transfers run for hours), TLS verification configurable.
+// overall timeout (transfers run for hours) and TLS verification
+// configurable, but bounded connect/TLS-handshake phases so a black-holed
+// endpoint fails Open in seconds instead of hanging forever. Proxy
+// environment variables (HTTP(S)_PROXY) are honored.
 func httpClient(insecure bool) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout: 15 * time.Second,
+			IdleConnTimeout:     90 * time.Second,
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure},
 		},
 	}
 }

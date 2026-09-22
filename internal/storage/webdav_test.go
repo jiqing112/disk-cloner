@@ -148,12 +148,12 @@ func TestWebDAVAbortDeletesPartial(t *testing.T) {
 	t.Fatal("partial file was never DELETEd after Abort")
 }
 
-// TestWebDAVCloseCleansUpOnError ensures a failing server side (500) leaves
-// no partial remote file behind.
+// TestWebDAVCloseCleansUpOnError ensures a failing server side (500 on the
+// real PUT, while the probe succeeds) leaves no partial remote file behind.
 func TestWebDAVCloseCleansUpOnError(t *testing.T) {
 	srv := &fakeWebDAV{}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut {
+		if r.Method == http.MethodPut && !strings.HasSuffix(r.URL.Path, ".diskcloner-probe") {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprint(w, "boom")
 			return
@@ -167,7 +167,7 @@ func TestWebDAVCloseCleansUpOnError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openWebDAV: %v", err)
 	}
-	// The streaming probe already succeeded above; this server 500s on the
+	// The streaming probe succeeded above; this server 500s on the
 	// real PUT. Writes may fail (broken pipe) or Close surfaces the 500.
 	w.Write(bytes.Repeat([]byte{0x02}, 4096))
 	if err := w.Close(); err == nil {
@@ -178,7 +178,56 @@ func TestWebDAVCloseCleansUpOnError(t *testing.T) {
 	}
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-	if len(srv.deleted) == 0 {
+	// The probe file's DELETE also lands in srv.deleted — require the real
+	// file itself to have been cleaned up.
+	deletedTarget := false
+	for _, d := range srv.deleted {
+		if d == "/file.img.gz" {
+			deletedTarget = true
+		}
+	}
+	if !deletedTarget {
 		t.Fatal("partial file was never DELETEd after failed Close")
+	}
+}
+
+// TestWebDAVProbeAuthFailureFailsFast: a 401 at probe time must fail Open.
+// It used to be treated as "chunked not supported", silently falling back
+// to spool mode — buffering the entire image into a local temp file (RAM
+// on tmpfs systems) only to die hours later with the same 401.
+func TestWebDAVProbeAuthFailureFailsFast(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	cfg := Config{Kind: KindWebDAV, URL: ts.URL + "/file.img.gz", User: "u", Password: "wrong", InsecureTLS: true}
+	if _, err := openWebDAV(cfg); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("openWebDAV = %v, want 401 fail-fast error", err)
+	}
+}
+
+// TestWebDAVSpoolWriteAfterClose: after a spool writer is closed, Write
+// must return an error like every other backend — it used to nil-panic
+// because finish() cleared the spool file but Write fell through to the
+// unset pipe writer.
+func TestWebDAVSpoolWriteAfterClose(t *testing.T) {
+	srv := &fakeWebDAV{rejectChunked: true}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	cfg := Config{Kind: KindWebDAV, URL: ts.URL + "/file.img.gz", User: "u", Password: "p", InsecureTLS: true}
+	w, err := openWebDAV(cfg)
+	if err != nil {
+		t.Fatalf("openWebDAV: %v", err)
+	}
+	if _, err := w.Write([]byte("data")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := w.Write([]byte("late")); err == nil {
+		t.Fatal("Write after Close = nil error, want error")
 	}
 }

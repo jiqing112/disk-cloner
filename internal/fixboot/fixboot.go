@@ -56,8 +56,10 @@ func Run(cfg Config) error {
 	// ── 2. Activate LVM if available ───────────────────────────────
 	if commandExists("lvm") {
 		log("检测 LVM...")
-		run("vgscan", "--mknodes")
-		run("vgchange", "-ay")
+		// Route through the lvm wrapper: Alpine's lvm2 package provides the
+		// standalone vgscan/vgchange symlinks on some builds only.
+		run("lvm", "vgscan", "--mknodes")
+		run("lvm", "vgchange", "-ay")
 		time.Sleep(time.Second)
 	} else {
 		log("未检测到 lvm 工具 (如需 LVM 支持: apk add lvm2)")
@@ -78,7 +80,7 @@ func Run(cfg Config) error {
 			return fmt.Errorf("挂载根分区 %s (fstype=%s): %v; 自动探测同样失败: %v", rootDev, rootFstype, err, err2)
 		}
 	}
-	defer umountAll()
+	defer func() { _ = umountAll() }()
 
 	// ── 4. Detect distro ───────────────────────────────────────────
 	distro := detectDistro(mountRoot)
@@ -91,16 +93,22 @@ func Run(cfg Config) error {
 		bootDir := filepath.Join(mountRoot, "boot")
 		log("  挂载 /boot: %s", dev)
 		if err := mount(dev, bootDir); err != nil {
-			log("  [!] 挂载 /boot 失败: %v (跳过)", err)
+			// Rebuilding initramfs with the real /boot unmounted writes into
+			// a shadowed directory on the root partition — the result is
+			// invisible after boot and the repair silently does nothing.
+			return fmt.Errorf("挂载独立 /boot 分区 (%s) 失败: %w — 无法安全重建 initramfs, 已中止", dev, err)
 		}
 	}
 
+	espMountedDev := ""
 	if dev, ok := fstabMounts["/boot/efi"]; ok {
 		efiDir := filepath.Join(mountRoot, "boot/efi")
 		os.MkdirAll(efiDir, 0755)
 		log("  挂载 /boot/efi: %s", dev)
 		if err := mount(dev, efiDir); err != nil {
-			log("  [!] 挂载 /boot/efi 失败: %v (跳过)", err)
+			log("  [!] 挂载 /boot/efi 失败: %v (UEFI 模式下 GRUB 安装将失败)", err)
+		} else {
+			espMountedDev = dev
 		}
 	}
 
@@ -122,7 +130,9 @@ func Run(cfg Config) error {
 	// Mount /run as tmpfs inside chroot
 	runDir := filepath.Join(mountRoot, "run")
 	os.MkdirAll(runDir, 0755)
-	mountTmpfs(runDir)
+	if err := mountTmpfs(runDir); err != nil {
+		log("  [!] /run tmpfs 挂载失败: %v (继续; chroot 内部分工具可能行为异常)", err)
+	}
 
 	// ── 7. Rebuild initramfs ───────────────────────────────────────
 	log("重建 initramfs (包含所有硬件驱动)...")
@@ -155,16 +165,50 @@ func Run(cfg Config) error {
 
 	// ── 8. Reinstall GRUB ──────────────────────────────────────────
 	log("修复 GRUB 引导...")
-	// UEFI when the ESP is known from fstab (authoritative even when the
-	// ESP was never mounted here) or the EFI directory is present.
+	// Boot mode follows the machine's own firmware — this tool runs on the
+	// box that will boot the disk, and /sys/firmware/efi exists only on
+	// UEFI boots. Directory/fstab hints alone misdetected UEFI systems
+	// (ESP mounted at /boot or /efi) as BIOS and wrote a legacy install
+	// that UEFI-only firmware can never boot.
+	fwEFI := dirExists("/sys/firmware/efi")
 	_, efiInFstab := fstabMounts["/boot/efi"]
-	efiDir := filepath.Join(mountRoot, "boot/efi/EFI")
-	isEFI := efiInFstab || dirExists(efiDir)
 
-	// Track a failed install so Run can report it instead of printing a
+	// Locate the ESP. Default /boot/efi; some systems mount the ESP at
+	// /boot directly (vfat fstab entry + EFI/ directory).
+	efiSub := "/boot/efi"
+	espDev := espMountedDev
+	if espDev == "" {
+		if bdev, ok := fstabMounts["/boot"]; ok && getBlkidFstype(bdev) == "vfat" &&
+			dirExists(filepath.Join(mountRoot, "boot/EFI")) {
+			espDev = bdev
+			efiSub = "/boot"
+		}
+	}
+	// Firmware says UEFI but no ESP found via fstab: scan the target disk's
+	// vfat partitions for one carrying an EFI/ directory (covers ESPs
+	// referenced only by PARTUUID or systemd's /efi automount).
+	if fwEFI && espDev == "" && !dirExists(filepath.Join(mountRoot, efiSub, "EFI")) {
+		if dev, ok := scanAndMountESP(cfg.TargetDisk); ok {
+			espDev = dev
+		}
+	}
+
+	isEFI := fwEFI || efiInFstab || espDev != "" || dirExists(filepath.Join(mountRoot, efiSub, "EFI"))
+
+	// Track failed steps so Run can report them instead of printing a
 	// misleading success line.
 	grubFailed := false
+	mkcfgFailed := false
 	grubToolFound := false
+
+	// grub.cfg regeneration is tracked separately: a stale grub.cfg (old
+	// UUIDs) boots as badly as a failed install.
+	runMkconfig := func(tool, cfgFile string) {
+		if err := chrootExec(mountRoot, tool, "-o", cfgFile); err != nil {
+			mkcfgFailed = true
+			log("  [!] %s 失败: %v", tool, err)
+		}
+	}
 
 	// bootID names the NVRAM boot entry; match the distro's EFI directory
 	// so it lines up with the shim path.
@@ -176,47 +220,51 @@ func Run(cfg Config) error {
 	}
 
 	if isEFI {
-		log("  检测到 UEFI 模式")
+		log("  检测到 UEFI 模式 (固件: %v, ESP: %s)", fwEFI, efiSub)
 		// Fedora/RHEL
 		if fileExists(filepath.Join(mountRoot, "usr/sbin/grub2-install")) {
 			grubToolFound = true
 			err = chrootExec(mountRoot, "grub2-install",
 				"--target=x86_64-efi",
-				"--efi-directory=/boot/efi",
+				"--efi-directory="+efiSub,
 				"--bootloader-id="+bootID,
 				"--recheck")
 			if err != nil {
 				grubFailed = true
 				log("  [!] grub2-install 失败: %v (可能需要手动处理)", err)
 			}
-			chrootExec(mountRoot, "grub2-mkconfig", "-o", "/boot/grub2/grub.cfg")
+			if fileExists(filepath.Join(mountRoot, "usr/sbin/grub2-mkconfig")) {
+				runMkconfig("grub2-mkconfig", "/boot/grub2/grub.cfg")
+			}
 		} else if fileExists(filepath.Join(mountRoot, "usr/sbin/grub-install")) {
 			grubToolFound = true
 			err = chrootExec(mountRoot, "grub-install",
 				"--target=x86_64-efi",
-				"--efi-directory=/boot/efi",
+				"--efi-directory="+efiSub,
 				"--recheck")
 			if err != nil {
 				grubFailed = true
 				log("  [!] grub-install 失败: %v", err)
 			}
-			chrootExec(mountRoot, "grub-mkconfig", "-o", "/boot/grub/grub.cfg")
+			if fileExists(filepath.Join(mountRoot, "usr/sbin/grub-mkconfig")) {
+				runMkconfig("grub-mkconfig", "/boot/grub/grub.cfg")
+			}
 		}
 
 		// Add UEFI boot entry if efibootmgr is available
 		if commandExists("efibootmgr") {
-			if efiDev, ok := fstabMounts["/boot/efi"]; ok && efiDev != "" {
+			if espDev != "" {
 				// The ESP may live on a different disk than the clone
 				// target — efibootmgr must reference the disk that
 				// actually hosts it.
-				efiDisk, efiPart := findEFIPart(efiDev)
+				efiDisk, efiPart := findEFIPart(espDev)
 				if efiDisk == "" {
 					efiDisk = cfg.TargetDisk
 				}
 				if efiPart == "" {
 					efiPart = "1"
 				}
-				shimPath := findShimPath(mountRoot)
+				shimPath := findShimPath(mountRoot, efiSub)
 				if shimPath != "" {
 					run("efibootmgr", "-c",
 						"-d", efiDisk,
@@ -239,7 +287,9 @@ func Run(cfg Config) error {
 				grubFailed = true
 				log("  [!] grub2-install 失败: %v", err)
 			}
-			chrootExec(mountRoot, "grub2-mkconfig", "-o", "/boot/grub2/grub.cfg")
+			if fileExists(filepath.Join(mountRoot, "usr/sbin/grub2-mkconfig")) {
+				runMkconfig("grub2-mkconfig", "/boot/grub2/grub.cfg")
+			}
 		} else if fileExists(filepath.Join(mountRoot, "usr/sbin/grub-install")) {
 			grubToolFound = true
 			err = chrootExec(mountRoot, "grub-install", "--recheck", cfg.TargetDisk)
@@ -247,11 +297,15 @@ func Run(cfg Config) error {
 				grubFailed = true
 				log("  [!] grub-install 失败: %v", err)
 			}
-			chrootExec(mountRoot, "grub-mkconfig", "-o", "/boot/grub/grub.cfg")
+			if fileExists(filepath.Join(mountRoot, "usr/sbin/grub-mkconfig")) {
+				runMkconfig("grub-mkconfig", "/boot/grub/grub.cfg")
+			}
 		}
 	}
 	if grubFailed {
 		log("  ✗ GRUB 重装失败")
+	} else if mkcfgFailed {
+		log("  ✗ grub.cfg 生成失败")
 	} else if grubToolFound {
 		log("  ✓ GRUB 修复完成")
 	} else {
@@ -266,9 +320,17 @@ func Run(cfg Config) error {
 
 	// ── 10. Cleanup ─────────────────────────────────────────────────
 	log("清理挂载点...")
-	umountAll()
+	if uerr := umountAll(); uerr != nil {
+		return fmt.Errorf("部分挂载点无法卸载: %w — 请手动 umount 后再重启, 否则文件系统日志可能未完整落盘", uerr)
+	}
 	if grubFailed {
+		if isEFI {
+			return fmt.Errorf("GRUB 重装失败 (UEFI), 目标盘可能无法启动 (initramfs 已重建); 请手动执行 grub-install --target=x86_64-efi --efi-directory=%s", efiSub)
+		}
 		return fmt.Errorf("GRUB 重装失败, 目标盘可能无法启动 (initramfs 已重建); 请手动执行 grub-install --recheck %s", cfg.TargetDisk)
+	}
+	if mkcfgFailed {
+		return fmt.Errorf("grub.cfg 生成失败 (GRUB 已重装, 目标盘可能仍引导异常); 请进入系统后手动执行 grub-mkconfig -o 对应 grub.cfg 路径")
 	}
 	log("✓ 引导修复完成!")
 
@@ -490,9 +552,17 @@ func parseFstab(path string) map[string]string {
 	return result
 }
 
+// resolveDevice maps an fstab source column to a /dev node. fstab keywords
+// are case-insensitive ("uuid=" is legal); the referenced value is not.
+// PARTUUID=/PARTLABEL= are handled alongside UUID=/LABEL= — Raspberry Pi OS,
+// Armbian and systemd-gpt-auto installs reference their /boot and ESP by
+// PARTUUID, and skipping those entries left /boot unmounted and misjudged
+// UEFI systems as BIOS.
 func resolveDevice(dev string) string {
-	if strings.HasPrefix(dev, "UUID=") {
-		uuid := strings.TrimPrefix(dev, "UUID=")
+	upper := strings.ToUpper(dev)
+	switch {
+	case strings.HasPrefix(upper, "UUID="):
+		uuid := dev[len("UUID="):]
 		link := "/dev/disk/by-uuid/" + uuid
 		target, err := filepath.EvalSymlinks(link)
 		if err == nil {
@@ -503,10 +573,18 @@ func resolveDevice(dev string) string {
 		if err == nil {
 			return strings.TrimSpace(string(out))
 		}
-		return "" // UUID not found on this system
-	}
-	if strings.HasPrefix(dev, "LABEL=") {
-		label := strings.TrimPrefix(dev, "LABEL=")
+	case strings.HasPrefix(upper, "PARTUUID="):
+		id := dev[len("PARTUUID="):]
+		target, err := filepath.EvalSymlinks("/dev/disk/by-partuuid/" + id)
+		if err == nil {
+			return target
+		}
+		out, err := exec.Command("blkid", "-t", "PARTUUID="+id, "-o", "device").Output()
+		if err == nil {
+			return strings.TrimSpace(string(out))
+		}
+	case strings.HasPrefix(upper, "LABEL="):
+		label := dev[len("LABEL="):]
 		link := "/dev/disk/by-label/" + label
 		target, err := filepath.EvalSymlinks(link)
 		if err == nil {
@@ -516,12 +594,49 @@ func resolveDevice(dev string) string {
 		if err == nil {
 			return strings.TrimSpace(string(out))
 		}
-		return ""
-	}
-	if strings.HasPrefix(dev, "/dev/") {
+	case strings.HasPrefix(upper, "PARTLABEL="):
+		id := dev[len("PARTLABEL="):]
+		target, err := filepath.EvalSymlinks("/dev/disk/by-partlabel/" + id)
+		if err == nil {
+			return target
+		}
+		out, err := exec.Command("blkid", "-t", "PARTLABEL="+id, "-o", "device").Output()
+		if err == nil {
+			return strings.TrimSpace(string(out))
+		}
+	case strings.HasPrefix(dev, "/dev/"):
 		return dev
 	}
 	return ""
+}
+
+// scanAndMountESP probes the target disk's vfat partitions for an EFI
+// System Partition (vfat + EFI/ directory) and mounts the first hit at
+// mountRoot/boot/efi. Used when the firmware booted UEFI but fstab yields
+// no usable /boot/efi entry (PARTUUID-only systems, /efi automounts, ...).
+func scanAndMountESP(targetDisk string) (string, bool) {
+	if dirExists(filepath.Join(mountRoot, "boot/efi/EFI")) {
+		return "", true // an ESP is already mounted there
+	}
+	probeDir := mountRoot + ".probe"
+	entries, _ := filepath.Glob(targetDisk + "*")
+	for _, e := range entries {
+		if e == targetDisk || getBlkidFstype(e) != "vfat" {
+			continue
+		}
+		if err := mount(e, probeDir); err != nil {
+			continue
+		}
+		hasEFI := dirExists(filepath.Join(probeDir, "EFI"))
+		umountSingle(probeDir)
+		if hasEFI {
+			if err := mount(e, filepath.Join(mountRoot, "boot/efi")); err == nil {
+				return e, true
+			}
+			return "", false
+		}
+	}
+	return "", false
 }
 
 // findEFIPart splits an EFI system partition device (e.g. /dev/sda1 or
@@ -546,7 +661,7 @@ func findEFIPart(efiDev string) (string, string) {
 	return disk, part
 }
 
-func findShimPath(mountpoint string) string {
+func findShimPath(mountpoint, efiSub string) string {
 	// Common locations for the EFI shim bootloader
 	candidates := []string{
 		"EFI/fedora/shimx64.efi",
@@ -559,7 +674,7 @@ func findShimPath(mountpoint string) string {
 		"EFI/debian/shimx64.efi",
 	}
 
-	efiBase := filepath.Join(mountpoint, "boot/efi")
+	efiBase := filepath.Join(mountpoint, strings.TrimPrefix(efiSub, "/"))
 	for _, c := range candidates {
 		full := filepath.Join(efiBase, c)
 		if fileExists(full) {
@@ -659,13 +774,14 @@ func umountSingle(target string) {
 // umountAll unmounts everything under mountRoot in reverse order.
 // Uses regular umount with retries (NOT lazy umount) so that the filesystem
 // journal is properly committed to disk before any subsequent dd operation.
-func umountAll() {
+// Returns an error listing mount points that could not be unmounted.
+func umountAll() error {
 	// Read /proc/mounts to find all mounts under mountRoot
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
 		// Fallback: try umount -R
 		runQuiet("umount", "-R", mountRoot)
-		return
+		return nil
 	}
 
 	// Collect mount points under mountRoot, sorted by depth (deepest first)
@@ -707,11 +823,14 @@ func umountAll() {
 		time.Sleep(time.Second)
 	}
 
-	// Last resort: if anything is still mounted, force it. This should
-	// only happen if a process inside chroot is still holding files open.
-	for _, mp := range mounts {
-		runQuiet("umount", "-l", mp)
+	// Never lazy-unmount (-l): it detaches the mount but leaves the
+	// filesystem live in the kernel with a mid-transaction journal — the
+	// exact corruption this tool exists to avoid (see umountSingle).
+	// Report the leftovers so the caller can refuse to proceed.
+	if len(mounts) > 0 {
+		return fmt.Errorf("卸载失败: %s", strings.Join(mounts, ", "))
 	}
+	return nil
 }
 
 func chrootExec(root string, name string, args ...string) error {
@@ -766,9 +885,14 @@ func fixFstab(rootMount string) error {
 	fstabPath := filepath.Join(rootMount, "etc/fstab")
 	bakPath := filepath.Join(rootMount, "etc/fstab.bak")
 
-	// Back up the original first
-	if err := copyFile(fstabPath, bakPath); err != nil {
+	// Back up the original first — never overwrite an existing backup, so
+	// a second run keeps the true original rather than a copy of the
+	// already-modified file.
+	if fileExists(bakPath) {
+		fmt.Printf("  [!] %s 已存在, 保留最早的原始备份\n", bakPath)
+	} else if err := copyFile(fstabPath, bakPath); err != nil {
 		// Non-fatal: continue with the fix even if backup fails
+		fmt.Printf("  [!] fstab 备份失败: %v (继续修复)\n", err)
 	}
 
 	data, err := os.ReadFile(fstabPath)

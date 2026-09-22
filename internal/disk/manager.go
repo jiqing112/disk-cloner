@@ -95,7 +95,11 @@ func ParseJSON(raw string) ([]DiskInfo, error) {
 }
 
 func isVirtualDevice(name string) bool {
-	for _, p := range []string{"loop", "ram", "zram"} {
+	// loop/ram/zram: RAM or loop devices. dm-/md/nbd: device-mapper, RAID
+	// and network-block-device pseudo disks — assembled or synthetic, not
+	// raw dd sources/targets (dm linear mappings report TYPE "disk" in
+	// lsblk, so they must be filtered by name). sr: optical drives.
+	for _, p := range []string{"loop", "ram", "zram", "dm-", "md", "nbd", "sr"} {
 		if strings.HasPrefix(name, p) {
 			return true
 		}

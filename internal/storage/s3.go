@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
@@ -40,8 +39,8 @@ func openS3(cfg Config) (Writer, error) {
 
 	w := &s3Writer{
 		cfg:      cfg,
-		client:   &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.InsecureTLS}}},
-		key:      awsURIEncode(cfg.Key, false),
+		client:   httpClient(cfg.InsecureTLS),
+		key:      cfg.Key,
 		partSize: 8 << 20, // 8 MiB, grows every 1000 parts (cap 256 MiB)
 		buf:      make([]byte, 0, 8<<20),
 	}
@@ -58,7 +57,7 @@ func openS3(cfg Config) (Writer, error) {
 type s3Writer struct {
 	cfg    Config
 	client *http.Client
-	key    string // URI-encoded object key (no bucket, no leading slash)
+	key    string // raw object key (no bucket, no leading slash); encoded once when building request URLs
 
 	uploadID  string
 	etags     []string
@@ -203,14 +202,17 @@ func (w *s3Writer) complete() error {
 
 	// Complete is idempotent per upload ID and the body is buffered — safe
 	// to retry on transient failures (S3 may 500 while assembling parts).
-	return retry(3, func() error {
+	// A transport error here is marked retryable too: without it, one
+	// dropped connection at finalize time aborted the whole multipart
+	// upload and destroyed hours of transfer.
+	if err := retry(3, func() error {
 		req, err := w.s3req(http.MethodPost, w.objectPath(), s3Query([2]string{"uploadId", w.uploadID}), body)
 		if err != nil {
 			return err
 		}
 		resp, err := w.client.Do(req)
 		if err != nil {
-			return fmt.Errorf("s3: complete upload: %w", err)
+			return &httpOpError{status: "transport error", detail: fmt.Sprintf("complete upload: %v", err), retryable: true}
 		}
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
@@ -223,7 +225,10 @@ func (w *s3Writer) complete() error {
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		return fmt.Errorf("s3: complete upload: %w", err)
+	}
+	return nil
 }
 
 func (w *s3Writer) createMultipart() (string, error) {
@@ -246,7 +251,9 @@ func (w *s3Writer) doCreateMultipart() (string, error) {
 	}
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("s3: create multipart upload: %w", err)
+		// Transport errors are transient (connection reuse races, RSTs) —
+		// retryable so Open doesn't fail on a one-off hiccup.
+		return "", &httpOpError{status: "transport error", detail: fmt.Sprintf("create multipart upload: %v", err), retryable: true}
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
@@ -281,8 +288,9 @@ func (w *s3Writer) abort() {
 	}
 }
 
-// objectPath returns the unescaped request path (bucket included only for
-// path-style addressing).
+// objectPath returns the raw (unencoded) request path — bucket included
+// only for path-style addressing. The percent-encoding happens exactly once,
+// in s3req's RawPath.
 func (w *s3Writer) objectPath() string {
 	if w.cfg.PathStyle {
 		return "/" + w.cfg.Bucket + "/" + w.cfg.Key
@@ -302,6 +310,10 @@ func (w *s3Writer) s3req(method, pathForURL, rawQuery string, body []byte) (*htt
 		host = w.cfg.Bucket + "." + host
 	}
 	u := &url.URL{Scheme: scheme, Host: host, Path: pathForURL, RawQuery: rawQuery}
+	// pathForURL carries the RAW key; encode it once here for the wire.
+	// (Encoding an already-encoded key escaped the '%' signs a second time
+	// and uploaded objects under mojibake names for keys with spaces or
+	// non-ASCII characters.)
 	u.RawPath = awsURIEncode(pathForURL, false)
 
 	var rdr io.Reader

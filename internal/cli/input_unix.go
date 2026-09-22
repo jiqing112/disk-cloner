@@ -13,6 +13,29 @@ import (
 	"golang.org/x/term"
 )
 
+// pending holds stdin bytes read ahead of the current keystroke. A single
+// Read in raw mode can return a whole pasted chunk (multi-line text, escape
+// sequences, multi-byte UTF-8); bytes are queued here and handed to the key
+// handler one at a time so embedded \r/\t/\x7f are processed as keys instead
+// of becoming literals inside the input (and pasted newlines stop merging
+// lines together).
+var pending []byte
+
+// readKey returns the next keystroke byte, refilling the pending queue from
+// stdin when it runs dry.
+func readKey(buf []byte) (byte, error) {
+	if len(pending) == 0 {
+		n, err := os.Stdin.Read(buf)
+		if err != nil || n == 0 {
+			return 0, err
+		}
+		pending = append(pending, buf[:n]...)
+	}
+	b := pending[0]
+	pending = pending[1:]
+	return b, nil
+}
+
 // ReadInput reads a line from the terminal with full backspace/delete support.
 // Uses raw terminal mode to handle control characters properly.
 // If def is not empty, it is pre-filled into the input buffer so the user
@@ -43,15 +66,13 @@ func ReadInput(prompt, def string) string {
 	oneByte := make([]byte, 4)
 
 	for {
-		n, err := os.Stdin.Read(oneByte)
-		if err != nil || n == 0 {
+		b, rerr := readKey(oneByte)
+		if rerr != nil {
 			if len(buf) == 0 {
 				stdinEOF = true
 			}
 			break
 		}
-
-		b := oneByte[0]
 
 		switch {
 		case b == '\r' || b == '\n':
@@ -93,17 +114,14 @@ func ReadInput(prompt, def string) string {
 			}
 
 		case b >= 32:
-			if n == 1 && b < 128 {
-				buf = append(buf, b)
-				fmt.Print(string(b))
-			} else {
-				char := oneByte[:n]
-				buf = append(buf, char...)
-				fmt.Print(string(char))
-			}
+			// UTF-8 sequences arrive byte-by-byte via readKey and are
+			// appended/echoed per byte — the terminal renders the
+			// multi-byte rune correctly as the bytes stream in.
+			buf = append(buf, b)
+			fmt.Print(string(b))
 
 		case b == 27:
-			readEscapeFollowup(oneByte)
+			readEscapeFollowup()
 
 		default:
 		}
@@ -163,7 +181,10 @@ func ReadPassword(prompt string) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(pass))
+	// Only the line terminator is stripped: leading/trailing spaces are
+	// legal password characters, and silently trimming them produces auth
+	// failures that are nearly impossible to diagnose.
+	return strings.TrimRight(string(pass), "\r\n")
 }
 
 // ReadInputPath reads a file path from the terminal with shell-like Tab
@@ -188,15 +209,13 @@ func ReadInputPath(prompt, def string) string {
 	oneByte := make([]byte, 4)
 
 	for {
-		n, err := os.Stdin.Read(oneByte)
-		if err != nil || n == 0 {
+		b, rerr := readKey(oneByte)
+		if rerr != nil {
 			if len(buf) == 0 {
 				stdinEOF = true
 			}
 			break
 		}
-
-		b := oneByte[0]
 
 		switch {
 		case b == '\r' || b == '\n':
@@ -237,17 +256,11 @@ func ReadInputPath(prompt, def string) string {
 			}
 
 		case b >= 32:
-			if n == 1 && b < 128 {
-				buf = append(buf, b)
-				fmt.Print(string(b))
-			} else {
-				char := oneByte[:n]
-				buf = append(buf, char...)
-				fmt.Print(string(char))
-			}
+			buf = append(buf, b)
+			fmt.Print(string(b))
 
 		case b == 27:
-			readEscapeFollowup(oneByte)
+			readEscapeFollowup()
 
 		default:
 		}
@@ -298,6 +311,9 @@ func completeTab(buf *[]byte, prompt string, oneByte []byte) {
 	if len(comp.list) > 50 {
 		fmt.Printf("  共 %d 个候选, 按 y 显示全部, 其他键跳过: ", len(comp.list))
 		n, _ := os.Stdin.Read(oneByte)
+		if n > 1 {
+			pending = append(pending, oneByte[1:n]...) // keep pasted extras
+		}
 		fmt.Print("\r\n")
 		if n > 0 && (oneByte[0] == 'y' || oneByte[0] == 'Y') {
 			printMatches(comp.list)
@@ -390,17 +406,29 @@ func entryIsDir(lookup, name string) (bool, bool) {
 }
 
 // readEscapeFollowup consumes up to 2 bytes of a terminal escape sequence
-// after ESC. It only reads when bytes are already available (50ms window),
-// so pressing Esc alone no longer blocks the prompt waiting for input that
-// never comes.
-func readEscapeFollowup(oneByte []byte) int {
+// after ESC, preferring bytes that already sit in the pending queue. It
+// only reads more from the terminal when bytes are already available
+// (50ms window), so pressing Esc alone no longer blocks the prompt waiting
+// for input that never comes.
+func readEscapeFollowup() int {
+	consumed := 0
+	for consumed < 2 && len(pending) > 0 {
+		pending = pending[1:]
+		consumed++
+	}
+	if consumed >= 2 {
+		return consumed
+	}
 	fds := []unix.PollFd{{Fd: int32(os.Stdin.Fd()), Events: unix.POLLIN}}
 	n, err := unix.Poll(fds, 50)
 	if err != nil || n == 0 {
-		return 0
+		return consumed
 	}
-	n2, _ := os.Stdin.Read(oneByte[:2])
-	return n2
+	// Read at most what's missing from the sequence; anything past it
+	// stays in the kernel buffer for the next readKey round.
+	var tmp [2]byte
+	n2, _ := os.Stdin.Read(tmp[:2-consumed])
+	return consumed + n2
 }
 
 // printMatches prints candidate names in columns.

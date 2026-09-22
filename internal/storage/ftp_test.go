@@ -202,3 +202,44 @@ func TestFTPAbortDeletesPartial(t *testing.T) {
 	}
 	t.Fatal("server never saw DELE after Abort")
 }
+
+// TestFTPParsePASV: replies often carry text after the closing paren —
+// "227 Entering passive mode (127,0,0,1,195,80)." (pyftpdlib, vsftpd). The
+// parser must take exactly the parenthesized body and treat parse failures
+// as errors, never silently-zeroed port bytes (that dialed port-256-below
+// the negotiated one).
+func TestFTPParsePASV(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want int
+	}{
+		{"227 Entering passive mode (127,0,0,1,195,80).", 50000}, // trailing period
+		{"227 Entering Passive Mode (127,0,0,1,195,80)", 50000},  // bare
+		{"227 Entering passive mode (127,0,0,1,195,80) extra text", 50000},
+		{"227 Entering passive mode (127,0,0,1,195,x).", 0},  // non-numeric port byte
+		{"227 no parens here", 0},                            // malformed
+		{"227 (1,2,3)", 0},                                   // too few fields
+	}
+	for _, c := range cases {
+		if got := ftpParsePASV(c.msg); got != c.want {
+			t.Errorf("ftpParsePASV(%q) = %d, want %d", c.msg, got, c.want)
+		}
+	}
+}
+
+// TestFTPStripCode: readResp returns replies WITH their numeric prefix —
+// remoteSize must strip "213 " before parsing the size, or the SIZE-based
+// completeness check never matched anything.
+func TestFTPStripCode(t *testing.T) {
+	cases := map[string]string{
+		"213 4096":  "4096",
+		"213-4096":  "4096",
+		"4096":      "4096", // no code prefix — returned unchanged
+		"213  8192": "8192",
+	}
+	for in, want := range cases {
+		if got := ftpStripCode(in); got != want {
+			t.Errorf("ftpStripCode(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -3,10 +3,14 @@ package clone
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	sshclient "disk-cloner/internal/ssh"
 )
 
 // TestValidateBlockSizeZeroAndOverflow covers inputs that match the old
@@ -128,5 +132,61 @@ func TestParseDdBytesRead(t *testing.T) {
 	}
 	if got := parseDdBytesRead("32768+0 records in\n32768+0 records out"); got != -1 {
 		t.Fatalf("busybox-style output: parseDdBytesRead = %d, want -1", got)
+	}
+}
+
+// fakeRunner answers CombinedOutput by substring-matching the command
+// against canned outputs — enough to test the /proc/mounts + dm-slaves
+// parsing logic without a real shell.
+type fakeRunner struct {
+	outputs map[string]string
+}
+
+func (f *fakeRunner) CombinedOutput(cmd string) (string, error) {
+	for k, v := range f.outputs {
+		if strings.Contains(cmd, k) {
+			return v, nil
+		}
+	}
+	return "", nil
+}
+func (f *fakeRunner) Execute(string) (sshclient.Session, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeRunner) ExecuteStdin(string) (sshclient.Session, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeRunner) IsConnected() bool { return true }
+
+// TestMountedSourcePartitionsDetectsLVM: an LVM root mounted as
+// /dev/mapper/vg0-root must be attributed to the source disk via the
+// kernel's dm-slaves topology — name matching alone never matched real LV
+// names (vg-root, vg-swap), so the pre-dd "abort if still mounted" gate
+// let a live LVM system through and dd produced a torn image.
+func TestMountedSourcePartitionsDetectsLVM(t *testing.T) {
+	r := &fakeRunner{outputs: map[string]string{
+		"/proc/mounts": "/dev/mapper/vg0-root / ext4 rw 0 0\n" +
+			"/dev/sda1 /boot ext4 rw 0 0\n" +
+			"/dev/sdb1 /data ext4 rw 0 0\n",
+		"/sys/block/dm-": "/dev/mapper/vg0-root\n/dev/dm-0\n",
+	}}
+	j := &CloneJob{runner: r, params: Params{SourcePath: "/dev/sda"}}
+	mounted := j.mountedSourcePartitions("/dev/sda")
+
+	want := map[string]bool{"/": false, "/boot": false}
+	for _, mp := range mounted {
+		if _, ok := want[mp]; ok {
+			want[mp] = true
+		}
+	}
+	for mp, seen := range want {
+		if !seen {
+			t.Errorf("mount %q of a source-disk device not detected (mounted=%v)", mp, mounted)
+		}
+	}
+	for _, mp := range mounted {
+		if mp == "/data" {
+			t.Errorf("unrelated disk's mount %q wrongly attributed to the source disk", mp)
+		}
 	}
 }

@@ -86,3 +86,30 @@ func TestParseJSONRemovableMountedNotSystem(t *testing.T) {
 		}
 	}
 }
+
+const lsblkPseudoJSON = `{
+  "blockdevices": [
+    { "name": "sda", "size": "500107862016", "type": "disk", "rm": false },
+    { "name": "dm-0", "size": "499570922496", "type": "disk", "rm": false },
+    { "name": "md0", "size": "1000203091968", "type": "raid1", "rm": false },
+    { "name": "nbd0", "size": "1073741824", "type": "disk", "rm": false },
+    { "name": "sr0", "size": "1073741312", "type": "rom", "rm": true }
+  ]
+}`
+
+// TestParseJSONFiltersPseudoDisks: device-mapper (dm-N reports TYPE "disk"
+// in lsblk!), md RAID and nbd devices are assembled/synthetic — they must
+// not be offered as dd sources or targets.
+func TestParseJSONFiltersPseudoDisks(t *testing.T) {
+	disks, err := ParseJSON(lsblkPseudoJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(disks) != 1 || disks[0].Name != "sda" {
+		names := make([]string, 0, len(disks))
+		for _, d := range disks {
+			names = append(names, d.Name)
+		}
+		t.Fatalf("disk list = %v, want [sda] only", names)
+	}
+}

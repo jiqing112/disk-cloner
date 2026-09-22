@@ -1361,6 +1361,11 @@ func runDirectLocal(diskPath, bs string, autoYes bool, saveFile, dst string) {
 		if err != nil {
 			log.Fatalf("%v", err)
 		}
+		// Same rule as runDirect: -tls-verify upgrades https destinations
+		// to full certificate validation (ParseURL defaults to insecure).
+		if tlsVerifyEnabled {
+			cfg.InsecureTLS = false
+		}
 		dstCfg = &cfg
 	}
 
@@ -1771,6 +1776,11 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	fmt.Printf("  |  目标:   %s:%s (%s)\n", ip, remoteDisk, targetLabel)
 	fmt.Println("  +--------------------------------------------+")
 	fmt.Println()
+
+	// Ask for the block size like the other modes do — it was previously
+	// hardcoded to 4M here, ignoring what -bs would set in CLI mode.
+	blockSize := readBlockSize()
+
 	fmt.Printf("  此操作将覆盖远程 %s 上的所有数据!\n", remoteDisk)
 	if !cli.Confirm("  确认开始恢复? 输入 yes 继续") {
 		fmt.Println("  已取消")
@@ -1787,7 +1797,7 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	// zero values rather than passing stale globals.
 	job := clone.New(sshClient, clone.Params{
 		TargetPath: remoteDisk,
-		BlockSize:  "4M",
+		BlockSize:  blockSize,
 	}, makeProgressFn())
 	job.SetLogFunc(func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)

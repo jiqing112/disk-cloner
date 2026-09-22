@@ -78,3 +78,29 @@ func TestLocalRunnerFailedCommand(t *testing.T) {
 		t.Fatalf("output = %q", out)
 	}
 }
+
+// TestLocalCloseThenWaitIdempotent: Close must reap the child itself (no
+// zombie when a caller only Closes), and Wait after Close must return the
+// same result instead of erroring with "Wait was already called".
+func TestLocalCloseThenWaitIdempotent(t *testing.T) {
+	haveSh(t)
+	s, err := NewRunner().Execute("true")
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Killed process: Wait returns a non-nil exit error but must not panic
+	// or report double-Wait; a second call returns the same value.
+	err1 := s.Wait()
+	err2 := s.Wait()
+	if err1 != nil && !strings.Contains(err1.Error(), "Wait was already called") {
+		// exit-status errors from the kill are fine; only the double-Wait
+		// bookkeeping error is a bug.
+		t.Logf("Wait after Close: %v (expected kill/exit status)", err1)
+	}
+	if err1 != err2 {
+		t.Fatalf("Wait not idempotent: %v then %v", err1, err2)
+	}
+}
