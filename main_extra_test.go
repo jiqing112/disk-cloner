@@ -21,17 +21,32 @@ func TestValidIPv4(t *testing.T) {
 	}
 }
 
-// TestExtractIPGarbageNotExtracted: an out-of-range dotted number embedded
-// in pasted text must not be extracted as if it were a valid address.
-func TestExtractIPGarbageNotExtracted(t *testing.T) {
-	if got := extractIP("IP: 999.1.1.1"); got != "IP: 999.1.1.1" {
-		t.Errorf("extractIP(garbage) = %q, want input returned unchanged", got)
+// TestExtractHostPort: an out-of-range dotted number embedded in pasted text
+// must not be extracted as if it were a valid address; a hostname containing
+// an IP-shaped substring must pass through unchanged (extraction boundaries
+// must not cut inside a hostname); a pasted "IP:port" yields both parts.
+func TestExtractHostPort(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantHost  string
+		wantPort  int
+	}{
+		{"IP: 999.1.1.1", "IP: 999.1.1.1", 0},      // garbage stays untouched
+		{"IP: 192.168.1.100", "192.168.1.100", 0},   // plain extraction
+		{"nas.lan", "nas.lan", 0},                   // hostname passthrough
+		{"srv-192.168.1.5.lan", "srv-192.168.1.5.lan", 0}, // IP inside hostname must not be ripped out
+		{"192.168.1.100:22", "192.168.1.100", 22},   // pasted port preserved
+		{"IP: 10.0.0.5:2121", "10.0.0.5", 2121},     // port in pasted text
+		{"root@192.168.1.7", "192.168.1.7", 0},      // user@host delimiter
+		{"192.168.1.100:0", "192.168.1.100", 0},     // port 0 rejected
+		{"192.168.1.100:99999", "192.168.1.100", 0}, // out-of-range port rejected
+		{"1.2.3.4.5", "1.2.3.4.5", 0},               // trailing junk → not delimited, passthrough
 	}
-	if got := extractIP("IP: 192.168.1.100"); got != "192.168.1.100" {
-		t.Errorf("extractIP(valid) = %q, want 192.168.1.100", got)
-	}
-	if got := extractIP("nas.lan"); got != "nas.lan" {
-		t.Errorf("extractIP(hostname) = %q, want hostname passthrough", got)
+	for _, c := range cases {
+		host, port := extractHostPort(c.in)
+		if host != c.wantHost || port != c.wantPort {
+			t.Errorf("extractHostPort(%q) = (%q, %d), want (%q, %d)", c.in, host, port, c.wantHost, c.wantPort)
+		}
 	}
 }
 

@@ -46,6 +46,16 @@ func ftpDial(host string, port int, timeout time.Duration) (*ftpClient, error) {
 	return c, nil
 }
 
+// Control-channel round-trip bounds. The TCP dial timeout only covers
+// connection establishment; without these, a server that accepts TCP but
+// never answers the protocol (hung ftpd, NAT black hole) blocks Open
+// forever. Generous values: these cover greeting/login/EPSV/STOR-acks on
+// slow NAS hardware, never the data transfer itself (separate connection).
+const (
+	ftpControlReadTimeout  = 60 * time.Second
+	ftpControlWriteTimeout = 30 * time.Second
+)
+
 // readRespLocked reads one (possibly multi-line) FTP reply, e.g.
 //
 //	230-Go ahead
@@ -53,6 +63,15 @@ func ftpDial(host string, port int, timeout time.Duration) (*ftpClient, error) {
 //
 // The caller must hold c.mu.
 func (c *ftpClient) readRespLocked() (int, string, error) {
+	return c.readRespDeadlineLocked(ftpControlReadTimeout)
+}
+
+// readRespDeadlineLocked is readRespLocked with a caller-chosen reply
+// deadline (teardown uses a tighter bound than normal operation).
+func (c *ftpClient) readRespDeadlineLocked(d time.Duration) (int, string, error) {
+	if err := c.conn.SetReadDeadline(time.Now().Add(d)); err != nil {
+		return 0, "", err
+	}
 	var lines []string
 	code := 0
 	for {
@@ -83,6 +102,9 @@ func (c *ftpClient) sendLocked(command string) error {
 	if hasCtl(command) {
 		return fmt.Errorf("ftp: command contains control characters")
 	}
+	if err := c.conn.SetWriteDeadline(time.Now().Add(ftpControlWriteTimeout)); err != nil {
+		return err
+	}
 	fmt.Fprint(c.w, command+"\r\n")
 	return wFlush(c.w)
 }
@@ -102,8 +124,7 @@ func wFlush(w *bufio.Writer) error { return w.Flush() }
 // c.mu; the reply drain is bounded so a mute server cannot block teardown.
 func (c *ftpClient) quitLocked() {
 	c.sendLocked("QUIT")
-	c.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	c.readRespLocked()
+	c.readRespDeadlineLocked(3 * time.Second)
 	c.conn.Close()
 }
 

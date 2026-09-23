@@ -118,3 +118,49 @@ func TestAWSURIEncode(t *testing.T) {
 		t.Errorf("awsURIEncode(utf8) = %q", got)
 	}
 }
+
+// TestParseURLPixelDrainDefaultPort: the default port must follow the final
+// scheme — ?tls=0 without an explicit port previously produced
+// http://host:443 (plaintext dialed at the TLS port).
+func TestParseURLPixelDrainDefaultPort(t *testing.T) {
+	cfg, err := ParseURL("pd://:KEY@host/file.img.gz?tls=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 80 {
+		t.Errorf("pixeldrain tls=0 default port = %d, want 80", cfg.Port)
+	}
+	if cfg.UseTLS {
+		t.Error("pixeldrain tls=0: UseTLS = true, want false")
+	}
+
+	cfg, err = ParseURL("pd://:KEY@host:8443/file.img.gz?tls=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 8443 {
+		t.Errorf("pixeldrain explicit port = %d, want 8443", cfg.Port)
+	}
+
+	cfg, err = ParseURL("pixeldrain://:KEY@host/file.img.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Port != 443 || !cfg.UseTLS {
+		t.Errorf("pixeldrain default = port %d tls %v, want 443 true", cfg.Port, cfg.UseTLS)
+	}
+}
+
+// TestDescribeWebDAVRedactsUserinfo: Describe must never echo credentials —
+// the interactive path stores the user's typed URL verbatim, which may
+// embed user:pass.
+func TestDescribeWebDAVRedactsUserinfo(t *testing.T) {
+	cfg := Config{Kind: KindWebDAV, URL: "https://user:secret@nas.lan:5006/dav/img.img.gz"}
+	got := Describe(cfg)
+	if strings.Contains(got, "secret") || strings.Contains(got, "user:") {
+		t.Errorf("Describe leaked credentials: %q", got)
+	}
+	if !strings.Contains(got, "nas.lan:5006/dav/img.img.gz") {
+		t.Errorf("Describe dropped the destination: %q", got)
+	}
+}

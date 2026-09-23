@@ -218,6 +218,13 @@ func (w *s3Writer) complete() error {
 		resp.Body.Close()
 		// A 200 can still carry an XML error body (S3 quirk) — check both.
 		if resp.StatusCode/100 != 2 || bytes.Contains(respBody, []byte("<Error>")) {
+			// 404 NoSuchUpload after a transport-error retry usually means
+			// the FIRST complete succeeded server-side but its response
+			// was lost. Verify with a HEAD instead of failing hours of
+			// transfer over a finished upload.
+			if resp.StatusCode == http.StatusNotFound && bytes.Contains(respBody, []byte("NoSuchUpload")) && w.objectExists() {
+				return nil
+			}
 			return &httpOpError{
 				status:    resp.Status,
 				detail:    s3ErrorMessageBytes(respBody),
@@ -229,6 +236,23 @@ func (w *s3Writer) complete() error {
 		return fmt.Errorf("s3: complete upload: %w", err)
 	}
 	return nil
+}
+
+// objectExists reports whether the target object is already present — used
+// to disambiguate NoSuchUpload on CompleteMultipartUpload (the complete may
+// have succeeded server-side while its response was lost in transit).
+func (w *s3Writer) objectExists() bool {
+	req, err := w.s3req(http.MethodHead, w.objectPath(), "", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return false
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	return resp.StatusCode/100 == 2
 }
 
 func (w *s3Writer) createMultipart() (string, error) {

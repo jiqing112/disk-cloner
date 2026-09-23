@@ -135,6 +135,60 @@ func TestParseDdBytesRead(t *testing.T) {
 	}
 }
 
+// TestParseDdRecordsOut covers the locale-independent fallback: the
+// "X+Y records out" line is used when the GNU "N bytes copied" line is
+// missing (BusyBox dd, non-English locale output without a bytes summary).
+func TestParseDdRecordsOut(t *testing.T) {
+	cases := []struct {
+		name, stderr string
+		want         int64
+	}{
+		// GNU coreutils: records line present alongside the bytes summary.
+		{"GNU full output",
+			"32768+0 records in\n32768+0 records out\n1073741824 bytes (1.1 GB) copied, 12 s, 87 MB/s", 32768},
+		// BusyBox dd: no bytes line at all.
+		{"busybox records only", "262144+1 records in\n262144+1 records out", 262144},
+		// No parsable bytes line (localized summary), English records line.
+		{"no bytes line", "1024+0 records in\n1024+0 records out", 1024},
+		{"partial blocks only", "0+512 records out", 0},
+		{"garbage", "disk read error\nnothing to see here", -1},
+		{"records in is not records out", "1024+0 records in", -1},
+	}
+	for _, c := range cases {
+		if got := parseDdRecordsOut(c.stderr); got != c.want {
+			t.Errorf("%s: parseDdRecordsOut = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// TestDdRecordsTruncated locks down the lower-bound test: a complete read of
+// sourceSize at block size bs ends with X*bs+bs > sourceSize, so the
+// converse proves truncation, and unusable inputs prove nothing.
+func TestDdRecordsTruncated(t *testing.T) {
+	const mib = int64(1 << 20)
+	cases := []struct {
+		name               string
+		recs, bs, sourceSz int64
+		want               bool
+	}{
+		{"complete with partial tail block", 24, 4 * mib, 99 * mib, false},
+		{"complete exact multiple", 25, 4 * mib, 100 * mib, false},
+		{"one block short", 24, 4 * mib, 100 * mib, true},
+		{"missing partial tail", 7, mib, 8 * mib, true},
+		{"no full blocks at all", 0, 4 * mib, 100 * mib, true},
+		{"records count unusable", -1, 4 * mib, 100 * mib, false},
+		{"block size unknown", 24, 0, 100 * mib, false},
+		{"source size unknown", 24, 4 * mib, 0, false},
+		{"count beyond disk (overflow guard)", 1 << 62, 4 * mib, 100 * mib, false},
+	}
+	for _, c := range cases {
+		if got := ddRecordsTruncated(c.recs, c.bs, c.sourceSz); got != c.want {
+			t.Errorf("%s: ddRecordsTruncated(%d, %d, %d) = %v, want %v",
+				c.name, c.recs, c.bs, c.sourceSz, got, c.want)
+		}
+	}
+}
+
 // fakeRunner answers CombinedOutput by substring-matching the command
 // against canned outputs — enough to test the /proc/mounts + dm-slaves
 // parsing logic without a real shell.
@@ -171,7 +225,10 @@ func TestMountedSourcePartitionsDetectsLVM(t *testing.T) {
 		"/sys/block/dm-": "/dev/mapper/vg0-root\n/dev/dm-0\n",
 	}}
 	j := &CloneJob{runner: r, params: Params{SourcePath: "/dev/sda"}}
-	mounted := j.mountedSourcePartitions("/dev/sda")
+	mounted, err := j.mountedSourcePartitions("/dev/sda")
+	if err != nil {
+		t.Fatalf("mountedSourcePartitions: %v", err)
+	}
 
 	want := map[string]bool{"/": false, "/boot": false}
 	for _, mp := range mounted {

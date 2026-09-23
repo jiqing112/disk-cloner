@@ -2,6 +2,7 @@ package fixboot
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -80,7 +81,13 @@ func Run(cfg Config) error {
 			return fmt.Errorf("挂载根分区 %s (fstype=%s): %v; 自动探测同样失败: %v", rootDev, rootFstype, err, err2)
 		}
 	}
-	defer func() { _ = umountAll() }()
+	defer func() {
+		// Cleanup on error paths must not overwrite Run's return value,
+		// but a leftover mount can mean an unflushed journal — warn loudly.
+		if uerr := umountAll(); uerr != nil {
+			log("  [!] 清理阶段卸载失败: %v — 可能存在残留挂载, 请手动 umount 后再重启", uerr)
+		}
+	}()
 
 	// ── 4. Detect distro ───────────────────────────────────────────
 	distro := detectDistro(mountRoot)
@@ -167,10 +174,11 @@ func Run(cfg Config) error {
 	log("修复 GRUB 引导...")
 	// Boot mode follows the machine's own firmware — this tool runs on the
 	// box that will boot the disk, and /sys/firmware/efi exists only on
-	// UEFI boots. Directory/fstab hints alone misdetected UEFI systems
-	// (ESP mounted at /boot or /efi) as BIOS and wrote a legacy install
-	// that UEFI-only firmware can never boot.
-	fwEFI := dirExists("/sys/firmware/efi")
+	// UEFI boots. The firmware verdict is absolute: fstab/ESP hints must
+	// not be able to flip it, or a BIOS box restoring a UEFI-origin image
+	// gets an unbootable UEFI install reported as success.
+	fwInfo, fwErr := os.Stat("/sys/firmware/efi")
+	fwEFI := fwErr == nil && fwInfo.IsDir()
 	_, efiInFstab := fstabMounts["/boot/efi"]
 
 	// Locate the ESP. Default /boot/efi; some systems mount the ESP at
@@ -193,7 +201,8 @@ func Run(cfg Config) error {
 		}
 	}
 
-	isEFI := fwEFI || efiInFstab || espDev != "" || dirExists(filepath.Join(mountRoot, efiSub, "EFI"))
+	isEFI := decideEFI(fwErr, fwEFI, efiInFstab, espDev,
+		dirExists(filepath.Join(mountRoot, efiSub, "EFI")))
 
 	// Track failed steps so Run can report them instead of printing a
 	// misleading success line.
@@ -253,6 +262,11 @@ func Run(cfg Config) error {
 
 		// Add UEFI boot entry if efibootmgr is available
 		if commandExists("efibootmgr") {
+			// efibootmgr needs efivarfs, which the minimal Alpine RAM OS
+			// rarely mounts on its own. Already mounted or failure: both
+			// fine — the efibootmgr call below reports if it still can't
+			// work.
+			runQuiet("mount", "-t", "efivarfs", "efivarfs", "/sys/firmware/efi/efivars")
 			if espDev != "" {
 				// The ESP may live on a different disk than the clone
 				// target — efibootmgr must reference the disk that
@@ -266,12 +280,15 @@ func Run(cfg Config) error {
 				}
 				shimPath := findShimPath(mountRoot, efiSub)
 				if shimPath != "" {
-					run("efibootmgr", "-c",
+					if err := run("efibootmgr", "-c",
 						"-d", efiDisk,
 						"-p", efiPart,
 						"-L", bootID,
-						"-l", shimPath)
-					log("  ✓ UEFI 引导项已添加 (%s 分区 %s)", efiDisk, efiPart)
+						"-l", shimPath); err != nil {
+						log("  [!] efibootmgr 添加启动项失败: %v — NVRAM 启动项未写入; grub-install 通常已写 fallback 路径 \\EFI\\BOOT\\BOOTX64.EFI, 多数固件仍可引导, 否则需手动添加启动项", err)
+					} else {
+						log("  ✓ UEFI 引导项已添加 (%s 分区 %s)", efiDisk, efiPart)
+					}
 				}
 			}
 		} else {
@@ -360,15 +377,23 @@ func findRootPartition(targetDisk string) (string, string, error) {
 		}
 	}
 
-	// 2. LVM logical volumes
+	// 2. LVM logical volumes — only those physically located on the target
+	// disk (/sys/block/dm-N/slaves names the devices a dm volume is built
+	// on). /dev/mapper/* spans every VG on the box; without the filter a
+	// multi-disk machine could pick another disk's root by alphabetical
+	// accident.
 	lvmDevs, _ := filepath.Glob("/dev/mapper/*")
 	for _, d := range lvmDevs {
-		if d != "/dev/mapper/control" {
+		if d != "/dev/mapper/control" && dmOnTargetDisk(d, targetDisk) {
 			candidates = append(candidates, d)
 		}
 	}
 	dmDevs, _ := filepath.Glob("/dev/dm-*")
-	candidates = append(candidates, dmDevs...)
+	for _, d := range dmDevs {
+		if dmOnTargetDisk(d, targetDisk) {
+			candidates = append(candidates, d)
+		}
+	}
 
 	// De-duplicate
 	seen := map[string]bool{}
@@ -449,6 +474,78 @@ func findRootPartition(targetDisk string) (string, string, error) {
 	}
 
 	return "", "", fmt.Errorf("no partition contains a Linux root filesystem")
+}
+
+// dmOnTargetDisk reports whether the device-mapper device devPath (a
+// /dev/dm-N node, or a /dev/mapper/* name that resolves to one) is built on
+// targetDisk or one of its partitions: every entry of
+// /sys/block/dm-N/slaves is a kernel basename like sda3 or nvme0n1p1.
+func dmOnTargetDisk(devPath, targetDisk string) bool {
+	real, err := filepath.EvalSymlinks(devPath)
+	if err != nil {
+		real = devPath
+	}
+	data, err := os.ReadFile("/sys/block/" + filepath.Base(real) + "/slaves")
+	if err != nil {
+		// Not a dm device or sysfs unreadable — excluding is the safe side:
+		// the plain-partition candidates above still cover the target disk.
+		return false
+	}
+	diskBase := filepath.Base(targetDisk)
+	for _, s := range strings.Fields(string(data)) {
+		if slaveMatchesDisk(s, diskBase) {
+			return true
+		}
+	}
+	return false
+}
+
+// slaveMatchesDisk reports whether slave (a kernel basename from a dm
+// device's slaves list, e.g. "sda3" or "nvme0n1p1") is diskBase itself or
+// one of its partitions. Disk names ending in a digit (nvme0n1, mmcblk0,
+// loop0) separate partition numbers with a "p"; a bare prefix check would
+// wrongly count nvme0n10 — a different disk — as a partition of nvme0n1.
+func slaveMatchesDisk(slave, diskBase string) bool {
+	if slave == diskBase {
+		return true
+	}
+	rest := strings.TrimPrefix(slave, diskBase)
+	if len(rest) == len(slave) {
+		return false // slave does not even start with diskBase
+	}
+	if c := diskBase[len(diskBase)-1]; c >= '0' && c <= '9' {
+		return strings.HasPrefix(rest, "p") && allDigits(rest[1:])
+	}
+	return allDigits(rest)
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// decideEFI resolves the boot mode from the /sys/firmware/efi probe.
+// Firmware is authoritative: a completed probe decides alone, and plain
+// absence of the directory is exactly what a BIOS boot looks like. Only an
+// abnormal probe error (something other than NotExist, i.e. /sys in an
+// unexpected state) falls back to the fstab/ESP heuristics.
+func decideEFI(probeErr error, fwIsDir, fstabEFI bool, espDev string, espDirPresent bool) bool {
+	if probeErr == nil {
+		return fwIsDir
+	}
+	// errors.Is (not os.IsNotExist): it unwraps %w-wrapped errors, which
+	// callers may pass when testing.
+	if errors.Is(probeErr, os.ErrNotExist) {
+		return false
+	}
+	return fstabEFI || espDev != "" || espDirPresent
 }
 
 // getBlkidFstype returns the filesystem type of a device using blkid.
@@ -779,8 +876,12 @@ func umountAll() error {
 	// Read /proc/mounts to find all mounts under mountRoot
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
-		// Fallback: try umount -R
-		runQuiet("umount", "-R", mountRoot)
+		// Fallback: umount -R is all that's left without /proc/mounts; a
+		// failure here can mean a live journal — surface it, don't fake
+		// success.
+		if rerr := runQuiet("umount", "-R", mountRoot); rerr != nil {
+			return fmt.Errorf("无法读取 /proc/mounts, umount -R %s 亦失败: %v", mountRoot, rerr)
+		}
 		return nil
 	}
 

@@ -63,6 +63,8 @@ func scanRemoteDisks(r sshclient.Runner) ([]disk.DiskInfo, error) {
 var compressLevel = 1 // default gzip compression level 1-9, 0 = no compression
 var compressType = 0  // 0=gzip, 1=pigz (multi-threaded)
 var fixInitramfs = false
+var cliZeroFill = true      // -no-zerofill: CLI 模式默认执行零填充
+var cliFixInitramfs = true  // -no-fix-initramfs: CLI 模式默认重建 initramfs
 var tlsVerifyEnabled = false // -tls-verify: enable certificate verification for WebDAV/S3 https
 
 func main() {
@@ -78,6 +80,8 @@ func main() {
 		autoYes     = flag.Bool("y", false, "跳过确认")
 		saveFile    = flag.String("o", "", "保存为 gzip 文件")
 		noFixBoot   = flag.Bool("no-fix-boot", false, "跳过引导修复 (克隆和恢复模式均生效)")
+		noZeroFill  = flag.Bool("no-zerofill", false, "跳过零填充 (命令行模式默认执行零填充, 此参数关闭)")
+		noFixInit   = flag.Bool("no-fix-initramfs", false, "跳过备份前重建 initramfs (命令行模式默认执行, 此参数关闭)")
 		fixBootDev  = flag.String("fix-boot-disk", "", "独立修复引导")
 		restoreFile = flag.String("r", "", "恢复 gzip 文件到远程磁盘")
 		dst         = flag.String("dst", "", "传输到远程存储 (sftp:// ftp:// dav:// davs:// s3:// pixeldrain://)")
@@ -122,9 +126,12 @@ func main() {
 
 	compressLevel = *compressLv
 	if compressLevel < 0 || compressLevel > 9 {
-		compressLevel = 1
+		fmt.Fprintf(os.Stderr, "错误: 压缩级别 -z 必须在 0-9 之间 (收到 %d)\n", *compressLv)
+		os.Exit(1)
 	}
 	tlsVerifyEnabled = *tlsVerify
+	cliZeroFill = !*noZeroFill
+	cliFixInitramfs = !*noFixInit
 
 	if *showVer {
 		fmt.Println("Disk Cloner v" + version)
@@ -178,6 +185,12 @@ func main() {
 	}
 	if *remoteIP != "" && *target == "" && *saveFile == "" && *restoreFile == "" && *dst == "" {
 		fmt.Fprintln(os.Stderr, "错误: 指定了 -H/-s 但未指定操作 (-t / -o / -r / -dst), 运行时不带参数可进入交互模式")
+		os.Exit(1)
+	}
+	// An operation flag without a source would be silently ignored when we
+	// fall through to interactive mode; fail fast instead.
+	if *localDisk == "" && *remoteIP == "" && (*target != "" || *saveFile != "" || *restoreFile != "" || *dst != "") {
+		fmt.Fprintln(os.Stderr, "错误: 指定了操作参数 (-t/-o/-r/-dst) 但未指定源 (-H/-s 或 -l), 运行时不带参数可进入交互模式")
 		os.Exit(1)
 	}
 	if *target != "" && runtime.GOOS == "windows" {
@@ -404,14 +417,17 @@ connectLoop:
 
 		fmt.Println("  远程服务器配置")
 		fmt.Println("  ─────────────────────────────────────────────")
-		ip := cli.ReadInput("服务器IP", "")
-		ip = extractIP(ip)
+		ip, pastedPort := extractHostPort(cli.ReadInput("服务器IP", ""))
 		if ip == "" {
 			fmt.Println("  取消")
 			waitExit()
 			return
 		}
-		port := cli.ReadInt("SSH 端口", 22)
+		portDefault := 22
+		if pastedPort > 0 {
+			portDefault = pastedPort
+		}
+		port := cli.ReadInt("SSH 端口", portDefault)
 		user := cli.ReadInput("用户名", "root")
 		pass := cli.ReadPassword("密码 (回车使用密钥)")
 		if pass == "" {
@@ -737,7 +753,8 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 	// Direct mode defaults: rebuild initramfs for cross-hardware boot
 	// compatibility (applies to both save and clone paths; restore ignores it).
-	fixInitramfs = true
+	// -no-fix-initramfs opts out.
+	fixInitramfs = cliFixInitramfs
 
 	remoteDisks, err := scanRemoteDisks(sshClient)
 	if err != nil {
@@ -781,8 +798,8 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			readiness.OSLine, readiness.RootFS, readiness.IsAlpine, readiness.IsRAM, readiness.Detected)
 		logger.logf("源磁盘: %s (%s)", srcDisk.Path, srcDisk.SizeHuman)
 		logger.logf("保存文件: %s", saveFile)
-		logger.logf("块大小: %s  压缩级别: %d  压缩方式: %s  零填充: 是  重建 initramfs: %v",
-			bs, compressLevel, compressTypeName(compressType), fixInitramfs)
+		logger.logf("块大小: %s  压缩级别: %d  压缩方式: %s  零填充: %v  重建 initramfs: %v",
+			bs, compressLevel, compressTypeName(compressType), cliZeroFill, fixInitramfs)
 
 		if !autoYes {
 			fmt.Printf("将保存远程 %s 到文件 %s\n", srcDisk.Path, saveFile)
@@ -798,7 +815,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		} else {
 			fmt.Printf("  日志文件: %s\n", logPath)
 		}
-		execSaveToFile(ip, cliDisk, sshClient, saveFile, bs, true, logger)
+		execSaveToFile(ip, cliDisk, sshClient, saveFile, bs, cliZeroFill, logger)
 		logger.close()
 		return
 	}
@@ -818,8 +835,8 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 			readiness.OSLine, readiness.RootFS, readiness.IsAlpine, readiness.IsRAM, readiness.Detected)
 		logger.logf("源磁盘: %s (%s)", srcDisk.Path, srcDisk.SizeHuman)
 		logger.logf("存储目标: %s", storage.Describe(cfg))
-		logger.logf("块大小: %s  压缩级别: %d  压缩方式: %s  零填充: 是  重建 initramfs: %v",
-			bs, compressLevel, compressTypeName(compressType), fixInitramfs)
+		logger.logf("块大小: %s  压缩级别: %d  压缩方式: %s  零填充: %v  重建 initramfs: %v",
+			bs, compressLevel, compressTypeName(compressType), cliZeroFill, fixInitramfs)
 
 		if !autoYes {
 			fmt.Printf("将读取远程 %s 并流式上传到 %s\n", srcDisk.Path, storage.Describe(cfg))
@@ -839,7 +856,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		} else {
 			fmt.Printf("  日志文件: %s\n", logPath)
 		}
-		execSaveToStorage(cliDisk, sshClient, cfg, bs, true, dateDir, logger)
+		execSaveToStorage(cliDisk, sshClient, cfg, bs, cliZeroFill, dateDir, logger)
 		logger.close()
 		return
 	}
@@ -865,7 +882,10 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		// Check target disk size vs uncompressed image size.
 		uncompSize := imageSize(restoreFile)
 		if uncompSize > 0 {
-			if targetSize, _ := getRemoteDiskSize(sshClient, source); targetSize > 0 && uncompSize > targetSize {
+			targetSize, sizeErr := getRemoteDiskSize(sshClient, source)
+			if sizeErr != nil {
+				fmt.Printf("  [!] 无法获取目标盘大小，跳过容量检查: %v\n", sizeErr)
+			} else if targetSize > 0 && uncompSize > targetSize {
 				pct := float64(targetSize) / float64(uncompSize) * 100
 				fmt.Printf("  [!] 目标盘 (%s) 小于解压后镜像 (%s)，只能写入约 %.1f%%\n",
 					disk.FormatBytes(targetSize), disk.FormatBytes(uncompSize), pct)
@@ -877,6 +897,18 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 				} else {
 					fmt.Println("  [!] -y 模式继续恢复（风险自负）")
 				}
+			}
+		}
+
+		// Destructive operation: same overwrite gate as every other path
+		// (interactive restore, CLI clone, CLI save). The checksum and size
+		// checks above only fire conditionally, so without this a plain
+		// `-r` invocation would start dd-ing the remote disk unprompted.
+		if !autoYes {
+			fmt.Printf("此操作将覆盖远程 %s 上的所有数据!\n", source)
+			if !cli.Confirm("  确认开始恢复? 输入 yes 继续") {
+				fmt.Println("已取消")
+				return
 			}
 		}
 
@@ -912,16 +944,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 
 		// Post-restore verification: read-only fsck on all target partitions.
 		// Catches torn images before the user reboots into a corrupted system.
-		fmt.Println("  正在验证目标文件系统一致性 (只读 fsck)...")
-		if bad := postRestoreFsck(sshClient, source); len(bad) > 0 {
-			fmt.Printf("  [!] 警告: 以下分区 fsck 报告错误: %s\n", strings.Join(bad, ", "))
-			fmt.Println("  [!] 恢复的文件系统可能不一致,重启前请先执行:")
-			for _, p := range bad {
-				fmt.Printf("        fsck -fy %s\n", p)
-			}
-		} else {
-			fmt.Println("  ✓ 目标文件系统一致性检查通过")
-		}
+		reportPostRestoreFsck(sshClient, source)
 		return
 	}
 
@@ -940,8 +963,16 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 	fmt.Printf("本地: %s (%s)\n", target, tgtDisk.SizeHuman)
 
 	if tgtDisk.SizeBytes < srcDisk.SizeBytes {
-		fmt.Printf("警告: 目标盘 (%s) 小于源盘 (%s)\n",
+		fmt.Printf("  [!] 目标盘 (%s) 小于源盘 (%s)，整盘克隆会被截断，恢复后目标文件系统将损坏\n",
 			tgtDisk.SizeHuman, srcDisk.SizeHuman)
+		if !autoYes {
+			if !cli.Confirm("  确认仍要强制克隆? 输入 yes") {
+				fmt.Println("已取消")
+				return
+			}
+		} else {
+			fmt.Println("  [!] -y 模式继续强制克隆（风险自负）")
+		}
 	}
 
 	if !autoYes {
@@ -960,7 +991,7 @@ func runDirect(ip string, port int, user, pass, source, target, bs string,
 		TargetPath:       target,
 		SourceSize:       srcDisk.SizeBytes,
 		BlockSize:        bs,
-		ZeroFill:         true,
+		ZeroFill:         cliZeroFill,
 		CompressionLevel: compressLevel,
 		CompressType:     compressType,
 		FixInitramfs:     fixInitramfs,
@@ -1192,14 +1223,12 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, runner sshclient.Runner, fi
 	if err := job.RunToFile(); err != nil {
 		logger.logf("保存失败: %v", err)
 		fmt.Printf("\n  保存失败: %v\n", err)
-		// Mark the leftover partial file so it can't be mistaken for a
-		// valid backup later.
-		if _, statErr := os.Stat(fileName); statErr == nil {
-			partial := fileName + ".partial"
-			if rnErr := os.Rename(fileName, partial); rnErr == nil {
-				logger.logf("未完成的文件已重命名为 %s", partial)
-				fmt.Printf("  [!] 未完成的文件已重命名为: %s\n", partial)
-			}
+		// RunToFile streams into "<file>.partial" and renames only on
+		// success — a failed rerun cannot destroy the previous backup.
+		partial := fileName + ".partial"
+		if _, statErr := os.Stat(partial); statErr == nil {
+			logger.logf("未完成的文件保留为 %s", partial)
+			fmt.Printf("  [!] 未完成的文件保留为: %s\n", partial)
 		}
 		return
 	}
@@ -1215,8 +1244,12 @@ func execSaveToFile(ip string, srcDisk cli.DiskItem, runner sshclient.Runner, fi
 	}
 	// Record the exact uncompressed size: gzip's ISIZE footer wraps above
 	// 4 GiB, and restores need the real size to warn about small targets.
-	clone.WriteSizeFile(fileName, srcDisk.SizeBytes)
-	logger.logf("校验/大小文件已生成: %s.sha256 / %s.size", fileName, fileName)
+	if err := clone.WriteSizeFile(fileName, srcDisk.SizeBytes); err != nil {
+		logger.logf("大小文件写入失败: %v", err)
+		fmt.Printf("  [!] 大小文件写入失败 %s.size: %v — 恢复时 >4GiB 镜像的容量预检会降级\n", fileName, err)
+	} else {
+		logger.logf("大小文件已生成: %s.size", fileName)
+	}
 
 	if info, err := os.Stat(fileName); err == nil {
 		ratio := 0.0
@@ -1379,7 +1412,8 @@ func runDirectLocal(diskPath, bs string, autoYes bool, saveFile, dst string) {
 	}
 
 	// Direct mode defaults: rebuild initramfs for cross-hardware boot.
-	fixInitramfs = true
+	// -no-fix-initramfs opts out.
+	fixInitramfs = cliFixInitramfs
 
 	disks, err := disk.GetLocalDisks()
 	if err != nil {
@@ -1438,7 +1472,7 @@ func runDirectLocal(diskPath, bs string, autoYes bool, saveFile, dst string) {
 		} else {
 			fmt.Printf("  日志文件: %s\n", logPath)
 		}
-		execSaveToFile("本机", cliDisk, runner, saveFile, bs, true, logger)
+		execSaveToFile("本机", cliDisk, runner, saveFile, bs, cliZeroFill, logger)
 		logger.close()
 		return
 	}
@@ -1477,7 +1511,7 @@ func runDirectLocal(diskPath, bs string, autoYes bool, saveFile, dst string) {
 	} else {
 		fmt.Printf("  日志文件: %s\n", logPath)
 	}
-	execSaveToStorage(cliDisk, runner, cfg, bs, true, dateDir, logger)
+	execSaveToStorage(cliDisk, runner, cfg, bs, cliZeroFill, dateDir, logger)
 	logger.close()
 }
 
@@ -1502,8 +1536,13 @@ func askStorageConn() (storage.Config, bool) {
 		if cfg.Host == "" {
 			return cfg, false
 		}
-		cfg.Host = extractIP(cfg.Host)
-		cfg.Port = cli.ReadInt("SSH 端口", 22)
+		var pastedPort int
+		cfg.Host, pastedPort = extractHostPort(cfg.Host)
+		portDefault := 22
+		if pastedPort > 0 {
+			portDefault = pastedPort
+		}
+		cfg.Port = cli.ReadInt("SSH 端口", portDefault)
 		cfg.User = cli.ReadInput("用户名", "root")
 		cfg.Password = cli.ReadPassword("密码 (回车使用密钥)")
 	case 2:
@@ -1512,8 +1551,13 @@ func askStorageConn() (storage.Config, bool) {
 		if cfg.Host == "" {
 			return cfg, false
 		}
-		cfg.Host = extractIP(cfg.Host)
-		cfg.Port = cli.ReadInt("端口", 21)
+		var pastedPort int
+		cfg.Host, pastedPort = extractHostPort(cfg.Host)
+		portDefault := 21
+		if pastedPort > 0 {
+			portDefault = pastedPort
+		}
+		cfg.Port = cli.ReadInt("端口", portDefault)
 		cfg.User = cli.ReadInput("用户名", "")
 		cfg.Password = cli.ReadPassword("密码")
 	case 3:
@@ -1671,6 +1715,14 @@ func execSaveToStorage(srcDisk cli.DiskItem, runner sshclient.Runner,
 	if err := w.Close(); err != nil {
 		logger.logf("上传收尾失败: %v", err)
 		fmt.Printf("\n  上传收尾失败: %v\n", err)
+		// The full stream was already sent and hashed before Close failed
+		// (e.g. S3 CompleteMultipartUpload error) — the remote object may
+		// still be intact. Surface the checksum so it can be verified
+		// manually; the .sha256 sidecar is only written on clean finish.
+		if job.ChecksumHex != "" {
+			fmt.Printf("  [!] 镜像数据已完整传出, 上传流 SHA256: %s\n", job.ChecksumHex)
+			fmt.Println("  [!] 若确认远端对象完整, 可手动与此值核对")
+		}
 		return
 	}
 	// Pixeldrain 等后端会上报可分享的链接
@@ -1689,8 +1741,12 @@ func execSaveToStorage(srcDisk cli.DiskItem, runner sshclient.Runner,
 	if job.ChecksumHex != "" {
 		writeChecksumFile(filepath.Join(sidecarDir, base), job.ChecksumHex)
 	}
-	clone.WriteSizeFile(filepath.Join(sidecarDir, base), srcDisk.SizeBytes)
-	logger.logf("校验/大小文件已生成(本地): %s.sha256 / %s.size", base, base)
+	if err := clone.WriteSizeFile(filepath.Join(sidecarDir, base), srcDisk.SizeBytes); err != nil {
+		logger.logf("大小文件写入失败: %v", err)
+		fmt.Printf("  [!] 大小文件写入失败 %s.size: %v — 恢复时 >4GiB 镜像的容量预检会降级\n", base, err)
+	} else {
+		logger.logf("大小文件已生成(本地): %s.size", base)
+	}
 
 	fmt.Println()
 	fmt.Println("  ===============================================")
@@ -1759,8 +1815,10 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 	// Check target disk size vs uncompressed image size.
 	uncompSize := imageSize(fileName)
 	if uncompSize > 0 {
-		targetSize, _ := getRemoteDiskSize(sshClient, remoteDisk)
-		if targetSize > 0 && uncompSize > targetSize {
+		targetSize, sizeErr := getRemoteDiskSize(sshClient, remoteDisk)
+		if sizeErr != nil {
+			fmt.Printf("  [!] 无法获取目标盘大小，跳过容量检查: %v\n", sizeErr)
+		} else if targetSize > 0 && uncompSize > targetSize {
 			pct := float64(targetSize) / float64(uncompSize) * 100
 			fmt.Printf("  [!] 目标盘 (%s) 小于解压后镜像 (%s)，只能写入约 %.1f%%\n",
 				disk.FormatBytes(targetSize), disk.FormatBytes(uncompSize), pct)
@@ -1822,16 +1880,7 @@ func runRestoreToRemote(ip string, srcDisk cli.DiskItem, sshClient *sshclient.Cl
 
 	// Post-restore verification: read-only fsck on all target partitions.
 	fmt.Println()
-	fmt.Println("  正在验证目标文件系统一致性 (只读 fsck)...")
-	if bad := postRestoreFsck(sshClient, remoteDisk); len(bad) > 0 {
-		fmt.Printf("  [!] 警告: 以下分区 fsck 报告错误: %s\n", strings.Join(bad, ", "))
-		fmt.Println("  [!] 恢复的文件系统可能不一致,重启前请先执行:")
-		for _, p := range bad {
-			fmt.Printf("        fsck -fy %s\n", p)
-		}
-	} else {
-		fmt.Println("  ✓ 目标文件系统一致性检查通过")
-	}
+	reportPostRestoreFsck(sshClient, remoteDisk)
 
 	fmt.Println()
 	fmt.Println("  ===============================================")
@@ -2127,23 +2176,69 @@ func saveExtFor(level int) string {
 	return ".img.gz"
 }
 
-// extractIP attempts to extract an IPv4 address from user input.
-// Handles copied text like "IP: 192.168.1.100" or "192.168.1.100:22".
-// Octets are range-checked so garbage like 999.999.999.999 isn't extracted
-// as if it were an address; non-matching input (e.g. a hostname) is
-// returned as-is and validated at dial time.
-var ipRe = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
+// extractHostPort attempts to extract an IPv4 address (and an optional
+// ":port") from user input like "IP: 192.168.1.100:22". Extraction only
+// fires when the address is delimited by characters that cannot appear
+// inside a hostname (string boundaries, whitespace, ":", "=", ",", "/",
+// "@"), so "srv-192.168.1.5.lan" stays a hostname instead of being silently
+// rewritten to the embedded IP. A trailing port is returned separately so
+// the caller can prefill its port prompt. Non-matching input is returned
+// unchanged and validated at dial time.
+var ipRe = regexp.MustCompile(`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}`)
 
-func extractIP(input string) string {
+func extractHostPort(input string) (string, int) {
 	input = strings.TrimSpace(input)
 	if input == "" {
-		return ""
+		return "", 0
 	}
-	// Try to extract IP from any surrounding text
-	if match := ipRe.FindString(input); match != "" && validIPv4(match) {
-		return match
+	for _, loc := range ipRe.FindAllStringIndex(input, -1) {
+		match := input[loc[0]:loc[1]]
+		if !validIPv4(match) || !ipDelimBefore(input, loc[0]) || !ipDelimAfter(input, loc[1]) {
+			continue
+		}
+		port := 0
+		if rest := input[loc[1]:]; strings.HasPrefix(rest, ":") {
+			digits := rest[1:]
+			end := strings.IndexFunc(digits, func(r rune) bool { return r < '0' || r > '9' })
+			if end < 0 {
+				end = len(digits)
+			}
+			if end > 0 {
+				if p, err := strconv.Atoi(digits[:end]); err == nil && p > 0 && p <= 65535 {
+					port = p
+				}
+			}
+		}
+		return match, port
 	}
-	return input
+	return input, 0
+}
+
+// ipDelimBefore reports whether the byte just before position i (or the
+// string start) separates an IP from its surroundings rather than being part
+// of a hostname like "srv-192.168.1.5.lan".
+func ipDelimBefore(s string, i int) bool {
+	if i <= 0 {
+		return true
+	}
+	switch s[i-1] {
+	case ' ', '\t', ':', '=', ',', '/', '@':
+		return true
+	}
+	return false
+}
+
+// ipDelimAfter is ipDelimBefore for the byte just after position i (or the
+// string end). A ':' here may carry a port, handled by the caller.
+func ipDelimAfter(s string, i int) bool {
+	if i >= len(s) {
+		return true
+	}
+	switch s[i] {
+	case ' ', '\t', ':', '=', ',', '/', '@':
+		return true
+	}
+	return false
 }
 
 // validIPv4 reports whether s is four dot-separated octets in 0-255.
@@ -2354,7 +2449,12 @@ func countType(disks []disk.DiskInfo, t string) int {
 // writeChecksumFile writes a precomputed SHA256 hex digest in the standard
 // "sha256sum" text format.
 func writeChecksumFile(filePath, hexStr string) {
-	os.WriteFile(filePath+".sha256", []byte(fmt.Sprintf("%s  %s\n", hexStr, filepath.Base(filePath))), 0644)
+	if err := os.WriteFile(filePath+".sha256", []byte(fmt.Sprintf("%s  %s\n", hexStr, filepath.Base(filePath))), 0644); err != nil {
+		// A silent failure here silently disables restore-time integrity
+		// verification (a missing .sha256 counts as "nothing to verify").
+		fmt.Printf("  [!] 校验文件写入失败 %s.sha256: %v — 恢复时将无法自动校验完整性\n", filePath, err)
+		return
+	}
 	fmt.Printf("  校验文件: %s.sha256\n", filePath)
 }
 
@@ -2362,17 +2462,22 @@ func writeChecksumFile(filePath, hexStr string) {
 func saveChecksum(filePath string) {
 	f, err := os.Open(filePath)
 	if err != nil {
+		fmt.Printf("  [!] 无法读取 %s 计算校验: %v — 恢复时将无法自动校验完整性\n", filePath, err)
 		return
 	}
 	defer f.Close()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
+		fmt.Printf("  [!] 计算 %s 的 SHA256 失败: %v — 恢复时将无法自动校验完整性\n", filePath, err)
 		return
 	}
 
 	hash := fmt.Sprintf("%x  %s\n", h.Sum(nil), filepath.Base(filePath))
-	os.WriteFile(filePath+".sha256", []byte(hash), 0644)
+	if err := os.WriteFile(filePath+".sha256", []byte(hash), 0644); err != nil {
+		fmt.Printf("  [!] 校验文件写入失败 %s.sha256: %v — 恢复时将无法自动校验完整性\n", filePath, err)
+		return
+	}
 	fmt.Printf("  校验文件: %s.sha256\n", filePath)
 }
 
@@ -2424,14 +2529,23 @@ func verifyChecksum(filePath string) bool {
 // target disk after a restore. This catches corruption that would otherwise
 // only surface as "Journal has aborted" / "bad block bitmap checksum" on boot.
 //
-// Returns the list of partitions that reported errors (caller may warn).
+// Returns the partitions that reported errors, how many were actually
+// checked, and an error when the sweep itself could not run (missing tool,
+// partition enumeration failure). "Not checked" must stay distinguishable
+// from "checked and clean" — a failed probe masquerading as a pass would be
+// worse than no check at all.
+//
 // Partitions whose filesystem type cannot be identified, or that use a
 // filesystem we can't check read-only (xfs has no safe offline check —
 // xfs_repair -n requires the filesystem to be unmounted and clean), are
 // silently skipped to avoid false positives.
-func postRestoreFsck(sshClient *sshclient.Client, targetDisk string) []string {
-	// Ensure fsck tools are available on the remote.
-	sshClient.CombinedOutput("command -v fsck.ext4 || apk add --quiet e2fsprogs 2>/dev/null")
+func postRestoreFsck(sshClient *sshclient.Client, targetDisk string) ([]string, int, error) {
+	// Ensure fsck tools are available on the remote. A missing fsck.ext4
+	// would exit 127 on every ext partition and report them all as bad.
+	sshClient.CombinedOutput("command -v fsck.ext4 >/dev/null 2>&1 || apk add --quiet e2fsprogs 2>/dev/null")
+	if _, err := sshClient.CombinedOutput("command -v fsck.ext4"); err != nil {
+		return nil, 0, fmt.Errorf("远程缺少 fsck.ext4 且自动安装失败, 无法执行只读检查")
+	}
 
 	// List partitions of the target disk via /sys/block, which doesn't need
 	// lsblk and works even on minimal busybox systems.
@@ -2439,12 +2553,16 @@ func postRestoreFsck(sshClient *sshclient.Client, targetDisk string) []string {
 	if i := strings.LastIndex(targetDisk, "/"); i >= 0 {
 		diskBase = targetDisk[i+1:]
 	}
-	out, _ := sshClient.CombinedOutput(fmt.Sprintf(
+	out, err := sshClient.CombinedOutput(fmt.Sprintf(
 		`for p in /sys/block/%s/%s*/partition; do [ -f "$p" ] || continue; `+
 			`echo "/dev/$(basename $(dirname "$p"))"; done`,
 		diskBase, diskBase))
+	if err != nil {
+		return nil, 0, fmt.Errorf("枚举 %s 的分区失败: %w", targetDisk, err)
+	}
 
 	var bad []string
+	checked := 0
 	for _, line := range strings.Split(out, "\n") {
 		part := strings.TrimSpace(line)
 		if part == "" || !strings.HasPrefix(part, "/dev/") {
@@ -2461,6 +2579,7 @@ func postRestoreFsck(sshClient *sshclient.Client, targetDisk string) []string {
 		switch fsType {
 		case "ext2", "ext3", "ext4":
 			// -n = read-only, don't touch. We just want the exit status.
+			checked++
 			if _, err := sshClient.CombinedOutput(fmt.Sprintf("fsck.ext4 -fn %s 2>&1", part)); err != nil {
 				bad = append(bad, part)
 			}
@@ -2478,5 +2597,27 @@ func postRestoreFsck(sshClient *sshclient.Client, targetDisk string) []string {
 			continue
 		}
 	}
-	return bad
+	return bad, checked, nil
+}
+
+// reportPostRestoreFsck runs the read-only fsck sweep and prints the outcome,
+// keeping "checked and clean", "nothing to check", "not checked" and
+// "partitions failed" visibly distinct.
+func reportPostRestoreFsck(sshClient *sshclient.Client, targetDisk string) {
+	fmt.Println("  正在验证目标文件系统一致性 (只读 fsck)...")
+	bad, checked, err := postRestoreFsck(sshClient, targetDisk)
+	switch {
+	case err != nil:
+		fmt.Printf("  [!] 一致性检查未执行: %v\n", err)
+	case checked == 0:
+		fmt.Println("  - 目标盘没有可在线检查的 ext 分区，跳过一致性检查")
+	case len(bad) > 0:
+		fmt.Printf("  [!] 警告: 以下分区 fsck 报告错误: %s\n", strings.Join(bad, ", "))
+		fmt.Println("  [!] 恢复的文件系统可能不一致,重启前请先执行:")
+		for _, p := range bad {
+			fmt.Printf("        fsck -fy %s\n", p)
+		}
+	default:
+		fmt.Println("  ✓ 目标文件系统一致性检查通过")
+	}
 }

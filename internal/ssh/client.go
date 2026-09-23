@@ -84,11 +84,24 @@ func Connect(cfg Config) (*Client, error) {
 
 	authMethods := []ssh.AuthMethod{}
 
-	// Password provided → use password auth only.
+	// Password provided → password auth, plus keyboard-interactive as a
+	// fallback: servers with PasswordAuthentication no but
+	// KbdInteractiveAuthentication yes (Ubuntu/PAM default) reject plain
+	// ssh.Password. A server that does not offer the method never invokes
+	// the callback, so MaxAuthTries is not consumed by it.
 	// Loading SSH keys alongside password can exceed MaxAuthTries on
 	// servers with strict limits (each failed key attempt counts).
 	if cfg.Password != "" {
-		authMethods = append(authMethods, ssh.Password(cfg.Password))
+		authMethods = append(authMethods, ssh.Password(cfg.Password),
+			ssh.KeyboardInteractive(func(user, instruction string, questions []string, echos []bool) ([]string, error) {
+				// PAM setups typically ask one password prompt — answer
+				// every prompt with the same password.
+				answers := make([]string, len(questions))
+				for i := range questions {
+					answers[i] = cfg.Password
+				}
+				return answers, nil
+			}))
 	} else {
 		// Try SSH keys as fallback
 		keyPaths := []string{"~/.ssh/id_rsa", "~/.ssh/id_ed25519", "~/.ssh/id_ecdsa"}
@@ -120,12 +133,23 @@ func Connect(cfg Config) (*Client, error) {
 			serverKey = key
 			return nil
 		},
-		Timeout: time.Duration(cfg.Timeout) * time.Second,
 	}
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	conn, err := ssh.Dial("tcp", addr, sshCfg)
+	timeout := time.Duration(cfg.Timeout) * time.Second
+	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
+		return nil, fmt.Errorf("ssh dial: %w", err)
+	}
+	// ssh.ClientConfig.Timeout only bounds the TCP dial; KEX and auth have
+	// no deadline of their own, so a peer that accepts TCP but stays silent
+	// on the protocol layer would block NewClientConn forever. Bound the
+	// whole handshake, then clear the deadline — liveness afterwards is the
+	// keepalive's job (IsConnected).
+	conn.SetDeadline(time.Now().Add(timeout))
+	sconn, chans, reqs, err := ssh.NewClientConn(conn, addr, sshCfg)
+	if err != nil {
+		conn.Close()
 		// Enhance the error message for common Windows-specific issues
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "handshake failed: EOF") {
@@ -145,8 +169,9 @@ func Connect(cfg Config) (*Client, error) {
 		}
 		return nil, fmt.Errorf("ssh dial: %w", err)
 	}
+	conn.SetDeadline(time.Time{})
 
-	c := &Client{conn: conn, Config: cfg}
+	c := &Client{conn: ssh.NewClient(sconn, chans, reqs), Config: cfg}
 	if serverKey != nil {
 		c.ServerKeyFingerprint = ssh.FingerprintSHA256(serverKey)
 	}

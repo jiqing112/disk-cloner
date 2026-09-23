@@ -108,7 +108,7 @@ cd /tmp && chmod +x disk-cloner-linux-amd64 && ./disk-cloner-linux-amd64
 
 - 保存目录回车 = 当前目录下自动创建日期子目录（如 `2026-07-03/`）；Windows 输入 `b` 弹出文件夹浏览对话框
 - 默认文件名 `IP-磁盘名-容量-日期.img.gz`，每个镜像附带三个小文件：`.sha256` 校验、`.size` 解压后真实大小、`.log` 传输日志
-- 传输中断的镜像自动改名 `.partial`，不会被误当成有效备份
+- 传输全程先写 `.partial` 临时文件，成功后才改名为正式文件——中途中断不会破坏已有的旧备份，残留的 `.partial` 也不会被误当成有效备份
 - `-z 0` 不压缩时输出原始 `.img` 文件，恢复时程序自动识别
 
 镜像是标准 gzip 格式，可脱离本工具恢复：
@@ -232,6 +232,8 @@ disk-cloner -H 192.168.1.100 -p password -s /dev/sda -dst 'sftp://user:pass@nas.
 | `-V` | 显示版本号 | — |
 | `--fix-boot-disk <磁盘>` | 独立修复引导 | — |
 | `--no-fix-boot` | 命令行克隆（`-t`）和恢复（`-r`）时跳过自动引导修复 | — |
+| `-no-zerofill` | 命令行模式跳过零填充（命令行模式默认执行零填充，交互模式会询问） | false |
+| `-no-fix-initramfs` | 命令行模式跳过备份前重建 initramfs（命令行模式默认执行，交互模式会询问） | false |
 | `-tls-verify` | 对 WebDAV/S3/Pixeldrain 启用 HTTPS 证书校验（也可在 URL 加 `tlsverify=1`） | false |
 
 密码含 `$` `~` `?` `%` 等特殊字符时用单引号包裹：`-p 'kI$~4)Tz?%E5ai78'`。

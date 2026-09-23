@@ -103,7 +103,7 @@ func Describe(cfg Config) string {
 	case KindFTP:
 		return fmt.Sprintf("ftp://%s@%s:%d%s", cfg.User, cfg.Host, cfg.Port, cfg.Path)
 	case KindWebDAV:
-		return cfg.URL
+		return redactURLCreds(cfg.URL)
 	case KindS3:
 		scheme := "https"
 		if !cfg.UseTLS {
@@ -270,9 +270,16 @@ func ParseURL(raw string) (Config, error) {
 		if cfg.Host == "" {
 			cfg.Host = "pixeldrain.com"
 		}
-		cfg.Port = portOr(u.Port(), 443)
-		cfg.Path = strings.TrimPrefix(u.Path, "/")
 		cfg.UseTLS = q.Get("tls") != "0"
+		// The default port must follow the final scheme, not be hardcoded
+		// to 443: a ?tls=0 URL without an explicit port would otherwise
+		// dial http://host:443 — plaintext at the TLS port.
+		defPort := 443
+		if !cfg.UseTLS {
+			defPort = 80
+		}
+		cfg.Port = portOr(u.Port(), defPort)
+		cfg.Path = strings.TrimPrefix(u.Path, "/")
 		// The API key goes in the password position; also accept
 		// pd://KEY@host/... for readability.
 		if cfg.Password == "" && cfg.User != "" {
@@ -305,6 +312,26 @@ func portOr(p string, def int) int {
 		return def
 	}
 	return n
+}
+
+// redactURLCreds strips any userinfo from a URL before display/logging.
+// cfg.URL normally comes from ParseURL (already userinfo-free), but the
+// interactive path stores the user's typed URL verbatim, which may embed
+// credentials — those must never reach the screen or the .log sidecar.
+func redactURLCreds(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		// Unparseable input: best-effort manual strip of everything up to
+		// the last "@" after the scheme separator.
+		if at := strings.LastIndex(raw, "@"); at >= 0 {
+			if sep := strings.Index(raw, "://"); sep >= 0 && sep+3 <= at {
+				return raw[:sep+3] + raw[at+1:]
+			}
+		}
+		return raw
+	}
+	u.User = nil
+	return u.String()
 }
 
 // httpClient returns a client suitable for long streaming uploads: no

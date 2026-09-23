@@ -246,9 +246,11 @@ func IsGzipFile(path string) bool {
 const sizeFileSuffix = ".size"
 
 // WriteSizeFile records the uncompressed image size in a "<path>.size"
-// sidecar file. Called after a successful save.
-func WriteSizeFile(path string, size int64) {
-	os.WriteFile(path+sizeFileSuffix, []byte(strconv.FormatInt(size, 10)+"\n"), 0644)
+// sidecar file. Called after a successful save. A failed write only
+// degrades the >4 GiB truncation pre-check on restore (the gzip ISIZE
+// footer wraps above 4 GiB), so callers should warn, not fail the save.
+func WriteSizeFile(path string, size int64) error {
+	return os.WriteFile(path+sizeFileSuffix, []byte(strconv.FormatInt(size, 10)+"\n"), 0644)
 }
 
 // ReadSizeFile returns the uncompressed size recorded by WriteSizeFile,
@@ -329,15 +331,61 @@ func parseDdBytesRead(stderr string) int64 {
 	return -1
 }
 
+// parseDdRecordsOut extracts the count of full output blocks from dd's
+// "X+Y records out" stderr line. BusyBox dd never prints the GNU
+// "N bytes ... copied" summary, and that summary is locale-dependent —
+// "X+Y records out" stays English, so it is the locale-independent
+// fallback whenever parseDdBytesRead finds nothing. Returns -1 when no
+// usable line exists.
+func parseDdRecordsOut(stderr string) int64 {
+	res := int64(-1)
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if !strings.HasSuffix(line, " records out") {
+			continue
+		}
+		f := strings.Fields(strings.TrimSuffix(line, " records out"))
+		if len(f) != 1 || !strings.Contains(f[0], "+") {
+			continue
+		}
+		parts := strings.SplitN(f[0], "+", 2)
+		if n, err := strconv.ParseInt(parts[0], 10, 64); err == nil && n >= 0 {
+			res = n
+		}
+	}
+	return res
+}
+
+// ddRecordsTruncated reports whether a full-block count from
+// parseDdRecordsOut proves dd stopped short of sourceSize: a complete read
+// of sourceSize bytes at block size bs ends with X*bs+bs > sourceSize, so
+// the converse means truncation. X*bs is only a lower bound on the bytes
+// moved, so a truncation smaller than bs can go undetected. Returns false
+// whenever the inputs cannot support a verdict.
+func ddRecordsTruncated(recs, bs, sourceSize int64) bool {
+	if recs < 0 || bs <= 0 || sourceSize <= 0 {
+		return false
+	}
+	if recs > sourceSize/bs {
+		return false // already at/over the disk size — no proof (and no overflow)
+	}
+	return recs*bs+bs <= sourceSize
+}
+
 // mountedSourcePartitions lists the mount points of all partitions (and
 // dm/LV devices) belonging to the source disk, parsed locally from
 // /proc/mounts so the matching logic is testable and injection-safe.
-func (j *CloneJob) mountedSourcePartitions(src string) []string {
+func (j *CloneJob) mountedSourcePartitions(src string) ([]string, error) {
 	diskBase := src
 	if i := strings.LastIndex(src, "/"); i >= 0 {
 		diskBase = src[i+1:]
 	}
-	out, _ := j.runner.CombinedOutput("cat /proc/mounts 2>/dev/null")
+	out, err := j.runner.CombinedOutput("cat /proc/mounts 2>/dev/null")
+	if err != nil {
+		// Fail closed: treating an unreadable mount table as "nothing
+		// mounted" would silently pass the pre-dd abort gates.
+		return nil, fmt.Errorf("read /proc/mounts on remote: %w", err)
+	}
 	// LVM logical volumes appear in /proc/mounts as /dev/mapper/<vg>-<lv>
 	// or /dev/dm-N — names that bear no relation to the source disk name,
 	// so they can only be attributed via the kernel's slave topology.
@@ -352,7 +400,7 @@ func (j *CloneJob) mountedSourcePartitions(src string) []string {
 			mounted = append(mounted, fields[1])
 		}
 	}
-	return mounted
+	return mounted, nil
 }
 
 // lvmDevicesOnDisk returns the set of device paths of device-mapper volumes
@@ -429,7 +477,11 @@ func (j *CloneJob) preReadWarnIfMounted() {
 	j.logFn("  Flushing remote filesystem buffers (sync)...")
 	j.runner.CombinedOutput("sync")
 
-	mounted := j.mountedSourcePartitions(j.params.SourcePath)
+	mounted, err := j.mountedSourcePartitions(j.params.SourcePath)
+	if err != nil {
+		j.logFn("  [!] 无法读取远程挂载表,跳过挂载状态警告: %v", err)
+		return
+	}
 	if len(mounted) > 0 {
 		j.logFn("  [!] 警告: 源磁盘的以下分区仍处于挂载状态:")
 		for _, mp := range mounted {
@@ -462,26 +514,65 @@ func (j *CloneJob) preReadSyncAndVerify(src string) error {
 	// Give the kernel a moment to finish flushing.
 	time.Sleep(2 * time.Second)
 
-	stillMounted := j.mountedSourcePartitions(src)
+	stillMounted, err := j.mountedSourcePartitions(src)
+	if err != nil {
+		return err
+	}
 	if len(stillMounted) > 0 {
 		// Try one more regular umount (NOT lazy). If it fails we must abort.
 		for _, mp := range stillMounted {
 			j.runner.CombinedOutput("umount " + shellQuote(mp) + " 2>/dev/null")
 		}
-		// Re-check.
-		stillMounted = j.mountedSourcePartitions(src)
 	}
-	if len(stillMounted) > 0 {
-		j.logFn("  [!] 严重: 源盘的以下分区无法卸载,dd 读到的镜像将不一致:")
-		for _, mp := range stillMounted {
-			j.logFn("        - %s", mp)
-		}
-		j.logFn("  [!] 请手动 umount 后重试,不要使用 lazy umount (-l)")
-		return fmt.Errorf("source partitions still mounted: %s — aborted to avoid producing a corrupt image",
-			strings.Join(stillMounted, ", "))
+	if err := j.abortIfSourceMounted(src); err != nil {
+		return err
 	}
 	j.logFn("  ✓ 源盘所有分区已卸载,文件系统状态一致")
 	return nil
+}
+
+// abortIfSourceMounted is the hard "source partitions must be unmounted"
+// gate extracted from preReadSyncAndVerify so other pre-transfer steps can
+// enforce the same abort. Re-reads the mount table and fails closed on a
+// read error.
+func (j *CloneJob) abortIfSourceMounted(src string) error {
+	stillMounted, err := j.mountedSourcePartitions(src)
+	if err != nil {
+		return err
+	}
+	if len(stillMounted) == 0 {
+		return nil
+	}
+	j.logFn("  [!] 严重: 源盘的以下分区无法卸载,dd 读到的镜像将不一致:")
+	for _, mp := range stillMounted {
+		j.logFn("        - %s", mp)
+	}
+	j.logFn("  [!] 请手动 umount 后重试,不要使用 lazy umount (-l)")
+	return fmt.Errorf("source partitions still mounted: %s — aborted to avoid producing a corrupt image",
+		strings.Join(stillMounted, ", "))
+}
+
+// ensureSourceUnmountedForZeroFill gates zero-fill on a fully unmounted
+// source. zero-fill mounts each source partition and writes until the
+// filesystem is full, so on a live system it would fill the production disk
+// to 100% long before the pre-dd abort fires. This cannot be replaced by
+// moving preReadSyncAndVerify earlier: that step must stay right before dd
+// (after zero-fill/initramfs, before the freeze) so it flushes what those
+// steps wrote — a frozen disk cannot be mounted for the fill.
+func (j *CloneJob) ensureSourceUnmountedForZeroFill() error {
+	mounted, err := j.mountedSourcePartitions(j.params.SourcePath)
+	if err != nil {
+		return err
+	}
+	if len(mounted) == 0 {
+		return nil
+	}
+	j.logFn("  [!] 零填充要求源盘完全未挂载,以下分区仍处于挂载状态:")
+	for _, mp := range mounted {
+		j.logFn("        - %s", mp)
+	}
+	return fmt.Errorf("zero-fill requires the source disk fully unmounted (mounted: %s) — boot into the RAM OS or disable zero-fill",
+		strings.Join(mounted, ", "))
 }
 
 // freezeSource freezes the remote block device to take a stable snapshot
@@ -631,6 +722,9 @@ func (j *CloneJob) Run() error {
 	j.preReadWarnIfMounted()
 
 	if j.params.ZeroFill {
+		if err := j.ensureSourceUnmountedForZeroFill(); err != nil {
+			return err
+		}
 		if err := j.zeroFillFreeSpace(); err != nil {
 			j.logFn("  [!] Zero-fill failed (continuing clone): %v", err)
 		}
@@ -683,6 +777,11 @@ func (j *CloneJob) Run() error {
 	return nil
 }
 
+// partialFileSuffix marks the in-progress image during RunToFile; the file
+// is renamed over the final name only after the transfer and the SHA256
+// pass complete, so a failed run never destroys a pre-existing backup.
+const partialFileSuffix = ".partial"
+
 // RunToFile saves remote disk as a gzip compressed file.
 // Remote does dd | gzip, only compressed data travels over the network.
 // The file is a standard RFC 1952 gzip — compatible with gunzip/dd everywhere.
@@ -691,23 +790,40 @@ func (j *CloneJob) RunToFile() error {
 	if err := validateDevicePath(j.params.SourcePath); err != nil {
 		return err
 	}
-	// Create the output before the long pre-transfer steps so an
+	// Write "<target>.partial" and rename over the target only after the
+	// full transfer (checksum included) succeeds: creating the final name
+	// up front truncates an existing backup before the transfer even
+	// starts, and a run that fails hours in must leave it intact. A failed
+	// run keeps the leftover .partial. rename(2) does not overwrite on
+	// Windows, hence the explicit remove of the target first.
+	partPath := j.params.TargetPath + partialFileSuffix
+	// Create the partial output before the long pre-transfer steps so an
 	// unwritable path fails immediately instead of after a zero-fill.
-	f, err := os.Create(j.params.TargetPath)
+	f, err := os.Create(partPath)
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
 	}
-	defer f.Close()
 
 	if err := j.runToSink(f); err != nil {
+		f.Close()
 		return err
 	}
 
-	// Flush to disk before returning: the caller generates the .sha256 file
+	// Flush to disk before renaming: the caller generates the .sha256 file
 	// immediately after and may show "save complete", so the image must be
 	// durable by then (protects against power loss right after saving).
 	if err := f.Sync(); err != nil {
+		f.Close()
 		return fmt.Errorf("sync file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close file: %w", err)
+	}
+	if err := os.Remove(j.params.TargetPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove existing file: %w", err)
+	}
+	if err := os.Rename(partPath, j.params.TargetPath); err != nil {
+		return fmt.Errorf("rename file: %w", err)
 	}
 	return nil
 }
@@ -733,6 +849,9 @@ func (j *CloneJob) runToSink(out io.Writer) error {
 	j.preReadWarnIfMounted()
 
 	if j.params.ZeroFill {
+		if err := j.ensureSourceUnmountedForZeroFill(); err != nil {
+			return err
+		}
 		if err := j.zeroFillFreeSpace(); err != nil {
 			j.logFn("  [!] Zero-fill failed (continuing save): %v", err)
 		}
@@ -1196,9 +1315,18 @@ func (j *CloneJob) FixBoot(targetDisk string) error {
 			continue
 		}
 
-		// Try mounting to see if it's root
+		// Try mounting to see if it's root. rmdir must run on every path —
+		// the old `&&`-chained form skipped it whenever mount failed and
+		// could never reach the trailing rmdir after the brace group's exit.
 		_, rcErr := j.runner.CombinedOutput(fmt.Sprintf(
-			`mp=$(mktemp -d) && mount %s "$mp" 2>/dev/null && { [ -f "$mp/etc/os-release" ] || [ -f "$mp/etc/fstab" ]; rc=$?; umount "$mp" 2>/dev/null; rmdir "$mp" >/dev/null 2>&1; exit $rc; } && rmdir "$mp" 2>/dev/null; exit 1`,
+			`rc=1
+mp=$(mktemp -d)
+if mount %s "$mp" 2>/dev/null; then
+  if [ -f "$mp/etc/os-release" ] || [ -f "$mp/etc/fstab" ]; then rc=0; fi
+  umount "$mp" 2>/dev/null
+fi
+rmdir "$mp" 2>/dev/null
+exit $rc`,
 			shellQuote(dev),
 		))
 		if rcErr == nil {
@@ -1218,11 +1346,31 @@ func (j *CloneJob) FixBoot(targetDisk string) error {
 	script := fmt.Sprintf(`ROOT=%s
 TARGETDISK=%s
 
+# Unmount everything we may have mounted under /mnt. Shared by the
+# early-abort exits below and the normal exit — the early exits used to
+# leak the mounts they had already made.
+cleanup_mnt() {
+  for try in 1 2 3 4 5; do
+    umount /mnt/run 2>/dev/null
+    umount /mnt/dev/pts 2>/dev/null
+    umount /mnt/dev 2>/dev/null
+    umount /mnt/proc 2>/dev/null
+    umount /mnt/sys 2>/dev/null
+    umount /mnt/boot/efi 2>/dev/null
+    umount /mnt/boot 2>/dev/null
+    if umount /mnt 2>/dev/null; then
+      break
+    fi
+    sync
+    sleep 1
+  done
+}
+
 # Unmount /mnt if something is already mounted there
 umount /mnt 2>/dev/null
 
 mount "$ROOT" /mnt 2>/dev/null || { echo "FAIL mount"; exit 1; }
-[ ! -d /mnt/usr/bin ] && [ ! -d /mnt/usr/sbin ] && { echo "FAIL noroot"; exit 1; }
+[ ! -d /mnt/usr/bin ] && [ ! -d /mnt/usr/sbin ] && { echo "FAIL noroot"; cleanup_mnt; exit 1; }
 
 # Mount /boot and /boot/efi if they are separate partitions (parsed from fstab).
 # Skip swap and pseudo filesystems. Resolve UUID=/LABEL= references.
@@ -1246,6 +1394,7 @@ if [ -n "$BOOTENT" ]; then
       # would write into a shadowed directory on the root partition and
       # silently vanish when the real /boot comes back — abort instead.
       echo "BOOT_MOUNT_FAILED"
+      cleanup_mnt
       exit 1
     fi
   fi
@@ -1260,6 +1409,19 @@ if [ -n "$EFIENT" ]; then
     else
       echo "  warn: could not mount /boot/efi (UEFI GRUB install may fail)"
     fi
+  fi
+fi
+
+# Where grub-install must place the EFI binary: /boot/efi when fstab has
+# such an entry; systems whose vfat ESP is mounted at /boot directly (no
+# /boot/efi entry) need /boot — hardcoding /boot/efi writes the EFI binary
+# into a plain directory on the root fs and grub-install still reports
+# success.
+EFIDIR=/boot/efi
+if [ -z "$EFIENT" ]; then
+  BOOTTYPE=$(awk '!/^[[:space:]]*#/ && $2=="/boot" {print $3; exit}' /mnt/etc/fstab 2>/dev/null)
+  if [ "$BOOTTYPE" = "vfat" ] && [ -d /mnt/boot/EFI ]; then
+    EFIDIR=/boot
   fi
 fi
 
@@ -1318,8 +1480,8 @@ if [ -n "$TARGETDISK" ]; then
 
   if [ -n "$GRUBNAME" ]; then
     if [ "$FWEFI" = "1" ]; then
-      echo "  -> $GRUBNAME --target=x86_64-efi --efi-directory=/boot/efi (UEFI firmware)"
-      chroot /mnt /usr/sbin/$GRUBNAME --target=x86_64-efi --efi-directory=/boot/efi --recheck 2>&1
+      echo "  -> $GRUBNAME --target=x86_64-efi --efi-directory=$EFIDIR (UEFI firmware)"
+      chroot /mnt /usr/sbin/$GRUBNAME --target=x86_64-efi --efi-directory=$EFIDIR --recheck 2>&1
       GRUB_RC=$?
     else
       echo "  -> $GRUBNAME --recheck $TARGETDISK (BIOS/Legacy firmware)"
@@ -1348,6 +1510,11 @@ if [ -n "$TARGETDISK" ]; then
         dev=$1; mp=$2
         if (mp == "" || mp == "none" || mp == "swap") { print; next }
         if (mp == "/" || mp == "/boot" || mp ~ /^\/boot\//) { print; next }
+        # Virtual/pseudo filesystems have no backing block device by design;
+        # the existence check below would comment them out even though they
+        # are valid on any machine.
+        if ($3 ~ /^(tmpfs|proc|sysfs|devpts|devtmpfs|cgroup|cgroup2|ramfs|fusectl)$/) { print; next }
+        if (dev == "none" || dev == "tmpfs") { print; next }
         # Resolve the device to a real /dev node. UUID=/LABEL= must be
         # resolved via command output (getline), NOT by pasting the blkid
         # command into [ -b ] -- that would always be false and comment out
@@ -1383,22 +1550,9 @@ fi
 
 # CRITICAL: must fully unmount — lazy umount (-l) leaves the filesystem
 # live in the kernel, so the on-disk journal stays mid-transaction and
-# dd reads a "dirty" image. Use regular umount with retries, in reverse
-# order (deepest first). Bind mounts first, then real mounts.
-for try in 1 2 3 4 5; do
-  umount /mnt/run 2>/dev/null
-  umount /mnt/dev/pts 2>/dev/null
-  umount /mnt/dev 2>/dev/null
-  umount /mnt/proc 2>/dev/null
-  umount /mnt/sys 2>/dev/null
-  umount /mnt/boot/efi 2>/dev/null
-  umount /mnt/boot 2>/dev/null
-  if umount /mnt 2>/dev/null; then
-    break
-  fi
-  sync
-  sleep 1
-done
+# dd reads a "dirty" image. cleanup_mnt does regular umounts with retries,
+# in reverse order (deepest first). Bind mounts first, then real mounts.
+cleanup_mnt
 exit $RC
 `, shellQuote(rootDev), shellQuote(targetDisk))
 
@@ -1422,6 +1576,11 @@ exit $RC
 	case strings.Contains(out2, "BOOT_MOUNT_FAILED"):
 		j.logFn("  [!] Failed to mount the separate /boot partition — aborted")
 		return fmt.Errorf("boot repair: failed to mount the separate /boot partition (rebuilding initramfs into a shadowed /boot would silently be lost)")
+	// Must be matched before GRUB_INSTALL_FAILED: the script emits both
+	// markers when no GRUB tool exists. grub-install being absent is normal
+	// on systemd-boot/EFISTUB systems and initramfs was already rebuilt, so
+	// this stays a warning (logged after the switch) instead of an error.
+	case strings.Contains(out2, "NO_GRUB_TOOL"):
 	case strings.Contains(out2, "GRUB_INSTALL_FAILED"):
 		j.logFn("  [!] Initramfs rebuilt, but GRUB reinstall failed — you may need to run grub2-install manually")
 		return fmt.Errorf("boot repair: GRUB reinstall failed (initramfs was rebuilt); run grub-install --recheck manually")
@@ -1433,7 +1592,7 @@ exit $RC
 		return fmt.Errorf("boot repair script failed: %v", err2)
 	}
 	if strings.Contains(out2, "NO_GRUB_TOOL") {
-		j.logFn("  ✓ Initramfs rebuilt (no GRUB install tool found; skipped GRUB reinstall)")
+		j.logFn("  [!] No GRUB install tool found — skipped GRUB reinstall (normal for systemd-boot/EFISTUB); initramfs was rebuilt")
 	} else if targetDisk != "" {
 		j.logFn("  ✓ GRUB reinstalled and initramfs rebuilt")
 	} else {
@@ -1457,10 +1616,15 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 		return err
 	}
 	bsBytes := bsToBytes(bs)
+	bsNum, _ := strconv.ParseInt(bsBytes, 10, 64)
 
 	// Remote: dd | compress (gzip or pigz)
 	compress := j.buildCompressCmd()
-	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | %s", j.params.SourcePath, bsBytes, compress)
+	// pipefail makes the pipeline's exit status reflect a dead dd; without
+	// it gzip exits 0 on the EOF dd leaves behind and a truncated stream
+	// passes as success. Shells without pipefail (dash) print an error —
+	// silenced into /dev/null — and behave exactly as before.
+	remoteCmd := fmt.Sprintf("set -o pipefail 2>/dev/null; dd if=%s bs=%s | %s", j.params.SourcePath, bsBytes, compress)
 
 	session, err := j.runner.Execute(remoteCmd)
 	if err != nil {
@@ -1528,6 +1692,12 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 		if ddRead := parseDdBytesRead(stderrOut); ddRead > 0 && j.params.SourceSize > 0 && ddRead < j.params.SourceSize {
 			finalErr = fmt.Errorf("clone truncated: dd read %d bytes but source disk is %d bytes (%.1f%% of expected) — target disk content is incomplete",
 				ddRead, j.params.SourceSize, float64(ddRead)/float64(j.params.SourceSize)*100)
+		} else if recs := parseDdRecordsOut(stderrOut); ddRecordsTruncated(recs, bsNum, j.params.SourceSize) {
+			// Locale-independent fallback for the missing "N bytes" line:
+			// the "X+Y records out" count bounds the bytes dd moved from
+			// below.
+			finalErr = fmt.Errorf("clone truncated: dd wrote at most %d bytes (%d full blocks) but source disk is %d bytes — target disk content is incomplete",
+				recs*bsNum+bsNum-1, recs, j.params.SourceSize)
 		}
 	}
 
@@ -1553,9 +1723,10 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 		return err
 	}
 	bsBytes := bsToBytes(bs)
+	bsNum, _ := strconv.ParseInt(bsBytes, 10, 64)
 
 	compress := j.buildCompressCmd()
-	remoteCmd := fmt.Sprintf("dd if=%s bs=%s | %s", j.params.SourcePath, bsBytes, compress)
+	remoteCmd := fmt.Sprintf("set -o pipefail 2>/dev/null; dd if=%s bs=%s | %s", j.params.SourcePath, bsBytes, compress)
 
 	session, err := j.runner.Execute(remoteCmd)
 	if err != nil {
@@ -1626,6 +1797,12 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 		if ddRead := parseDdBytesRead(stderrOut); ddRead > 0 && j.params.SourceSize > 0 && ddRead < j.params.SourceSize {
 			finalErr = fmt.Errorf("backup truncated: dd read %d bytes but source disk is %d bytes (%.1f%% of expected) — backup is corrupt, do not restore it",
 				ddRead, j.params.SourceSize, float64(ddRead)/float64(j.params.SourceSize)*100)
+		} else if recs := parseDdRecordsOut(stderrOut); ddRecordsTruncated(recs, bsNum, j.params.SourceSize) {
+			// Locale-independent fallback for the missing "N bytes" line:
+			// the "X+Y records out" count bounds the bytes dd moved from
+			// below.
+			finalErr = fmt.Errorf("backup truncated: dd wrote at most %d bytes (%d full blocks) but source disk is %d bytes — backup is corrupt, do not restore it",
+				recs*bsNum+bsNum-1, recs, j.params.SourceSize)
 		}
 	}
 
@@ -1647,6 +1824,7 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 		return err
 	}
 	bsBytes := bsToBytes(bs)
+	bsNum, _ := strconv.ParseInt(bsBytes, 10, 64)
 
 	remoteCmd := fmt.Sprintf("dd if=%s bs=%s", j.params.SourcePath, bsBytes)
 
@@ -1704,6 +1882,9 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 		if ddRead := parseDdBytesRead(stderrOut); ddRead > 0 && j.params.SourceSize > 0 && ddRead < j.params.SourceSize {
 			finalErr = fmt.Errorf("backup truncated: dd read %d bytes but source disk is %d bytes (%.1f%% of expected) — backup is corrupt, do not restore it",
 				ddRead, j.params.SourceSize, float64(ddRead)/float64(j.params.SourceSize)*100)
+		} else if recs := parseDdRecordsOut(stderrOut); ddRecordsTruncated(recs, bsNum, j.params.SourceSize) {
+			finalErr = fmt.Errorf("backup truncated: dd wrote at most %d bytes (%d full blocks) but source disk is %d bytes — backup is corrupt, do not restore it",
+				recs*bsNum+bsNum-1, recs, j.params.SourceSize)
 		}
 	}
 
