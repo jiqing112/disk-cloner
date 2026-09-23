@@ -100,7 +100,7 @@ cd /tmp && chmod +x disk-cloner-linux-amd64 && ./disk-cloner-linux-amd64
 - 目标盘小于源盘时会警告并要求输入 `yes` 强制继续（会截断数据，正常应换更大的盘）
 - 完成后自动重装 GRUB + 重建 initramfs + 修 fstab，通常直接重启即可启动
 
-## 模式 2 — 备份：远程盘 → 镜像文件
+## 模式 2 — 备份：远程盘 → 本地镜像文件
 
 把远程服务器整盘保存为本地压缩镜像。**只需源服务器进 RAM OS，程序在本地运行（Linux / Windows 均可）。**
 
@@ -118,7 +118,7 @@ gunzip -c 192.168.1.100-sda-30G-2026-07-03.img.gz | dd of=/dev/sda bs=4M
 sha256sum -c 192.168.1.100-sda-30G-2026-07-03.img.gz.sha256
 ```
 
-## 模式 3 — 恢复：镜像文件 → 远程盘
+## 模式 3 — 恢复：本地镜像文件 → 远程盘
 
 把备份镜像写回远程服务器硬盘。**只需目标服务器进 RAM OS，程序在本地运行（Linux / Windows 均可）。**
 
@@ -222,8 +222,8 @@ disk-cloner -H 192.168.1.100 -p password -s /dev/sda -dst 'sftp://user:pass@nas.
 | `-p` | SSH 密码。不提供则用密钥认证；也可用环境变量 `DISK_CLONER_PASSWORD`（避免进 shell 历史） | — |
 | `-s` | 源磁盘路径（远程），如 `/dev/sda` | — |
 | `-t` | 目标磁盘路径（本地） | — |
-| `-o` | 保存为镜像文件，`auto` = 自动命名 + 日期目录 | — |
-| `-r` | 从镜像文件恢复到远程磁盘 | — |
+| `-o` | 保存为本地镜像文件，`auto` = 自动命名 + 日期目录 | — |
+| `-r` | 从本地镜像文件恢复到远程磁盘 | — |
 | `-dst` | 传输到远程存储：`sftp://` `ftp://` `dav://` `davs://` `s3://` `pixeldrain://`（别名 `pd://`） | — |
 | `-l` | 本机磁盘作为源（程序运行在源机 RAM OS，仅 Linux；搭配 `-dst` 或 `-o`） | — |
 | `-bs` | dd 块大小 | 4M |
@@ -251,6 +251,8 @@ disk-cloner -H 192.168.1.100 -p password -s /dev/sda -dst 'sftp://user:pass@nas.
 ```
 
 **启动模式必须一致**：源机和目标机的 BIOS/UEFI 要相同，不一致时修了 GRUB 也起不来。`ls /sys/firmware/efi` 有目录 = UEFI，报 No such file = BIOS。各平台对应设置：VMware（Firmware = EFI）、Hyper-V（Generation 2）、VirtualBox（Enable EFI）、PVE/KVM（OVMF）。
+
+**跨虚拟化平台恢复注意驱动问题**：云服务器一般是 KVM，桌面虚拟机常见 VMware / VirtualBox。实测 Linux 从 KVM 迁移到 VMware Workstation 可以开机，但开机可能卡一会儿，进入系统后记得更新一下内核；而 KVM 里的 Windows 迁到 VMware，常见因硬盘驱动不同导致无法开机。这**不是程序的问题**——镜像恢复只是原样搬运数据，跨虚拟化平台启动需要目标环境有对应的磁盘驱动，需在相同的虚拟化环境才能正常开启。
 
 ## 克隆/恢复后的手动收尾
 
@@ -281,7 +283,7 @@ umount /mnt && reboot
 ## 常见问题
 
 **恢复后不能启动？**
-看恢复日志末尾有没有 `修复引导`。新版模式 1/3 会自动修复；旧版本或修复失败用 `--fix-boot-disk` 单独修；还不行检查 BIOS/UEFI 是否与源机一致。
+看恢复日志末尾有没有 `修复引导`。新版模式 1/3 会自动修复；旧版本或修复失败用 `--fix-boot-disk` 单独修；还不行检查 BIOS/UEFI 是否与源机一致，以及是否跨了虚拟化平台（KVM ↔ VMware/VirtualBox 的驱动问题见[引导修复](#引导修复grub--initramfs)一节）。
 
 **恢复后 fsck 报 `bad magic number in super-block`？**
 误报。旧版对所有分区硬跑 `fsck.ext4`，遇到 xfs/btrfs 必然报错，不是真损坏。新版用 blkid 识别类型，xfs/btrfs 自动跳过。担心的话 `xfs_repair -n /dev/sda1` 只读验证。
