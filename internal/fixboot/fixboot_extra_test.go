@@ -149,3 +149,32 @@ func TestDecideEFI(t *testing.T) {
 		}
 	}
 }
+
+// TestIsPartitionOf: glob "disk*" also catches sibling disks whose names
+// extend the target's (sda vs sdaa, nvme0n1 vs nvme0n10) — only real
+// partition suffixes may count as candidates.
+func TestIsPartitionOf(t *testing.T) {
+	cases := []struct {
+		dev, disk string
+		want      bool
+	}{
+		{"/dev/sda1", "/dev/sda", true},
+		{"/dev/sda12", "/dev/sda", true},
+		{"/dev/sdaa", "/dev/sda", false},
+		{"/dev/sdaa1", "/dev/sda", false},
+		{"/dev/sdb1", "/dev/sda", false},
+		{"/dev/sda", "/dev/sda", false},
+		{"/dev/nvme0n1p1", "/dev/nvme0n1", true},
+		{"/dev/nvme0n1p12", "/dev/nvme0n1", true},
+		{"/dev/nvme0n10", "/dev/nvme0n1", false},
+		{"/dev/nvme0n10p1", "/dev/nvme0n1", false},
+		{"/dev/nvme0n1p", "/dev/nvme0n1", false},
+		{"/dev/mmcblk0p2", "/dev/mmcblk0", true},
+		{"/dev/mmcblk0", "/dev/mmcblk0", false},
+	}
+	for _, c := range cases {
+		if got := isPartitionOf(c.dev, c.disk); got != c.want {
+			t.Errorf("isPartitionOf(%q, %q) = %v, want %v", c.dev, c.disk, got, c.want)
+		}
+	}
+}

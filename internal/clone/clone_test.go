@@ -26,7 +26,7 @@ func TestWriteReadSizeFile(t *testing.T) {
 }
 
 func TestValidateBlockSize(t *testing.T) {
-	for _, ok := range []string{"4M", "1M", "512K", "8G", "1048576", "2k"} {
+	for _, ok := range []string{"4M", "1M", "512K", "1G", "1048576", "2k"} {
 		if err := ValidateBlockSize(ok); err != nil {
 			t.Errorf("ValidateBlockSize(%q) = %v, want nil", ok, err)
 		}

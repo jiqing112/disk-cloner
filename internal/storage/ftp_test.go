@@ -216,9 +216,9 @@ func TestFTPParsePASV(t *testing.T) {
 		{"227 Entering passive mode (127,0,0,1,195,80).", 50000}, // trailing period
 		{"227 Entering Passive Mode (127,0,0,1,195,80)", 50000},  // bare
 		{"227 Entering passive mode (127,0,0,1,195,80) extra text", 50000},
-		{"227 Entering passive mode (127,0,0,1,195,x).", 0},  // non-numeric port byte
-		{"227 no parens here", 0},                            // malformed
-		{"227 (1,2,3)", 0},                                   // too few fields
+		{"227 Entering passive mode (127,0,0,1,195,x).", 0}, // non-numeric port byte
+		{"227 no parens here", 0},                           // malformed
+		{"227 (1,2,3)", 0},                                  // too few fields
 	}
 	for _, c := range cases {
 		if got := ftpParsePASV(c.msg); got != c.want {
@@ -241,5 +241,41 @@ func TestFTPStripCode(t *testing.T) {
 		if got := ftpStripCode(in); got != want {
 			t.Errorf("ftpStripCode(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestReadRespMultilineRFC959: multi-line replies may carry intermediate
+// lines with no numeric code at all ("220-welcome", "plain banner text",
+// "220 ready") — RFC 959 §4.2. The parser must skip them instead of
+// declaring the reply malformed.
+func TestReadRespMultilineRFC959(t *testing.T) {
+	cases := []struct {
+		name  string
+		lines string
+		code  int
+	}{
+		{"single", "220 ready\r\n", 220},
+		{"classic_multiline", "230-Go ahead\r\n230 logged in\r\n", 230},
+		{"text_without_code", "220-Welcome to the server\r\nplain banner line, no code\r\n220 ready\r\n", 220},
+		{"bare_code_final", "220-Welcome\r\n220\r\n", 220},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server, client := net.Pipe()
+			defer server.Close()
+			go func() {
+				server.Write([]byte(tc.lines))
+				server.Close()
+			}()
+			c := &ftpClient{conn: client, r: bufio.NewReader(client), w: bufio.NewWriter(client)}
+			code, msg, err := c.readRespDeadlineLocked(5 * time.Second)
+			if err != nil {
+				t.Fatalf("readResp: %v", err)
+			}
+			if code != tc.code {
+				t.Errorf("code = %d, want %d (msg %q)", code, tc.code, msg)
+			}
+			client.Close()
+		})
 	}
 }

@@ -63,8 +63,8 @@ func scanRemoteDisks(r sshclient.Runner) ([]disk.DiskInfo, error) {
 var compressLevel = 1 // default gzip compression level 1-9, 0 = no compression
 var compressType = 0  // 0=gzip, 1=pigz (multi-threaded)
 var fixInitramfs = false
-var cliZeroFill = true      // -no-zerofill: CLI 模式默认执行零填充
-var cliFixInitramfs = true  // -no-fix-initramfs: CLI 模式默认重建 initramfs
+var cliZeroFill = true       // -no-zerofill: CLI 模式默认执行零填充
+var cliFixInitramfs = true   // -no-fix-initramfs: CLI 模式默认重建 initramfs
 var tlsVerifyEnabled = false // -tls-verify: enable certificate verification for WebDAV/S3 https
 
 func main() {

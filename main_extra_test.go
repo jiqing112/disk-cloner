@@ -27,20 +27,20 @@ func TestValidIPv4(t *testing.T) {
 // must not cut inside a hostname); a pasted "IP:port" yields both parts.
 func TestExtractHostPort(t *testing.T) {
 	cases := []struct {
-		in        string
-		wantHost  string
-		wantPort  int
+		in       string
+		wantHost string
+		wantPort int
 	}{
-		{"IP: 999.1.1.1", "IP: 999.1.1.1", 0},      // garbage stays untouched
-		{"IP: 192.168.1.100", "192.168.1.100", 0},   // plain extraction
-		{"nas.lan", "nas.lan", 0},                   // hostname passthrough
+		{"IP: 999.1.1.1", "IP: 999.1.1.1", 0},             // garbage stays untouched
+		{"IP: 192.168.1.100", "192.168.1.100", 0},         // plain extraction
+		{"nas.lan", "nas.lan", 0},                         // hostname passthrough
 		{"srv-192.168.1.5.lan", "srv-192.168.1.5.lan", 0}, // IP inside hostname must not be ripped out
-		{"192.168.1.100:22", "192.168.1.100", 22},   // pasted port preserved
-		{"IP: 10.0.0.5:2121", "10.0.0.5", 2121},     // port in pasted text
-		{"root@192.168.1.7", "192.168.1.7", 0},      // user@host delimiter
-		{"192.168.1.100:0", "192.168.1.100", 0},     // port 0 rejected
-		{"192.168.1.100:99999", "192.168.1.100", 0}, // out-of-range port rejected
-		{"1.2.3.4.5", "1.2.3.4.5", 0},               // trailing junk → not delimited, passthrough
+		{"192.168.1.100:22", "192.168.1.100", 22},         // pasted port preserved
+		{"IP: 10.0.0.5:2121", "10.0.0.5", 2121},           // port in pasted text
+		{"root@192.168.1.7", "192.168.1.7", 0},            // user@host delimiter
+		{"192.168.1.100:0", "192.168.1.100", 0},           // port 0 rejected
+		{"192.168.1.100:99999", "192.168.1.100", 0},       // out-of-range port rejected
+		{"1.2.3.4.5", "1.2.3.4.5", 0},                     // trailing junk → not delimited, passthrough
 	}
 	for _, c := range cases {
 		host, port := extractHostPort(c.in)

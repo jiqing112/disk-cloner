@@ -66,6 +66,7 @@ type s3Writer struct {
 	buf       []byte
 	err       error
 	finalized bool
+	aborted   bool // Abort ran: later Close must not report success
 }
 
 func (w *s3Writer) Write(p []byte) (int, error) {
@@ -98,6 +99,9 @@ func (w *s3Writer) Close() error {
 		w.abort()
 		return w.err
 	}
+	if w.aborted {
+		return fmt.Errorf("s3: upload was aborted, object not created")
+	}
 	if w.finalized {
 		return nil
 	}
@@ -117,6 +121,7 @@ func (w *s3Writer) Close() error {
 
 // Abort discards the multipart upload and any uploaded parts.
 func (w *s3Writer) Abort() error {
+	w.aborted = true
 	w.abort()
 	return nil
 }

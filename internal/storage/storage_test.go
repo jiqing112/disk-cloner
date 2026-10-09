@@ -164,3 +164,25 @@ func TestDescribeWebDAVRedactsUserinfo(t *testing.T) {
 		t.Errorf("Describe dropped the destination: %q", got)
 	}
 }
+
+// TestParseURLErrorRedactsCreds: url.Parse errors (and their inner reasons
+// like "invalid userinfo") quote the raw URL verbatim. The returned error
+// must carry only the redacted form — credentials never reach the screen or
+// the .log sidecar.
+func TestParseURLErrorRedactsCreds(t *testing.T) {
+	for _, bad := range []string{
+		"https://admin:sup3rs3cret@nas.lan/dav/%%zz",   // invalid escape
+		"s3://AKID:pa$$w0rd@minio.lan:9000/bkt/key%zz", // invalid escape in key
+	} {
+		_, err := ParseURL(bad)
+		if err == nil {
+			t.Errorf("ParseURL(%q) = nil error, want error", bad)
+			continue
+		}
+		for _, secret := range []string{"sup3rs3cret", "pa$$w0rd"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("ParseURL(%q) error leaks credential %q: %v", bad, secret, err)
+			}
+		}
+	}
+}

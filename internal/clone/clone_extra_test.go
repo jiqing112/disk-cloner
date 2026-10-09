@@ -22,10 +22,16 @@ func TestValidateBlockSizeZeroAndOverflow(t *testing.T) {
 			t.Errorf("ValidateBlockSize(%q) = nil, want error", bad)
 		}
 	}
-	// Large-but-representable values stay valid.
-	for _, ok := range []string{"17179869184K", "8G", "4096"} {
+	// Large-but-representable values within the OOM cap stay valid; anything
+	// over the cap is rejected before it can allocate gigabytes remotely.
+	for _, ok := range []string{"1G", "1048576K", "4096"} {
 		if err := ValidateBlockSize(ok); err != nil {
 			t.Errorf("ValidateBlockSize(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"2G", "8G", "17179869184K"} {
+		if err := ValidateBlockSize(bad); err == nil {
+			t.Errorf("ValidateBlockSize(%q) = nil, want over-cap error", bad)
 		}
 	}
 }

@@ -32,6 +32,7 @@ echo [OK] Dependencies ready.
 
 echo.
 echo [2/2] Building...
+set BUILD_FAILED=0
 
 echo   - Building for Linux amd64 (Alpine)...
 set GOOS=linux
@@ -40,6 +41,7 @@ set CGO_ENABLED=0
 go build -ldflags="-s -w" -o disk-cloner-linux-amd64 .
 if %errorlevel% neq 0 (
     echo     [FAILED]
+    set BUILD_FAILED=1
 ) else (
     echo     [OK] disk-cloner-linux-amd64
 )
@@ -50,12 +52,20 @@ set GOARCH=amd64
 go build -ldflags="-s -w" -o disk-cloner-windows-amd64.exe .
 if %errorlevel% neq 0 (
     echo     [FAILED]
+    set BUILD_FAILED=1
 ) else (
     echo     [OK] disk-cloner-windows-amd64.exe
 )
 
 echo.
 echo ============================================
+if "%BUILD_FAILED%"=="1" (
+    echo   BUILD FAILED
+    echo ============================================
+    echo.
+    pause
+    exit /b 1
+)
 echo   BUILD COMPLETE
 echo ============================================
 echo.

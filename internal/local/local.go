@@ -42,6 +42,11 @@ func (runner) IsConnected() bool { return true }
 
 func startProc(cmdStr string, withStdin bool) (sshclient.Session, error) {
 	c := exec.Command("sh", "-c", cmdStr)
+	// Own process group (Unix): the scripts run here spawn background children
+	// (zero-fill's dd); killing just the sh leaves them running — the dd
+	// keeps filling the partition to 100% long after this process is gone.
+	// A dedicated group lets Close/Signal take the whole tree down.
+	setProcGroup(c)
 
 	// Hand-owned os.Pipes instead of StdoutPipe/StderrPipe/StdinPipe:
 	// exec.Cmd.Wait closes the pipes it created, racing the caller's
@@ -127,12 +132,21 @@ func (p *proc) Wait() error {
 	return p.waitErr
 }
 
+// killGroup signals the child's whole process group (Unix; pgid == leader
+// pid, negative pid = group semantics). A bare pid would only hit the sh
+// wrapper and orphan its background children. On Windows this degrades to
+// killing the wrapper alone — mode 4 is Linux-only anyway.
+func (p *proc) killGroup(sig syscall.Signal) error {
+	return killProcGroup(p.cmd, sig)
+}
+
 // Close tears the process down (used on abort/error paths) AND reaps it,
-// so a caller that only Close never leaves a zombie behind. After a
-// completed Wait the kill errors harmlessly.
+// so a caller that only Close never leaves a zombie behind. SIGKILL goes to
+// the whole group so background children (zero-fill dd) cannot outlive the
+// script. After a completed Wait the kill errors harmlessly.
 func (p *proc) Close() error {
 	if p.cmd.Process != nil {
-		_ = p.cmd.Process.Kill()
+		_ = p.killGroup(syscall.SIGKILL)
 	}
 	p.Wait()
 	p.stdoutR.Close()
@@ -144,14 +158,11 @@ func (p *proc) Close() error {
 }
 
 func (p *proc) Signal(sig ssh.Signal) error {
-	if p.cmd.Process == nil {
-		return nil
-	}
 	switch sig {
 	case ssh.SIGTERM:
-		return p.cmd.Process.Signal(syscall.SIGTERM)
+		return p.killGroup(syscall.SIGTERM)
 	case ssh.SIGKILL:
-		return p.cmd.Process.Kill()
+		return p.killGroup(syscall.SIGKILL)
 	}
 	return fmt.Errorf("local: unsupported signal %q", sig)
 }

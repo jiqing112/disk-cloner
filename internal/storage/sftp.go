@@ -57,11 +57,12 @@ func openSFTP(cfg Config) (Writer, error) {
 }
 
 type sftpWriter struct {
-	ssh    *sshclient.Client
-	client *sftp.Client
-	file   *sftp.File
-	path   string
-	done   bool // Close/Abort already ran (they both terminate the upload)
+	ssh     *sshclient.Client
+	client  *sftp.Client
+	file    *sftp.File
+	path    string
+	done    bool // Close/Abort already ran (they both terminate the upload)
+	aborted bool
 }
 
 func (w *sftpWriter) Write(p []byte) (int, error) {
@@ -69,9 +70,13 @@ func (w *sftpWriter) Write(p []byte) (int, error) {
 }
 
 // Close finalizes the upload. On error the partial remote file is removed
-// (while the connection is still open).
+// (while the connection is still open). Close after Abort reports failure —
+// the file was deleted, claiming success would be a trap for retry logic.
 func (w *sftpWriter) Close() error {
 	if w.done {
+		if w.aborted {
+			return fmt.Errorf("sftp: upload of %s was aborted, file removed", w.path)
+		}
 		return nil
 	}
 	w.done = true
@@ -90,12 +95,14 @@ func (w *sftpWriter) Close() error {
 	return nil
 }
 
-// Abort removes the partial remote file (best effort).
+// Abort removes the partial remote file (best effort). Abort after a
+// successful Close stays a no-op success — the upload completed.
 func (w *sftpWriter) Abort() error {
 	if w.done {
 		return nil
 	}
 	w.done = true
+	w.aborted = true
 	err := w.removePartial()
 	if w.client != nil {
 		w.client.Close()

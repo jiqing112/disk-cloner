@@ -54,6 +54,11 @@ func ftpDial(host string, port int, timeout time.Duration) (*ftpClient, error) {
 const (
 	ftpControlReadTimeout  = 60 * time.Second
 	ftpControlWriteTimeout = 30 * time.Second
+	// The data connection gets a rolling per-write deadline instead of an
+	// overall one: uploads run for hours, but a server that stops reading
+	// (disk full, wedged NAT) must surface as an i/o timeout rather than
+	// block io.Copy — and the whole pipeline — indefinitely.
+	ftpDataWriteTimeout = 2 * time.Minute
 )
 
 // readRespLocked reads one (possibly multi-line) FTP reply, e.g.
@@ -81,15 +86,32 @@ func (c *ftpClient) readRespDeadlineLocked(d time.Duration) (int, string, error)
 		}
 		line = strings.TrimRight(line, "\r\n")
 		lines = append(lines, line)
-		if len(line) >= 4 && line[3] == '-' {
-			continue // continuation line
+
+		if code == 0 {
+			// First line of the reply must carry the 3-digit code.
+			if len(line) >= 3 {
+				if n, convErr := strconv.Atoi(line[:3]); convErr == nil {
+					code = n
+				}
+			}
+			if code == 0 {
+				break // malformed; reported below
+			}
+			if len(line) >= 4 && line[3] == '-' {
+				continue // multi-line reply started
+			}
+			break // single-line reply
 		}
-		if len(line) >= 3 {
-			if n, convErr := strconv.Atoi(line[:3]); convErr == nil {
-				code = n
+
+		// Inside a multi-line reply only a line carrying the SAME code
+		// terminates it. RFC 959 permits intermediate lines without any
+		// code ("220-welcome", "plain banner text", "220 ready") — they
+		// are banner text, not malformed replies.
+		if len(line) == 3 || (len(line) >= 4 && line[3] == ' ') {
+			if n, convErr := strconv.Atoi(line[:3]); convErr == nil && n == code {
+				break
 			}
 		}
-		break
 	}
 	if code == 0 {
 		return 0, "", fmt.Errorf("ftp: malformed reply %q", strings.Join(lines, " | "))
@@ -153,16 +175,28 @@ func (c *ftpClient) tryLock(d time.Duration) bool {
 // connection. It runs only when the control channel is idle; when the stor
 // goroutine still holds it, the connection is dropped instead so its
 // blocked read errors out rather than stealing teardown's replies.
-func (c *ftpClient) teardown(path string, delete bool) {
+// teardown quits the session, optionally deleting the partial file first.
+// It reports whether the delete actually happened: when the control channel
+// is wedged (stor goroutine stuck reading a final reply), the connection is
+// dropped without DELE and the partial file may remain on the server.
+func (c *ftpClient) teardown(path string, delete bool) bool {
 	if !c.tryLock(3 * time.Second) {
 		c.conn.Close()
-		return
+		return false
 	}
 	defer c.mu.Unlock()
 	if delete {
-		c.sendLocked("DELE " + path)
+		if err := c.sendLocked("DELE " + path); err != nil {
+			c.conn.Close()
+			return false
+		}
+		if code, _, err := c.readRespLocked(); err != nil || code/100 != 2 {
+			c.conn.Close()
+			return false
+		}
 	}
 	c.quitLocked()
+	return true
 }
 
 // login performs USER/PASS and fails on 5xx replies.
@@ -257,6 +291,19 @@ func ftpParsePASV(msg string) int {
 	return p1*256 + p2
 }
 
+// ftpDataWriter refreshes the data connection's write deadline before every
+// Write. Each successful write buys another ftpDataWriteTimeout, so a healthy
+// but slow transfer never trips it, while a peer that stops acknowledging
+// data errors out instead of hanging io.Copy forever.
+type ftpDataWriter struct{ c net.Conn }
+
+func (w ftpDataWriter) Write(p []byte) (int, error) {
+	if err := w.c.SetWriteDeadline(time.Now().Add(ftpDataWriteTimeout)); err != nil {
+		return 0, err
+	}
+	return w.c.Write(p)
+}
+
 // stor streams r to path via STOR. r is read only after the server accepted
 // the command, so a rejected path or permission fails before data flows.
 // The accepted channel is closed as soon as the server answers 1xx, letting
@@ -276,7 +323,7 @@ func (c *ftpClient) stor(path string, r io.Reader, accepted chan<- struct{}) err
 		return fmt.Errorf("ftp: STOR %s: %d %s", path, code, msg)
 	}
 	close(accepted)
-	_, copyErr := io.Copy(data, r)
+	_, copyErr := io.Copy(ftpDataWriter{data}, r)
 	data.Close()
 	// Hold the control-channel lock while reading the final reply so the
 	// teardown path in finish() cannot interleave a DELE/SIZE on the same
@@ -380,8 +427,9 @@ type ftpWriter struct {
 
 	written atomic.Int64 // bytes handed to Write; compared against SIZE on finalize
 
-	mu       sync.Mutex
-	finished bool
+	mu        sync.Mutex
+	finished  bool
+	abandoned bool
 }
 
 func (w *ftpWriter) Write(p []byte) (int, error) {
@@ -405,10 +453,12 @@ func (w *ftpWriter) Close() error {
 	return w.finish(false)
 }
 
-// Abort discards the upload and deletes the partial remote file.
+// Abort discards the upload and deletes the partial remote file. It reports
+// whether that cleanup actually happened — a wedged control channel forces
+// dropping the connection without DELE, and the caller must not be told the
+// server is clean when it may still hold a partial image.
 func (w *ftpWriter) Abort() error {
-	w.finish(true)
-	return nil
+	return w.finish(true)
 }
 
 // remoteSizeLocked queries the uploaded file's size via SIZE (TYPE I
@@ -448,9 +498,15 @@ func (w *ftpWriter) finish(abandon bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.finished {
+		if w.abandoned {
+			return fmt.Errorf("ftp: upload was aborted, partial file removed")
+		}
 		return nil
 	}
 	w.finished = true
+	if abandon {
+		w.abandoned = true
+	}
 	if abandon {
 		w.pw.CloseWithError(io.ErrClosedPipe)
 	} else {
@@ -469,7 +525,9 @@ func (w *ftpWriter) finish(abandon bool) error {
 		// the control channel (timed out) — teardown sends DELE only when
 		// the channel is idle, otherwise it drops the connection and the
 		// goroutine's blocked read errors out.
-		w.c.teardown(w.path, true)
+		if !w.c.teardown(w.path, true) {
+			return fmt.Errorf("ftp: control channel was stuck, %s may remain on server (delete it manually)", w.path)
+		}
 		return nil
 	}
 	if err != nil {

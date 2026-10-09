@@ -274,9 +274,11 @@ func Run(cfg Config) error {
 				efiDisk, efiPart := findEFIPart(espDev)
 				if efiDisk == "" {
 					efiDisk = cfg.TargetDisk
+					log("  [!] 无法解析 ESP 所在磁盘 (%s), NVRAM 启动项将指向目标盘 %s", espDev, efiDisk)
 				}
 				if efiPart == "" {
 					efiPart = "1"
+					log("  [!] 无法解析 ESP 分区号 (%s), NVRAM 启动项将指向分区 1", espDev)
 				}
 				shimPath := findShimPath(mountRoot, efiSub)
 				if shimPath != "" {
@@ -289,6 +291,8 @@ func Run(cfg Config) error {
 					} else {
 						log("  ✓ UEFI 引导项已添加 (%s 分区 %s)", efiDisk, efiPart)
 					}
+				} else {
+					log("  [!] ESP 中未找到 shim/grub 启动文件, 跳过 NVRAM 启动项写入; grub-install 通常已写 fallback 路径 \\EFI\\BOOT\\BOOTX64.EFI, 多数固件仍可引导, 否则需手动添加启动项")
 				}
 			}
 		} else {
@@ -365,7 +369,7 @@ func findRootPartition(targetDisk string) (string, string, error) {
 	// 1. Direct partitions on target disk (sda1, sda2, nvme0n1p1, etc.)
 	entries, _ := filepath.Glob(targetDisk + "*")
 	for _, e := range entries {
-		if e != targetDisk {
+		if isPartitionOf(e, targetDisk) {
 			candidates = append(candidates, e)
 		}
 	}
@@ -425,7 +429,8 @@ func findRootPartition(targetDisk string) (string, string, error) {
 		os.Remove(tmpMount)
 	}()
 
-	// Sort candidates: try larger partitions first (more likely to be root)
+	// Order candidates: known Linux filesystems first (ext4, xfs, btrfs),
+	// then the rest. Swap, vfat (usually EFI/boot) and unknown types go last.
 	// Use blkid to get filesystem info
 	type partInfo struct {
 		dev    string
@@ -529,6 +534,24 @@ func allDigits(s string) bool {
 		}
 	}
 	return true
+}
+
+// isPartitionOf reports whether dev is a partition of disk: exactly disk
+// followed by a partition-number suffix — digits ("sda1"), or "p"+digits for
+// names that end in a digit ("nvme0n1p1", "mmcblk0p1"). A plain glob "disk*"
+// also catches sibling disks whose names extend the target's (sda vs sdaa,
+// nvme0n1 vs nvme0n10 on controllers with ≥10 namespaces); for digit-ending
+// bases a digit-only suffix is always a sibling, never a partition.
+func isPartitionOf(dev, disk string) bool {
+	if !strings.HasPrefix(dev, disk) {
+		return false
+	}
+	suffix := dev[len(disk):]
+	base := filepath.Base(disk)
+	if len(base) > 0 && base[len(base)-1] >= '0' && base[len(base)-1] <= '9' {
+		return len(suffix) > 1 && suffix[0] == 'p' && allDigits(suffix[1:])
+	}
+	return allDigits(suffix)
 }
 
 // decideEFI resolves the boot mode from the /sys/firmware/efi probe.
@@ -718,7 +741,7 @@ func scanAndMountESP(targetDisk string) (string, bool) {
 	probeDir := mountRoot + ".probe"
 	entries, _ := filepath.Glob(targetDisk + "*")
 	for _, e := range entries {
-		if e == targetDisk || getBlkidFstype(e) != "vfat" {
+		if !isPartitionOf(e, targetDisk) || getBlkidFstype(e) != "vfat" {
 			continue
 		}
 		if err := mount(e, probeDir); err != nil {
@@ -759,16 +782,24 @@ func findEFIPart(efiDev string) (string, string) {
 }
 
 func findShimPath(mountpoint, efiSub string) string {
-	// Common locations for the EFI shim bootloader
+	// Common locations for the EFI shim bootloader. openSUSE/SLES name it
+	// shim.efi; arch/manjaro ship no shim by default — their boot entry
+	// points straight at grubx64.efi. BOOTX64.EFI is the removable-media
+	// fallback most firmware tries on its own.
 	candidates := []string{
 		"EFI/fedora/shimx64.efi",
 		"EFI/centos/shimx64.efi",
 		"EFI/redhat/shimx64.efi",
 		"EFI/rocky/shimx64.efi",
 		"EFI/almalinux/shimx64.efi",
-		"EFI/BOOT/BOOTX64.EFI",
+		"EFI/opensuse/shim.efi",
+		"EFI/opensuse/shimx64.efi",
+		"EFI/suse/shim.efi",
 		"EFI/ubuntu/shimx64.efi",
 		"EFI/debian/shimx64.efi",
+		"EFI/arch/grubx64.efi",
+		"EFI/manjaro/grubx64.efi",
+		"EFI/BOOT/BOOTX64.EFI",
 	}
 
 	efiBase := filepath.Join(mountpoint, strings.TrimPrefix(efiSub, "/"))
@@ -935,6 +966,14 @@ func umountAll() error {
 }
 
 func chrootExec(root string, name string, args ...string) error {
+	// Minimal images can lack /etc/mtab; grub-mkconfig/grub-install read it
+	// to map / and /boot to their devices. The remote-side clone.go script
+	// already creates this link — keep the two in sync.
+	mtab := filepath.Join(root, "etc", "mtab")
+	if _, err := os.Lstat(mtab); err != nil {
+		os.Symlink("/proc/self/mounts", mtab)
+	}
+
 	fullArgs := append([]string{root, name}, args...)
 	cmd := exec.Command("chroot", fullArgs...)
 	cmd.Stdout = os.Stdout

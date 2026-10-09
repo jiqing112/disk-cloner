@@ -68,7 +68,7 @@ func webdavProbeChunked(client *http.Client, fileURL, user, pass string) (bool, 
 	req.Header.Set("Content-Type", "application/octet-stream")
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("webdav: 探测失败 (无法连接 %s): %w", fileURL, err)
+		return false, fmt.Errorf("webdav: 探测失败 (无法连接 %s): %w", redactURLCreds(fileURL), err)
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
@@ -144,7 +144,7 @@ func webdavStreamWriter(client *http.Client, cfg Config) (Writer, error) {
 		req.Header.Set("Content-Type", "application/octet-stream")
 		doErr := webdavDo(client, req, cfg.URL)
 		if doErr != nil {
-			doErr = fmt.Errorf("webdav: PUT %s: %w", cfg.URL, doErr)
+			doErr = fmt.Errorf("webdav: PUT %s: %w", redactURLCreds(cfg.URL), doErr)
 		}
 		w.done <- doErr
 		pw.Close()
@@ -202,8 +202,9 @@ type webdavWriter struct {
 	spool *os.File
 	size  int64
 
-	mu       sync.Mutex
-	finished bool
+	mu        sync.Mutex
+	finished  bool
+	abandoned bool
 }
 
 func (w *webdavWriter) Write(p []byte) (int, error) {
@@ -236,9 +237,15 @@ func (w *webdavWriter) finish(abandon bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.finished {
+		if w.abandoned {
+			return fmt.Errorf("webdav: upload was aborted, file not uploaded")
+		}
 		return nil
 	}
 	w.finished = true
+	if abandon {
+		w.abandoned = true
+	}
 
 	var err error
 	outcomeUnknown := false
@@ -297,7 +304,7 @@ func (w *webdavWriter) putSpoolFile(spoolPath string, size int64) error {
 	req.Header.Set("Content-Type", "application/octet-stream")
 	err := webdavDo(w.client, req, w.cfg.URL)
 	if err != nil {
-		return fmt.Errorf("webdav: PUT %s: %w", w.cfg.URL, err)
+		return fmt.Errorf("webdav: PUT %s: %w", redactURLCreds(w.cfg.URL), err)
 	}
 	return nil
 }

@@ -147,7 +147,23 @@ func readLineSimple(def string) string {
 		for i := 0; i < len(pipedBuf); i++ {
 			if pipedBuf[i] == '\n' || pipedBuf[i] == '\r' {
 				input := strings.TrimSpace(string(pipedBuf[:i]))
-				pipedBuf = pipedBuf[i+1:]
+				// CRLF must count as ONE terminator: consuming only the '\r'
+				// leaves the '\n' to be parsed as an empty line, which made
+				// every second prompt of a CRLF answer file silently take
+				// its default value.
+				end := i + 1
+				if pipedBuf[i] == '\r' {
+					if end < len(pipedBuf) {
+						if pipedBuf[end] == '\n' {
+							end++
+						}
+					} else {
+						// '\r' as the last buffered byte may be half of a CRLF
+						// split across reads — read more before deciding.
+						break
+					}
+				}
+				pipedBuf = pipedBuf[end:]
 				if input == "" {
 					return def
 				}

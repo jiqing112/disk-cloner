@@ -193,7 +193,10 @@ func (c *Config) NeedsName() bool {
 func ParseURL(raw string) (Config, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
-		return Config{}, fmt.Errorf("invalid storage URL: %w", err)
+		// url.Parse errors (and their inner reasons, e.g. "invalid userinfo")
+		// quote the raw URL verbatim, credentials included — report only the
+		// redacted form instead of wrapping err.
+		return Config{}, fmt.Errorf("invalid storage URL %s (检查格式, 特殊字符需百分号编码)", redactURLCreds(strings.TrimSpace(raw)))
 	}
 	cfg := Config{InsecureTLS: true}
 	if u.User != nil {
@@ -337,8 +340,13 @@ func redactURLCreds(raw string) string {
 // httpClient returns a client suitable for long streaming uploads: no
 // overall timeout (transfers run for hours) and TLS verification
 // configurable, but bounded connect/TLS-handshake phases so a black-holed
-// endpoint fails Open in seconds instead of hanging forever. Proxy
-// environment variables (HTTP(S)_PROXY) are honored.
+// endpoint fails Open in seconds instead of hanging forever. ResponseHeaderTimeout
+// bounds only the wait AFTER a request (body included) was fully written — a
+// server that accepted the connection but never answers (wedged gateway,
+// silent NAT drop) fails there instead of blocking client.Do forever; 5 min
+// accommodates slow server-side processing (e.g. S3 CompleteMultipartUpload
+// on very large objects). Proxy environment variables (HTTP(S)_PROXY) are
+// honored.
 func httpClient(insecure bool) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
@@ -347,9 +355,10 @@ func httpClient(insecure bool) *http.Client {
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
-			TLSHandshakeTimeout: 15 * time.Second,
-			IdleConnTimeout:     90 * time.Second,
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure},
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 5 * time.Minute,
+			IdleConnTimeout:       90 * time.Second,
+			TLSClientConfig:       &tls.Config{InsecureSkipVerify: insecure},
 		},
 	}
 }

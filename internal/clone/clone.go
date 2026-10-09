@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -108,6 +109,12 @@ func ValidateBlockSize(bs string) error {
 
 var safeBSRe = regexp.MustCompile(`^[0-9]+[KMGkmg]?$`)
 
+// maxBSBytes caps the dd block size: dd allocates a buffer of bs bytes, so
+// an oversized value (e.g. a "64G" typo for "64M") OOMs the remote hours
+// into a run with nothing but a cryptic "write error: EOF". Performance
+// saturates far below this anyway.
+const maxBSBytes = 1 << 30 // 1 GiB
+
 func validateBS(bs string) error {
 	if !safeBSRe.MatchString(bs) {
 		return fmt.Errorf("invalid block size: %q", bs)
@@ -128,6 +135,9 @@ func validateBS(bs string) error {
 	}
 	if n > math.MaxInt64/mult {
 		return fmt.Errorf("invalid block size: %q overflows the byte counter", bs)
+	}
+	if n*mult > maxBSBytes {
+		return fmt.Errorf("invalid block size: %q exceeds the %s cap (dd allocates a buffer of bs bytes; larger values OOM the machine)", bs, formatBytesCompat(maxBSBytes))
 	}
 	return nil
 }
@@ -685,6 +695,11 @@ func (j *CloneJob) watchInterrupt(session sshclient.Session, done <-chan struct{
 					case <-time.After(5 * time.Second):
 					}
 				}
+				// os.Exit skips deferred session cleanup — take the command's
+				// whole tree down explicitly. For the local runner this kills
+				// the process GROUP (zero-fill's background dd included); for
+				// SSH sessions it is redundant but harmless.
+				_ = session.Signal(ssh.SIGKILL)
 				os.Exit(130)
 			}
 		case <-done:
@@ -726,6 +741,9 @@ func (j *CloneJob) Run() error {
 			return err
 		}
 		if err := j.zeroFillFreeSpace(); err != nil {
+			if errors.Is(err, errZeroFillCancelled) {
+				return err
+			}
 			j.logFn("  [!] Zero-fill failed (continuing clone): %v", err)
 		}
 	}
@@ -853,6 +871,9 @@ func (j *CloneJob) runToSink(out io.Writer) error {
 			return err
 		}
 		if err := j.zeroFillFreeSpace(); err != nil {
+			if errors.Is(err, errZeroFillCancelled) {
+				return err
+			}
 			j.logFn("  [!] Zero-fill failed (continuing save): %v", err)
 		}
 	}
@@ -1043,6 +1064,11 @@ func (j *CloneJob) RestoreFromFile(filePath string) error {
 	return finalErr
 }
 
+// errZeroFillCancelled reports a user interrupt during zero-fill: this
+// hours-long phase must abort the run instead of falling through to dd-ing
+// the disk after the user tried to stop the program.
+var errZeroFillCancelled = errors.New("zero-fill cancelled by user")
+
 // zeroFillFreeSpace mounts each partition on the source disk,
 // writes zeros to fill free space, then unmounts.
 // Outputs progress in real-time as each partition is processed.
@@ -1143,7 +1169,8 @@ for dev in $all_devices; do
   mp=$(mktemp -d /tmp/zf.XXXXXX)
   if mount "$dev" "$mp" 2>/dev/null; then
     echo "FILL $dev"
-    dd if=/dev/zero of="$mp/.zero_fill" bs=4194304 2>/dev/null &
+    dderr=$(mktemp /tmp/zf.err.XXXXXX)
+    dd if=/dev/zero of="$mp/.zero_fill" bs=4194304 2>"$dderr" &
     PID=$!
     while kill -0 $PID 2>/dev/null; do
       size=$(stat -c %%s "$mp/.zero_fill" 2>/dev/null)
@@ -1152,7 +1179,17 @@ for dev in $all_devices; do
     done
     wait $PID
     fill_rc=$?
-    if [ $fill_rc -ne 0 ]; then echo "DDFAIL $dev rc=$fill_rc"; fi
+    if [ $fill_rc -ne 0 ]; then
+      # ENOSPC is the normal SUCCESS end of a zero-fill: dd wrote zeros until
+      # the filesystem was full (GNU and BusyBox dd both exit 1 for it). Any
+      # other non-zero exit is a real I/O failure.
+      if grep -q "No space left on device" "$dderr" 2>/dev/null; then
+        echo "FILLED $dev"
+      else
+        echo "DDFAIL $dev rc=$fill_rc"
+      fi
+    fi
+    rm -f "$dderr"
     rm -f "$mp/.zero_fill"
     sync
     # CRITICAL: must fully unmount before dd reads the source disk.
@@ -1189,6 +1226,14 @@ echo "DONE"
 	}
 	defer session.Close()
 
+	// Ctrl+C during the hours-long fill tears the script and its background
+	// dd down (the local runner signals the process group) so no orphan dd
+	// keeps filling the partition after this process is gone.
+	done := make(chan struct{})
+	defer close(done)
+	var zfCancelled atomic.Bool
+	go j.watchInterrupt(session, done, &zfCancelled, nil)
+
 	scanner := bufio.NewScanner(session.Stdout())
 	filled := 0
 	skipped := 0
@@ -1206,6 +1251,8 @@ echo "DONE"
 			}
 		} else if strings.HasPrefix(line, "DONEPART ") {
 			j.logFn("    Done: %s", strings.TrimPrefix(line, "DONEPART "))
+		} else if strings.HasPrefix(line, "FILLED ") {
+			j.logFn("    Filled: %s (filled to capacity)", strings.TrimPrefix(line, "FILLED "))
 		} else if strings.HasPrefix(line, "SKIP ") {
 			j.logFn("    Skipped: %s", strings.TrimPrefix(line, "SKIP "))
 			skipped++
@@ -1231,6 +1278,9 @@ echo "DONE"
 	// Surface remote failures instead of printing a false "Zero-fill done":
 	// a dead connection or OOM-killed script used to be reported as success.
 	if err := session.Wait(); err != nil {
+		if zfCancelled.Load() {
+			return errZeroFillCancelled
+		}
 		return fmt.Errorf("zero-fill script failed: %w", err)
 	}
 	if len(fillFailures) > 0 {
@@ -1698,6 +1748,13 @@ func (j *CloneJob) streamCompressed(dst io.Writer) error {
 			// below.
 			finalErr = fmt.Errorf("clone truncated: dd wrote at most %d bytes (%d full blocks) but source disk is %d bytes — target disk content is incomplete",
 				recs*bsNum+bsNum-1, recs, j.params.SourceSize)
+		} else if j.params.SourceSize > 0 && written < j.params.SourceSize {
+			// Last line of defense, mirroring RestoreFromFile's byte check: a
+			// SIGKILLed dd prints no stats for the parsers above, and on shells
+			// without pipefail gzip sees EOF, writes a valid footer and exits
+			// 0 — the truncated stream would otherwise pass as a good clone.
+			finalErr = fmt.Errorf("clone truncated: transferred %d bytes but source disk is %d bytes (%.1f%% of expected) — dd exited silently, target content is incomplete",
+				written, j.params.SourceSize, float64(written)/float64(j.params.SourceSize)*100)
 		}
 	}
 
@@ -1803,6 +1860,14 @@ func (j *CloneJob) streamCompressedRaw(dst io.Writer) error {
 			// below.
 			finalErr = fmt.Errorf("backup truncated: dd wrote at most %d bytes (%d full blocks) but source disk is %d bytes — backup is corrupt, do not restore it",
 				recs*bsNum+bsNum-1, recs, j.params.SourceSize)
+		} else if j.params.SourceSize > 0 && written < j.params.SourceSize {
+			// Last line of defense, mirroring RestoreFromFile's byte check: a
+			// SIGKILLed dd prints no stats for the parsers above, and on shells
+			// without pipefail gzip sees EOF, writes a valid footer and exits
+			// 0 — the truncated stream would be saved as a good image whose
+			// checksum even matches it.
+			finalErr = fmt.Errorf("backup truncated: transferred %d bytes but source disk is %d bytes (%.1f%% of expected) — dd exited silently, image is incomplete, do not restore it",
+				written, j.params.SourceSize, float64(written)/float64(j.params.SourceSize)*100)
 		}
 	}
 
@@ -1885,6 +1950,12 @@ func (j *CloneJob) streamRaw(dst io.Writer) error {
 		} else if recs := parseDdRecordsOut(stderrOut); ddRecordsTruncated(recs, bsNum, j.params.SourceSize) {
 			finalErr = fmt.Errorf("backup truncated: dd wrote at most %d bytes (%d full blocks) but source disk is %d bytes — backup is corrupt, do not restore it",
 				recs*bsNum+bsNum-1, recs, j.params.SourceSize)
+		} else if j.params.SourceSize > 0 && written < j.params.SourceSize {
+			// Same silent-death guard as the compressed paths: dd killed
+			// without stats must not yield a short raw .img that passes as
+			// a valid backup.
+			finalErr = fmt.Errorf("backup truncated: transferred %d bytes but source disk is %d bytes (%.1f%% of expected) — dd exited silently, image is incomplete, do not restore it",
+				written, j.params.SourceSize, float64(written)/float64(j.params.SourceSize)*100)
 		}
 	}
 
